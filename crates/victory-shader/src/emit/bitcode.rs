@@ -500,30 +500,22 @@ impl Module {
         self.blocks[block].term = Some(t);
     }
 
-    /// Gives every loop one back edge: a header that more than one block
-    /// branches back to (the console's loops can continue from several
-    /// places) gets a latch block of its own that those branches go to
-    /// instead, with phis joining what each brings to the header's phis.
-    /// DXC's loops have one latch, and vkd3d-proton's DXIL-to-SPIR-V
-    /// structuriser asserts on a header with two back edges
-    /// (`cfg_structurizer.cpp`: "succ->pred_back_edge == &entry"); the
-    /// Abort/Retry/Ignore dialog it raises stops the pipeline compile.
-    /// Block 0 is the entry. Call it after every phi is filled in.
-    pub fn single_latches(&mut self) {
+    /// Each loop header with the blocks that branch back to it: edges to
+    /// a block still on the depth-first stack from the entry (block 0), in
+    /// a reducible graph whatever the order.
+    fn back_edges(&self) -> Vec<(usize, Vec<usize>)> {
         let succs = |blocks: &[Block], b: usize| match blocks[b].term {
             Some(Term::Br(t)) => vec![t],
             Some(Term::CondBr(_, t, f)) => vec![t, f],
             _ => vec![],
         };
-        if self.blocks.is_empty() {
-            return;
-        }
-        // Depth-first from the entry: an edge to a block still on the
-        // stack is a back edge (in a reducible graph, whatever the order).
         let n = self.blocks.len();
         let mut seen = vec![false; n];
         let mut on_stack = vec![false; n];
         let mut back: Vec<(usize, Vec<usize>)> = Vec::new();
+        if n == 0 {
+            return back;
+        }
         let mut stack = vec![(0usize, 0usize)];
         seen[0] = true;
         on_stack[0] = true;
@@ -548,6 +540,59 @@ impl Module {
                 }
             }
         }
+        back
+    }
+
+    /// Gives every loop one back edge: a header that more than one block
+    /// branches back to (the console's loops can continue from several
+    /// places) gets a latch block of its own that those branches go to
+    /// instead, with phis joining what each brings to the header's phis.
+    /// DXC's loops have one latch, and vkd3d-proton's DXIL-to-SPIR-V
+    /// structuriser asserts on a header with two back edges
+    /// (`cfg_structurizer.cpp`: "succ->pred_back_edge == &entry"); the
+    /// Abort/Retry/Ignore dialog it raises stops the pipeline compile.
+    /// Block 0 is the entry. Call it after every phi is filled in.
+    pub fn single_latches(&mut self) {
+        if self.blocks.is_empty() {
+            return;
+        }
+        // A block may continue two loops (an inner and an outer header):
+        // dxil-spirv allows one back edge out of a block too
+        // (`cfg_structurizer.cpp`: "entry.succ_back_edge == succ"). All
+        // but its first go through a block of their own that only branches
+        // back.
+        for (header, from) in self.back_edges() {
+            for b in from {
+                let backs = self
+                    .back_edges()
+                    .iter()
+                    .filter(|(_, f)| f.contains(&b))
+                    .map(|(h, _)| *h)
+                    .collect::<Vec<_>>();
+                if backs.len() < 2 || backs[0] == header {
+                    continue;
+                }
+                let via = self.new_block();
+                self.blocks[via].term = Some(Term::Br(header));
+                let to = |t: usize| if t == header { via } else { t };
+                self.blocks[b].term = match self.blocks[b].term {
+                    Some(Term::Br(t)) => Some(Term::Br(to(t))),
+                    Some(Term::CondBr(c, t, f)) => Some(Term::CondBr(c, to(t), to(f))),
+                    t => t,
+                };
+                for phi in self.blocks[header].phis.clone() {
+                    let Op::Phi(incoming) = &self.insts[phi as usize].op else {
+                        unreachable!("a phi")
+                    };
+                    let incoming = incoming
+                        .iter()
+                        .map(|&(v, p)| (v, if p == b { via } else { p }))
+                        .collect();
+                    self.set_phi(V::Inst(phi), incoming);
+                }
+            }
+        }
+        let back = self.back_edges();
         for (header, from) in back {
             if from.len() < 2 {
                 continue;
@@ -811,6 +856,10 @@ impl Module {
                 &preds[b][..],
             ) && pos[h] < pos[b]
                 && !succs(*p).contains(&h)
+                // Not into a block that already branches back (to an outer
+                // loop's header): one block with two back edges asserts in
+                // dxil-spirv ("entry.succ_back_edge == succ").
+                && !succs(*p).iter().any(|&s| s != b && pos[s] <= pos[*p])
             {
                 fold[b] = Some((*p, h));
             }
