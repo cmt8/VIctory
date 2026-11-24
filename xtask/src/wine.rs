@@ -35,28 +35,39 @@ pub fn run(root: &Path, o: Options) -> Result<()> {
     let prefix = target_dir.join("wine-prefix");
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
 
-    let x = xwin.display();
-    let cflags = format!(
-        "--target={TARGET} -Wno-unused-command-line-argument \
-         /imsvc{x}/crt/include /imsvc{x}/sdk/include/ucrt /imsvc{x}/sdk/include/um /imsvc{x}/sdk/include/shared"
-    );
-    let rustflags = format!(
-        "-Lnative={x}/crt/lib/x86_64 -Lnative={x}/sdk/lib/um/x86_64 -Lnative={x}/sdk/lib/ucrt/x86_64"
-    );
+    // cc splits *FLAGS like a shell when CC_SHELL_ESCAPED_FLAGS is set;
+    // quote each include so a path with spaces stays one argument.
+    let includes = [
+        xwin.join("crt/include"),
+        xwin.join("sdk/include/ucrt"),
+        xwin.join("sdk/include/um"),
+        xwin.join("sdk/include/shared"),
+    ]
+    .map(|dir| shell_quote(&format!("/imsvc{}", dir.display())))
+    .join(" ");
+    let cflags = format!("--target={TARGET} -Wno-unused-command-line-argument {includes}");
+    // Cargo splits RUSTFLAGS on spaces inside paths, so encode the
+    // separators. Every cargo call below passes --target, so these flags
+    // never reach host build scripts or proc macros.
+    let rustflags = [
+        xwin.join("crt/lib/x86_64"),
+        xwin.join("sdk/lib/um/x86_64"),
+        xwin.join("sdk/lib/ucrt/x86_64"),
+    ]
+    .map(|dir| format!("-Lnative={}", dir.display()))
+    .join("\x1f");
     let env: Vec<(&str, OsString)> = vec![
         ("CC_x86_64_pc_windows_msvc", "clang-cl".into()),
         ("CXX_x86_64_pc_windows_msvc", "clang-cl".into()),
         ("AR_x86_64_pc_windows_msvc", "llvm-lib".into()),
         ("CFLAGS_x86_64_pc_windows_msvc", cflags.clone().into()),
         ("CXXFLAGS_x86_64_pc_windows_msvc", cflags.into()),
+        ("CC_SHELL_ESCAPED_FLAGS", "1".into()),
         (
             "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER",
             "lld-link".into(),
         ),
-        (
-            "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS",
-            rustflags.into(),
-        ),
+        ("CARGO_ENCODED_RUSTFLAGS", rustflags.into()),
         ("CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER", "wine".into()),
         ("WINEPREFIX", prefix.clone().into()),
     ];
@@ -131,4 +142,9 @@ pub fn run(root: &Path, o: Options) -> Result<()> {
 /// `path` as Wine's Z: drive (the host's root) names it.
 fn wine_path(path: &Path) -> String {
     format!("Z:{}", path.display()).replace('/', "\\")
+}
+
+/// `arg` as one shell word for cc's `CC_SHELL_ESCAPED_FLAGS` parsing.
+fn shell_quote(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', "'\\''"))
 }
