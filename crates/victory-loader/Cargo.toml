@@ -29,6 +29,7 @@ windows-sys = { workspace = true, features = [
 
 [dev-dependencies]
 tempfile.workspace = true
+victory-pe = { workspace = true, features = ["fixtures"] }
 
 [features]
 # Debugging switches (scheduled stack dumps and the like).

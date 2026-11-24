@@ -5,6 +5,8 @@
 //! host binaries alike. This crate never modifies anything; patching lives in
 //! `victory-loader`, which uses the raw offsets exported from [`layout`].
 
+#[cfg(any(test, feature = "fixtures"))]
+pub mod fixtures;
 mod image;
 pub mod implib;
 pub mod layout;

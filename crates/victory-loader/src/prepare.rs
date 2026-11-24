@@ -178,8 +178,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn patches_own_test_binary() {
-        let original = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+    fn patches_a_synthetic_executable() {
+        let original = victory_pe::fixtures::executable();
         let prepared = prepare(&original).unwrap();
         assert!(!prepared.info.is_dll(), "info describes the original");
         assert!(prepared.info.import_count() > 0);
@@ -206,7 +206,7 @@ mod tests {
 
     #[test]
     fn keeps_iat_slots_when_import_size_excludes_the_terminator() {
-        let mut original = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let mut original = victory_pe::fixtures::executable();
         let info = ImageInfo::parse(&original).unwrap();
         let directory = layout::data_directory_offset(&original, dir::IMPORT).unwrap();
         // This linker layout counts the descriptors for real modules only.
@@ -244,8 +244,10 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_assigns_static_tls_to_a_prepared_dll() {
-        // Model a title DLL using our own linked image. Loading a DLL leaves
-        // its assigned index intact; the executable-specific redirect resets it.
+        // Model a title DLL using our own linked image. This one must be a
+        // real, loadable PE, so it cannot use the synthetic fixture; it is
+        // Windows-only for the same reason. Loading a DLL leaves its assigned
+        // index intact; the executable-specific redirect resets it.
         let mut original = std::fs::read(std::env::current_exe().unwrap()).unwrap();
         let flags =
             layout::file_header_offset(&original).unwrap() + layout::FILE_HEADER_CHARACTERISTICS;
@@ -275,7 +277,7 @@ mod tests {
 
     #[test]
     fn file_name_is_stable_per_build() {
-        let original = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let original = victory_pe::fixtures::executable();
         let a = prepare(&original).unwrap();
         let b = prepare(&original).unwrap();
         assert_eq!(a.file_name(), b.file_name());

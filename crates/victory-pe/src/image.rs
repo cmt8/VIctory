@@ -405,14 +405,9 @@ fn va_to_rva(va: u64, image_base: u64) -> Result<u32, PeError> {
 mod tests {
     use super::*;
 
-    /// The test binary itself is a real MSVC-linked PE32+ image.
-    fn own_image() -> Vec<u8> {
-        std::fs::read(std::env::current_exe().unwrap()).unwrap()
-    }
-
     #[test]
-    fn parses_own_test_binary() {
-        let info = ImageInfo::parse(&own_image()).unwrap();
+    fn parses_a_synthetic_executable() {
+        let info = ImageInfo::parse(&crate::fixtures::executable()).unwrap();
         assert_eq!(info.machine, MACHINE_AMD64);
         assert!(!info.is_dll());
         assert!(info.entry_rva != 0);
@@ -422,16 +417,19 @@ mod tests {
             .imports
             .iter()
             .find(|m| m.dll.eq_ignore_ascii_case("kernel32.dll"))
-            .expect("Rust std imports kernel32");
+            .expect("the image imports kernel32");
+        assert_eq!(kernel32.entries.len(), 2);
         assert!(kernel32.entries.iter().all(|e| e.iat_slot_rva != 0));
-        // Rust std uses static TLS, so a TLS directory must be present (its
-        // callback array may legitimately be empty).
-        assert!(info.tls.is_some());
+        // A TLS directory must be reported even when its callback array is
+        // empty, which is the normal case for static TLS.
+        let tls = info.tls.expect("TLS directory");
+        assert_eq!(tls.directory_rva, 0x2200);
+        assert!(tls.callback_rvas.is_empty());
     }
 
     #[test]
     fn rva_to_file_offset_maps_entry_point() {
-        let data = own_image();
+        let data = crate::fixtures::executable();
         let info = ImageInfo::parse(&data).unwrap();
         let off = info.rva_to_file_offset(info.entry_rva).unwrap() as usize;
         assert!(off < data.len());
@@ -439,7 +437,7 @@ mod tests {
 
     #[test]
     fn rva_to_file_offset_rejects_offsets_past_4_gib() {
-        let mut info = ImageInfo::parse(&own_image()).unwrap();
+        let mut info = ImageInfo::parse(&crate::fixtures::executable()).unwrap();
         let rva = info.sections[0].rva + 0x20;
         assert!(info.rva_to_file_offset(rva).is_some());
         // Used to overflow (a panic in debug builds, a wrong offset in
@@ -452,14 +450,14 @@ mod tests {
     fn rejects_garbage_without_panicking() {
         assert!(ImageInfo::parse(b"").is_err());
         assert!(ImageInfo::parse(b"MZ not really").is_err());
-        let mut truncated = own_image();
+        let mut truncated = crate::fixtures::executable();
         truncated.truncate(0x200);
         assert!(ImageInfo::parse(&truncated).is_err());
     }
 
     #[test]
     fn rejects_iat_outside_image() {
-        let mut data = own_image();
+        let mut data = crate::fixtures::executable();
         let dd = layout::data_directory_offset(&data, dir::IMPORT).unwrap();
         let import_rva = layout::read_u32(&data, dd).unwrap();
         let desc = ImageInfo::parse(&data)

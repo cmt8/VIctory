@@ -11,5 +11,9 @@ publish.workspace = true
 object.workspace = true
 thiserror.workspace = true
 
+[features]
+# Hand-built PE images, for tests in this crate and its dependents.
+fixtures = []
+
 [lints]
 workspace = true
