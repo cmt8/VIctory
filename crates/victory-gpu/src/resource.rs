@@ -228,6 +228,7 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
 
 /// A format as the host has it. The console's 16-bit depth with stencil
 /// (and its typeless views) has no PC format: the 24-bit ones stand in.
+#[cfg(windows)]
 pub(crate) fn pc_format(format: u32) -> u32 {
     match format {
         118 => 45,
@@ -238,6 +239,7 @@ pub(crate) fn pc_format(format: u32) -> u32 {
 }
 
 /// The typeless format of a format's family (itself if it has none).
+#[cfg(windows)]
 pub(crate) fn family(format: u32) -> u32 {
     const FAMILIES: [(u32, u32); 22] = [
         (1, 4),
@@ -274,11 +276,13 @@ pub(crate) fn family(format: u32) -> u32 {
 }
 
 /// sRGB formats and their linear twins.
+#[cfg(windows)]
 pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 
 /// The format a view of a title texture must name when its host copy is
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
 /// the host copy is typed.
+#[cfg(windows)]
 pub(crate) fn view_format(this: This) -> Option<u32> {
     let own = pc_format(resource(this).desc.format);
     let host = host_resource(this)?;
@@ -290,6 +294,7 @@ pub(crate) fn view_format(this: This) -> Option<u32> {
 /// Depth formats with their typeless family: depth textures that shaders
 /// read are made typeless on the host, which only allows views of
 /// typeless depth resources.
+#[cfg(windows)]
 pub(crate) const DEPTH_FORMATS: [(u32, u32); 4] = [(20, 19), (40, 39), (45, 44), (55, 53)];
 
 /// Mip levels, the full chain for 0.
@@ -325,6 +330,7 @@ pub(crate) struct PlacedFootprint {
 
 impl PlacedFootprint {
     /// The bytes it spans in a buffer: every row pitched but the last.
+    #[cfg(windows)]
     pub(crate) fn bytes(&self) -> Option<u64> {
         let (element, block) = element(self.format)?;
         let lines = u64::from(self.height).div_ceil(block) * u64::from(self.depth);
@@ -874,6 +880,7 @@ fn host_texture(
 }
 
 /// A texture's console memory and description; `None` for buffers.
+#[cfg(windows)]
 pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
     if this.is_null() {
         return None;

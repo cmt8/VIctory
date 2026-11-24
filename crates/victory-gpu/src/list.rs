@@ -256,6 +256,8 @@ extern "system" fn close(this: This) -> HRESULT {
     if let Some(host) = host_list(this) {
         host.close();
     }
+    #[cfg(not(windows))]
+    let _ = this;
     S_OK
 }
 extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT {
@@ -341,6 +343,7 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
 
 /// An unordered access barrier on every resource: earlier shader writes
 /// finish before later work reads or writes.
+#[cfg(windows)]
 const UAV_BARRIER: Barrier = Barrier {
     kind: 2,
     flags: 0,
@@ -351,6 +354,8 @@ const UAV_BARRIER: Barrier = Barrier {
 
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
+    #[cfg(not(windows))]
+    let _ = (this, count, barriers);
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && !barriers.is_null()
@@ -1163,8 +1168,14 @@ extern "system" fn execute_indirect(
         return;
     };
     let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
+    #[cfg(windows)]
     let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
+    #[cfg(not(windows))]
+    let _ = (this, count_offset);
+    #[cfg(windows)]
     let mut ran = false;
+    #[cfg(not(windows))]
+    let ran = false;
     #[cfg(windows)]
     if let ([[kind, ..]], Some(address)) = (args, address)
         && (count.is_null() || counter.is_some())
@@ -1203,6 +1214,7 @@ extern "system" fn execute_indirect(
 }
 
 /// Indirect executions dropped since the last call.
+#[cfg(windows)]
 pub(crate) fn take_indirect() -> u64 {
     INDIRECT.swap(0, std::sync::atomic::Ordering::Relaxed)
 }

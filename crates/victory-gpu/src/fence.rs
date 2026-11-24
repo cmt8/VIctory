@@ -135,7 +135,9 @@ static FUNCTIONS: Table<24> = {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
     use super::*;
+    #[cfg(windows)]
     use crate::object::slot;
 
     #[cfg(windows)]

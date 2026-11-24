@@ -68,6 +68,7 @@ pub(crate) fn heap<'a>(this: This) -> &'a Heap {
 
 impl Heap {
     /// Whether this is a sampler heap.
+    #[cfg(windows)]
     pub(crate) fn samplers(&self) -> bool {
         self.desc.kind == SAMPLERS
     }
@@ -100,6 +101,7 @@ impl Heap {
     }
 
     /// The descriptor index of `handle` in this heap, if it lies in it.
+    #[cfg(windows)]
     pub(crate) fn index(&self, handle: u64) -> Option<u32> {
         let step = u64::from(increment(self.desc.kind)?);
         let at = handle.checked_sub(self.start)?;
@@ -383,6 +385,7 @@ fn record(handle: u64, view: View) {
 }
 
 /// The title released `resource`: the views naming it go stale.
+#[cfg(any(windows, test))]
 pub(crate) fn forget(resource: usize) {
     let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     let Some(entries) = views.by_resource.remove(&resource) else {
@@ -412,6 +415,7 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive).
+#[cfg(any(windows, test))]
 pub(crate) fn view(handle: u64) -> Option<View> {
     if handle == 0 {
         return None;
@@ -564,15 +568,18 @@ pub(crate) extern "system" fn copy(
 }
 
 /// The view recorded at `handle`, if one is.
+#[cfg(windows)]
 pub(crate) fn rtv_record(handle: u64) -> Option<RtvRecord> {
     tagged_record(handle, RTV_TAG)
 }
 
 /// The depth view recorded at `handle`, if one is.
+#[cfg(windows)]
 pub(crate) fn dsv_record(handle: u64) -> Option<RtvRecord> {
     tagged_record(handle, DSV_TAG)
 }
 
+#[cfg(windows)]
 fn tagged_record(handle: u64, tag: u32) -> Option<RtvRecord> {
     if handle == 0 {
         return None;
