@@ -25,6 +25,10 @@ pub fn run(root: &Path, o: Options) -> Result<()> {
         Some(dir) => dir,
         None => PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?).join(".xwin"),
     };
+    // The cargo calls below run from the repository root; anchor a relative
+    // path to the invocation directory first. `absolute` keeps symlinks.
+    let xwin =
+        std::path::absolute(&xwin).with_context(|| format!("resolving {}", xwin.display()))?;
     ensure!(
         xwin.join("crt").is_dir() && xwin.join("sdk").is_dir(),
         "no xwin splat at {} (make one with `xwin --accept-license splat --output {0}`, \
