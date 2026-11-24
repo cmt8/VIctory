@@ -596,6 +596,12 @@ mod host {
 mod tests {
     use super::*;
 
+    // These two register Windows title paths. `runtime::set_image_path`
+    // stores them through `std::path::absolute`, for which `C:\title\..` is
+    // absolute on Windows but relative anywhere else, so off Windows the
+    // host's working directory is prepended and a `\`-separated name no
+    // longer has a last component to match.
+    #[cfg(windows)]
     #[test]
     fn title_images_report_their_original_path() {
         let base = 0x7000_0000_0000;
@@ -654,6 +660,8 @@ mod tests {
         );
     }
 
+    // Windows title paths again; see the note above.
+    #[cfg(windows)]
     #[test]
     fn title_dlls_and_pseudo_modules_are_found_by_name() {
         let base = 0x7100_0000_0000usize;

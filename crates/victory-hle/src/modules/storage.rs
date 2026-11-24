@@ -177,6 +177,10 @@ mod tests {
     use super::*;
     use crate::modules::xgameruntime::method;
 
+    // `folder()` mounts a virtual drive with `files::mount`, which exists
+    // only on Windows and is `None` elsewhere by design, so every path call
+    // here reports NOT_SUPPORTED off Windows.
+    #[cfg(windows)]
     #[test]
     fn serves_a_drive_over_the_title_folder_and_its_quota() {
         type Size = extern "system" fn(This, *mut usize) -> HRESULT;
