@@ -5,7 +5,7 @@
 use std::ffi::{c_char, c_void};
 
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, NOT_SUPPORTED, Object, add_ref, missing, put, text,
+    Guid, HRESULT, Interface, Methods, NOT_SUPPORTED, Object, add_ref, missing, text,
 };
 
 /// HDR mode; asked for with this interface id since 2020.
@@ -77,6 +77,7 @@ extern "system" fn launch_uri(_: This, _user: *const c_void, uri: *const c_char)
 /// power request; the handle is that request.
 #[cfg(windows)]
 extern "system" fn acquire_deferral(_: This, out: *mut *mut c_void) -> HRESULT {
+    use super::xgameruntime::put;
     use windows_sys::Win32::System::Power::{
         PowerCreateRequest, PowerRequestDisplayRequired, PowerSetRequest,
     };

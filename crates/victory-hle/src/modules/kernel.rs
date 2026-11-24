@@ -592,7 +592,8 @@ mod host {
     }
 }
 
-#[cfg(test)]
+// Every test here is Windows-only (see each one).
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
 
