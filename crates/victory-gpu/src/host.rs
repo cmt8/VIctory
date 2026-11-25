@@ -2619,6 +2619,19 @@ pub(crate) fn settle_for_fence() {
     settle_now(WHY_FENCE);
 }
 
+/// Asks the helper thread to land what is settled now ([`land`]) and look
+/// at what queues hold, without waiting for it: a table that found no
+/// free dynamic descriptor slots (`descriptor::host` `dynamic`) waits for
+/// the slots of lists the card has run, which they give back when landed.
+/// Locks the line only for the flag.
+pub(crate) fn land_soon() {
+    // Not waited for: the caller may be inside a submission that holds it.
+    if let Ok(mut line) = LINE.try_lock() {
+        line.poke = true;
+    }
+    LINE_MOVED.notify_all();
+}
+
 /// Resets the host lists of settled flights and keeps them for reuse, as
 /// a queue does for the lists it ran (`crate::list::recycle`).
 fn land() {
@@ -6639,6 +6652,16 @@ impl Meter {
                     refused = crate::watch::REFUSED.load(Ordering::Relaxed),
                     read_beside = crate::watch::read_beside(),
                     "kernel writes into title memory refused under a guard set again since they were opened, opened and tried again, since the start (VICTORY_READ_BESIDE)"
+                );
+                let [in_use, most, waited, got, refused] =
+                    [0, 1, 2, 3, 4].map(|i| crate::descriptor::host::DYNAMIC_STATS[i].load(Ordering::Relaxed));
+                tracing::info!(
+                    in_use,
+                    most,
+                    waited,
+                    got_by_waiting = got,
+                    refused,
+                    "dynamic descriptor slots (tables made afresh): in use now, the most in use since the start; since the start, tables that found none free and waited (VICTORY_DYNAMIC_WAIT_MS), of them got slots, and tables refused (their draws dropped)"
                 );
             }
             #[cfg(feature = "diagnostics")]

@@ -186,6 +186,14 @@ frames later).
   hold the bytes due again; `0` counts only (as before); `guards`, `slots`,
   `all` (also plain-address reads) for finer A/B. The status line "writes
   behind the guards, since the start" has the counts.
+- `VICTORY_DYNAMIC_WAIT_MS` (250; `0` as before): a descriptor table made
+  afresh for a draw that finds no free dynamic slots waits that long for
+  slots given back by lists the card has run (the helper thread is asked
+  to land them) before the draw is dropped. Where the host's view heap has
+  room (2^21 views under vkd3d-proton on RADV) every slot between the
+  title's and the null buffer views is a dynamic one, up to 2^20 (2^18
+  before). The status line "dynamic descriptor slots" says how many are in
+  use, the most ever, and how many tables waited, got slots or were refused.
 - `VICTORY_DSTORAGE_RETRIES` (12): page-destination writes refused for a
   moment are tried again; `0` as before.
 - `VICTORY_FULL_CARD_PASS` (on; `=0` as before): on a full card, texture
