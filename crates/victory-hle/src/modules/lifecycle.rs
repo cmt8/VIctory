@@ -73,8 +73,9 @@ pub extern "system" fn CreateWindowExW(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
-    // SAFETY: the title's own arguments, forwarded (the size fitted).
+    let (ex_style, style, x, y, width, height) = place(parent, ex_style, style, x, y, width, height);
+    // SAFETY: the title's own arguments, forwarded (the size fitted, or
+    // the window made borderless over the screen).
     let hwnd = unsafe {
         wm::CreateWindowExW(
             ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
@@ -99,8 +100,9 @@ pub extern "system" fn CreateWindowExA(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
-    // SAFETY: the title's own arguments, forwarded (the size fitted).
+    let (ex_style, style, x, y, width, height) = place(parent, ex_style, style, x, y, width, height);
+    // SAFETY: the title's own arguments, forwarded (the size fitted, or
+    // the window made borderless over the screen).
     let hwnd = unsafe {
         wm::CreateWindowExA(
             ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
@@ -108,6 +110,59 @@ pub extern "system" fn CreateWindowExA(
     };
     hook(hwnd);
     hwnd
+}
+
+/// Where the title's window goes and how it looks: as the title asks,
+/// fitted to the screen ([`fit`]); or, with `VICTORY_FULLSCREEN=1`, its
+/// first top-level window borderless over the whole primary monitor
+/// ([`borderless`]), which Windows and Wine show as a fullscreen window
+/// (no frame, no title bar). Returns the extended style, style, position
+/// and size to create the window with.
+fn place(
+    parent: HWND,
+    ex_style: u32,
+    style: u32,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> (u32, u32, i32, i32, i32, i32) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static TAKEN: AtomicBool = AtomicBool::new(false);
+    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_FULLSCREEN").is_some_and(|v| v == "1"));
+    if on && parent.is_null() && !TAKEN.swap(true, Ordering::Relaxed) {
+        // SAFETY: plain queries.
+        let (w, h) = unsafe {
+            (
+                wm::GetSystemMetrics(wm::SM_CXSCREEN),
+                wm::GetSystemMetrics(wm::SM_CYSCREEN),
+            )
+        };
+        if w > 0 && h > 0 {
+            let (style, ex_style) = borderless(style, ex_style);
+            tracing::info!(width = w, height = h, "title window borderless over the screen (VICTORY_FULLSCREEN=1)");
+            return (ex_style, style, 0, 0, w, h);
+        }
+    }
+    let (x, y, width, height) = fit(parent, x, y, width, height);
+    (ex_style, style, x, y, width, height)
+}
+
+/// `style` and `ex_style` without a frame: a popup with no caption,
+/// border, sizing frame or window buttons, the rest (visibility, clipping)
+/// kept.
+fn borderless(style: u32, ex_style: u32) -> (u32, u32) {
+    let frame = wm::WS_CAPTION
+        | wm::WS_THICKFRAME
+        | wm::WS_SYSMENU
+        | wm::WS_MINIMIZEBOX
+        | wm::WS_MAXIMIZEBOX
+        | wm::WS_CHILD;
+    let edges = wm::WS_EX_WINDOWEDGE
+        | wm::WS_EX_CLIENTEDGE
+        | wm::WS_EX_DLGMODALFRAME
+        | wm::WS_EX_STATICEDGE;
+    ((style & !frame) | wm::WS_POPUP, ex_style & !edges)
 }
 
 /// A console title sizes its window to its render target (
@@ -329,6 +384,27 @@ mod tests {
         UnregisterAppStateChangeNotification(a);
         let left: Vec<_> = routines().iter().map(|r| r.0).collect();
         assert_eq!(left, [b]);
+    }
+
+    /// A borderless window keeps no frame, caption or window buttons of
+    /// the title's style, and keeps its visibility.
+    #[test]
+    fn borderless_windows_have_no_frame() {
+        let (style, ex_style) = borderless(
+            wm::WS_OVERLAPPEDWINDOW | wm::WS_VISIBLE | wm::WS_CLIPCHILDREN,
+            wm::WS_EX_WINDOWEDGE | wm::WS_EX_APPWINDOW,
+        );
+        assert_eq!(style, wm::WS_POPUP | wm::WS_VISIBLE | wm::WS_CLIPCHILDREN);
+        assert_eq!(ex_style, wm::WS_EX_APPWINDOW);
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: 640,
+            bottom: 360,
+        };
+        // SAFETY: a plain computation on our rectangle.
+        assert_ne!(unsafe { wm::AdjustWindowRectEx(&mut rect, style, 0, ex_style) }, 0);
+        assert_eq!((rect.left, rect.top, rect.right, rect.bottom), (0, 0, 640, 360), "no frame around the picture");
     }
 
     #[test]
