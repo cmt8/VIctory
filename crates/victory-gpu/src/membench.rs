@@ -338,6 +338,29 @@ fn questions(label: &str, pool: &Pool, watched: &Block, plain: &Block, n: usize)
     report(&format!("{label} ReadProcessMemory 4 KiB from an unmapped placeholder (fails)"), ns_per(n, |_| {
         assert!(!rpm(hole, buffer.as_ptr() as usize, 4096));
     }));
+    // A refresh of a copy of view memory (`watch::writes`): the kernel's
+    // write watch, which fails for a view, then the guards; once the guards
+    // know the view, the guards alone.
+    report(&format!("{label} GetWriteWatch of a mapped 64 KiB view (fails)"), ns_per(n, |_| {
+        let mut count = PAGE / 4096;
+        found.resize(count, 0);
+        let mut granularity = 0;
+        // SAFETY: room for `count` answers.
+        let failed = unsafe {
+            GetWriteWatch(1, mapped as *const c_void, PAGE, found.as_mut_ptr().cast(), &mut count, &mut granularity)
+        } != 0;
+        assert!(failed, "a view is not write-watched");
+    }));
+    assert!(crate::watch::writes(mapped, mapped + PAGE, true).is_some(), "a view is guarded");
+    report(&format!("{label} watch::writes of a guarded 64 KiB view the guards know"), ns_per(n, |_| {
+        assert!(crate::watch::writes(mapped, mapped + PAGE, false).is_none());
+        assert!(crate::watch::writes(mapped, mapped + PAGE, true).is_some());
+    }));
+    // Read-write and unguarded again, for what follows.
+    crate::watch::title_memory_remapped(mapped, PAGE);
+    let mut old = 0;
+    // SAFETY: our view; only its protection changes.
+    unsafe { VirtualProtect(mapped as *const c_void, PAGE, PAGE_READWRITE, &mut old) };
 }
 
 #[test]
