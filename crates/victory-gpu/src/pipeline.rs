@@ -764,6 +764,8 @@ static FUNCTIONS: Table<24> = {
 };
 
 #[cfg(windows)]
+mod apart;
+#[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
 pub mod known;
