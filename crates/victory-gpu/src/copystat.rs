@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// Counters since the last line.
-pub enum C {
+pub(crate) enum C {
     Submissions,
     Copies,
     CopyBytes,
@@ -85,17 +85,11 @@ pub enum C {
     /// the time.
     CompareBytes,
     CompareUs,
-    /// `XMemMapPhysicalPagesScatter` calls, the pages they name, and the
-    /// `XMemMapPhysicalPages` calls they made of them (fewer than the pages
-    /// when consecutive addresses ride one call).
-    Scatter,
-    ScatterPages,
-    ScatterMaps,
 }
-const COUNTERS: usize = 55;
+const COUNTERS: usize = 52;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
-pub fn add(c: C, n: u64) {
+pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
 }
 
@@ -222,7 +216,7 @@ pub(crate) fn log(frames: f64) {
          refresh batches, steps (each with the batch it flushes): refresh {:.1} ms, copy {:.1} ms, \
          work {:.1} ms, GPU writes {:.1} ms, textures {:.1} ms, heaps {:.1} ms, title memory {:.1} ms; \
          heap texture uploads {:.1} ms, state preludes {:.1} ms; copying back compared {:.1} MB          in {:.1} ms; working set {:.0} MB, \
-         {:.0} hard faults; {:.1} page scatters {:.0} pages in {:.1} map calls",
+         {:.0} hard faults",
         c[C::Submissions as usize],
         c[C::Copies as usize],
         mb(c[C::CopyBytes as usize]),
@@ -282,9 +276,6 @@ pub(crate) fn log(frames: f64) {
             let hard = hard_faults();
             (hard - HARD.swap(hard, Relaxed).min(hard)) as f64 / frames
         },
-        c[C::Scatter as usize],
-        c[C::ScatterPages as usize],
-        c[C::ScatterMaps as usize],
     );
     let held: Vec<String> = crate::watch::held_times()
         .iter()
