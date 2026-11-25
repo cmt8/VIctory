@@ -4,9 +4,17 @@
 //! billion vertices or a dispatch past the host's limits runs until the
 //! host resets the display driver. So active records are copied and clamped
 //! on the GPU into a device-local scratch buffer, just before execution, by a
-//! compute shader of ours (HLSL compiled by the system's compiler; a 5.1
-//! shader with its root signature inside), leaving the title's argument and
-//! count buffers untouched.
+//! compute shader of ours (HLSL compiled by the system's compiler as a 5.1
+//! shader; its root signature is made beside it), leaving the title's
+//! argument and count buffers untouched.
+//!
+//! The source keeps to what Wine's compiler takes as well as Microsoft's:
+//! Wine's has no methods on writable buffers but `Store*` (no `Load*`, no
+//! `Interlocked*` methods: those only as functions) and ignores a
+//! `[RootSignature]`. So the two buffers the shader writes are structured
+//! buffers of `uint` indexed in words (a root descriptor can be either; the
+//! callers refuse offsets, strides and addresses that are not multiples of
+//! 4), and the root signature is serialized here.
 //!
 //! When a count buffer is given, threads at or past `min(max, count)` return
 //! immediately without charging the list's budget or reading uninitialized
@@ -28,7 +36,6 @@ use windows::core::s;
 use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
 cbuffer Record : register(b0) {
     uint kind;
     uint stride;
@@ -42,14 +49,14 @@ cbuffer Record : register(b0) {
 };
 ByteAddressBuffer src_args : register(t0);
 ByteAddressBuffer count_buf : register(t1);
-RWByteAddressBuffer dst_args : register(u0);
+// Both written ones in words.
+RWStructuredBuffer<uint> dst_args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
-// records run empty.
-RWByteAddressBuffer budget : register(u1);
+// records run empty. Word 0; words 1 and 2 are diagnostics (below).
+RWStructuredBuffer<uint> budget : register(u1);
 static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
-[RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     uint eff_count = records;
@@ -59,7 +66,8 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
     if (id.x >= eff_count) return;
     uint src_at = args_offset + id.x * stride;
-    uint dst_at = id.x * stride;
+    // In words: the stride is a multiple of 4.
+    uint dst_at = id.x * (stride / 4);
     uint cost;
     uint2 draw_counts = uint2(0, 0);
     uint3 groups = uint3(0, 0, 0);
@@ -93,8 +101,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         // Diagnostics, in the budget buffer's next words: the largest
         // group count a mesh record asked for, and the groups asked in all.
         uint was;
-        budget.InterlockedMax(4, g.x, was);
-        budget.InterlockedAdd(8, min(g.x, 1u << 24), was);
+        InterlockedMax(budget[1], g.x, was);
+        InterlockedAdd(budget[2], min(g.x, 1u << 24), was);
         g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
         cost = g.x * g.y * g.z * 128u;
         groups = g;
@@ -102,12 +110,13 @@ void main(uint3 id : SV_DispatchThreadID) {
     bool over = false;
     if (cost > 0) {
         uint before;
-        budget.InterlockedOr(0, 0, before);
-        [allow_uav_condition]
+        InterlockedOr(budget[0], 0, before);
+        // No `[allow_uav_condition]`: Wine's compiler stops at it ("not
+        // yet implemented"), and Microsoft's builds the loop without it.
         while (before < BUDGET) {
             uint next = (BUDGET - before <= cost) ? BUDGET : (before + cost);
             uint prev;
-            budget.InterlockedCompareExchange(0, before, next, prev);
+            InterlockedCompareExchange(budget[0], before, next, prev);
             if (prev == before) break;
             before = prev;
         }
@@ -117,17 +126,20 @@ void main(uint3 id : SV_DispatchThreadID) {
         if (over) {
             draw_counts = uint2(0, 0);
         }
-        dst_args.Store2(dst_at, draw_counts);
+        dst_args[dst_at] = draw_counts.x;
+        dst_args[dst_at + 1] = draw_counts.y;
         for (uint off = 8; off < stride; off += 4) {
-            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+            dst_args[dst_at + off / 4] = src_args.Load(src_at + off);
         }
     } else {
         if (over) {
             groups = uint3(0, 0, 0);
         }
-        dst_args.Store3(dst_at, groups);
+        dst_args[dst_at] = groups.x;
+        dst_args[dst_at + 1] = groups.y;
+        dst_args[dst_at + 2] = groups.z;
         for (uint off = 12; off < stride; off += 4) {
-            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+            dst_args[dst_at + off / 4] = src_args.Load(src_at + off);
         }
     }
 }
@@ -194,11 +206,11 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
         return Err(e);
     }
     let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
+    let root = root_signature(device)?;
+    // SAFETY: the blob's own bytes.
     unsafe {
         let bytes =
             std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE {
@@ -209,6 +221,21 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
         })?;
         Ok(Clamp { root, pso })
     }
+}
+
+/// The clamp's root signature, as `record_clamp_as` binds it: the record
+/// constants (six at b0), the source arguments and the count as root SRVs
+/// (t0, t1), the clamped arguments and the budget as root UAVs (u0, u1).
+fn root_signature(device: &ID3D12Device) -> windows::core::Result<ID3D12RootSignature> {
+    use crate::host::{root_constants, root_view};
+    let params = [
+        root_constants(0, 6),
+        root_view(D3D12_ROOT_PARAMETER_TYPE_SRV, 0),
+        root_view(D3D12_ROOT_PARAMETER_TYPE_SRV, 1),
+        root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 0),
+        root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 1),
+    ];
+    crate::host::root_signature(device, &params, "argument clamp")
 }
 
 /// Minimum record byte stride for a supported PC indirect argument `kind`.
@@ -1211,6 +1238,76 @@ void main() {
         );
         list.close();
         host.execute(&[&list]);
+        list.reset();
+    }
+
+    /// The clamp's output on the host GPU (the WARP tests above need a WARP
+    /// adapter, which Wine has not): records at offsets into the source,
+    /// a count read at an offset into its buffer, strides past the
+    /// smallest, and every kind, word for word as clamped.
+    #[test]
+    fn clamped_records_land_word_for_word_on_the_host() {
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let list = host.new_list().expect("command list");
+        let (src, src_ptr) = host.shared_buffer(256).expect("source buffer");
+        let (count, count_ptr) = host.shared_buffer(256).expect("count buffer");
+        let back = host.read_back_buffer(256).expect("read-back buffer");
+        let words = src_ptr.cast::<u32>();
+        let put = |at: usize, record: &[u32]| {
+            // SAFETY: inside the mapped 256 bytes.
+            unsafe { std::ptr::copy_nonoverlapping(record.as_ptr(), words.add(at / 4), record.len()) };
+        };
+        // An indexed draw (kind 1, stride 20) at byte 16; two dispatches
+        // (kind 2, stride 16) at byte 64, of which the count (one, at byte
+        // 8 of its buffer) lets the first run; a mesh dispatch (kind 10,
+        // stride 12) at byte 128.
+        put(16, &[u32::MAX, 5, 11, 12, 13]);
+        put(64, &[70_000, 2, 3, 0xab, 1, 1, 1, 0xcd]);
+        put(128, &[100_000, 7, 9]);
+        // SAFETY: inside the mapped 256 bytes.
+        unsafe { count_ptr.cast::<u32>().add(2).write_volatile(1) };
+        let cases: [(u64, Option<u64>, (u32, u32, u32), u64); 3] =
+            [(16, None, (1, 20, 1), 0), (64, Some(8), (2, 16, 2), 64), (128, None, (10, 12, 1), 128)];
+        for (at, count_at, spec, out) in cases {
+            let clamped = bound(&list, (&src, at), count_at.map(|c| (&count, c)), spec).expect("clamped");
+            // The scratch buffer is the same one each time: its record is
+            // copied out before the next clamp.
+            // SAFETY: an open list; live buffers in the states named.
+            unsafe {
+                let l = &list.list;
+                l.ResourceBarrier(&[transition(
+                    &clamped,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                l.CopyBufferRegion(&back, out, &clamped, 0, u64::from(spec.1));
+                l.ResourceBarrier(&[transition(
+                    &clamped,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                )]);
+            }
+            done(&list, &clamped);
+        }
+        list.close();
+        host.execute(&[&list]);
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: a read-back buffer the list has written and the host has
+        // waited for (`execute`).
+        unsafe { back.Map(0, None, Some(&mut mapped)) }.expect("mapped");
+        // SAFETY: the 256 mapped bytes.
+        let read = |at: usize, n: usize| unsafe { std::slice::from_raw_parts(mapped.cast::<u32>().add(at / 4), n).to_vec() };
+        // 2^24 vertices; instances cut to 2^26 / 2^24; the rest copied.
+        assert_eq!(read(0, 5), [1 << 24, 4, 11, 12, 13]);
+        // Groups cut to 65,535 per dimension; the fourth word copied. The
+        // second record is past the count and not looked at.
+        assert_eq!(read(64, 4), [65_535, 2, 3, 0xab]);
+        // A mesh dispatch: one-dimensional, at most 65,535 groups.
+        assert_eq!(read(128, 3), [65_535, 1, 1]);
+        // SAFETY: mapped above.
+        unsafe { back.Unmap(0, None) };
         list.reset();
     }
 }
