@@ -511,6 +511,10 @@ fn mesh_kept(pipeline: usize) -> bool {
     last.as_bytes().contains(&hash[15]) && (before.is_empty() || before.as_bytes().contains(&hash[14]))
 }
 
+/// The sampler heap we bind when the title binds none (a value no title heap
+/// address takes).
+const SAMPLERS_OURS: usize = usize::MAX;
+
 /// Draws recorded on the host GPU since the last frame line.
 static DRAWN: AtomicU64 = AtomicU64::new(0);
 
@@ -838,6 +842,16 @@ impl State {
 
     pub(crate) fn set_pipeline(&mut self, pipeline: This) {
         self.pipeline = pipeline as usize;
+    }
+
+    /// The heaps a list must have bound before a root signature that
+    /// indexes them directly is set: the title's of each kind, and ours for
+    /// a sampler heap it binds none of. D3D12 requires a heap of both kinds
+    /// to be bound before such a signature (the debug layer's id 1419), and
+    /// every signature we make says its sampler heap is indexed directly;
+    /// compute lists that only read views bind no sampler heap.
+    fn wanted_heaps(title: [usize; 2]) -> [usize; 2] {
+        [title[0], if title[1] != 0 { title[1] } else { SAMPLERS_OURS }]
     }
 
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
@@ -1298,18 +1312,30 @@ impl State {
         }
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
-        if self.host_heaps != self.heaps {
-            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
+        let want = Self::wanted_heaps(self.heaps);
+        if self.host_heaps != want {
+            let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = self
                 .heaps
                 .iter()
-                .filter(|&&h| h != 0)
+                .filter(|&&h| h != 0 && h != SAMPLERS_OURS)
                 .filter_map(|&h| crate::descriptor::heap(h as This).host())
                 .map(|h| Some(h.heap.clone()))
                 .collect();
+            if want[1] == SAMPLERS_OURS {
+                match crate::descriptor::fallback_samplers() {
+                    Some(h) => {
+                        tracing::debug!("the title binds no sampler heap: binding ours");
+                        heaps.push(Some(h.heap.clone()));
+                    }
+                    None => {
+                        once!("no sampler heap of ours to bind");
+                    }
+                }
+            }
             heaps.iter().flatten().for_each(|h| list.keep(h));
             // SAFETY: an open list and shader-visible heaps.
             unsafe { l.SetDescriptorHeaps(&heaps) };
-            self.host_heaps = self.heaps;
+            self.host_heaps = want;
             self.host_roots = [0; 2];
         }
         // The depth target a draw only tests, for the views of it that the
@@ -4131,6 +4157,21 @@ mod replay_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A root signature that indexes the heaps directly needs one of each
+    /// kind bound before it is set: our sampler heap stands in for a title
+    /// that binds none, which a compute list that only reads views does.
+    #[test]
+    fn a_list_without_a_sampler_heap_gets_ours() {
+        // The title binds both: nothing of ours.
+        assert_eq!(State::wanted_heaps([0x10, 0x20]), [0x10, 0x20]);
+        // Views only: our sampler heap after them.
+        assert_eq!(State::wanted_heaps([0x10, 0]), [0x10, SAMPLERS_OURS]);
+        // Neither: ours of the sampler kind still.
+        assert_eq!(State::wanted_heaps([0, 0]), [0, SAMPLERS_OURS]);
+        // A title sampler heap stays whatever the views are.
+        assert_eq!(State::wanted_heaps([0, 0x20]), [0, 0x20]);
+    }
 
     #[test]
     fn a_lone_record_opens_a_window_at_the_remembered_step() {
