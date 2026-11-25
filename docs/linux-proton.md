@@ -134,6 +134,15 @@ and `policy::tests::repository_passes_policy` (runs `git`). Run
   views of physical pages go straight to their guards, and allocations are
   looked up from a cache rather than with `VirtualQuery`, which takes the
   same lock as the title's write faults.
+  Also only under Wine, each with a switch that restores the earlier
+  behaviour: a texture with a page not there is read as a partly mapped
+  one instead of waiting for the runtime to finish remapping
+  (`VICTORY_TEXTURE_PARTLY_WAIT=1` waits); the thread that copies back
+  what shaders wrote fetches from the card on a copy queue of its own
+  (`VICTORY_RELAY_FETCH_QUEUE=0`: on the host's queue); the pieces hashed
+  again after sends to card copies are one pass per copy
+  (`VICTORY_CARD_PIECE_LISTS=0`); texture staging buffers are kept by
+  size class for the next texture (`VICTORY_STAGING_POOL=0`).
 - **Software rendering does not work.** On lavapipe, Wine cannot handle the
   write faults of VIctory's guarded title memory when lavapipe's own
   threads take them.
