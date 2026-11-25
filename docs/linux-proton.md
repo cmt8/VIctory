@@ -125,6 +125,30 @@ pipeline set", the ray-tracing structure builder's dispatches (off unless
 `VICTORY_BVH_BUILDER=1`), or what else dropped a draw whose pipeline is
 there (an index buffer outside title buffers, a table without free slots,
 ...). It writes to the log only.
+A compute program's wave sum of 16-bit floats where some lanes have left
+(the refusal "a wave sum of 16-bit floats where not every lane runs"; compute
+`b22a16a178976e1b` in a Linux run, bound when the world appears) runs on a
+host of 64-lane waves, bit for bit as the console adds it;
+`VICTORY_HALF_SUM_PRESENT=0` refuses it as before (its dispatches are then
+dropped). Part of the shader cache key.
+A `DispatchMeshX` whose group counts are in GPU memory is dropped (counted
+with the indirect executions dropped, and named in the drop reasons);
+`VICTORY_MESH_INDIRECT=1` runs it as an indirect execution of one record,
+as upstream #1749 does: that record layout is unchecked against the title,
+and the first Linux run with it ended in a GPU page fault and reset.
+A draw or dispatch whose root descriptor (title memory's directory, the
+view heap's address or stride table, a root constant buffer, a root view
+outside title memory) has nothing to bind is dropped, named in the drop
+reasons, instead of running with the parameter unbound.
+With `VICTORY_DROP_REASONS=1` a line `indirect records per frame` also
+says what the argument clamp did to the indirect records it bounded: how
+many asked for work and ran empty because their list's budget (2^27 vertex
+instances or threads) was spent, how many lists ran out, how many records
+asked for nothing, and how many draws were cut to the bounds. Records
+emptied by the budget draw nothing and are counted nowhere else.
+`VICTORY_INDIRECT_BUDGET_LOG2=<20..31>` sets the budget for A/B runs; a
+larger one lets garbage records (left by passes that do not run) run
+longer before they are cut, which on a slow card can mean a reset.
 `VICTORY_PIPELINE_WAIT_MS` sets how long a frame may wait for pipelines
 being made (500 by default; 0 never waits, pipelines then appear a few
 frames later).

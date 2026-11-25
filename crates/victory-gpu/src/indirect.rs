@@ -52,7 +52,7 @@ ByteAddressBuffer count_buf : register(t1);
 // Both written ones in words.
 RWStructuredBuffer<uint> dst_args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
-// records run empty. Word 0; words 1 and 2 are diagnostics (below).
+// records run empty. Word 0; words 1 to 5 are diagnostics (below).
 RWStructuredBuffer<uint> budget : register(u1);
 static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
@@ -70,6 +70,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     uint dst_at = id.x * (stride / 4);
     uint cost;
     uint2 draw_counts = uint2(0, 0);
+    uint2 asked_counts = uint2(0, 0);
     uint3 groups = uint3(0, 0, 0);
     if (kind <= 1) {
         // Draws: vertex or index count, then instances.
@@ -81,6 +82,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         uint instances = min(asked.y, (1u << 26) / max(count, 1u));
         cost = count * instances;
         draw_counts = uint2(count, instances);
+        asked_counts = asked;
     } else if (kind == 2) {
         uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
         // x * y fits 32 bits; the whole count may not.
@@ -108,6 +110,15 @@ void main(uint3 id : SV_DispatchThreadID) {
         groups = g;
     }
     bool over = false;
+    uint noted;
+    if (cost == 0) {
+        // Diagnostics: records that ask for nothing (or were left empty
+        // above), and of the draw records the ones cut by the bounds.
+        InterlockedAdd(budget[4], 1u, noted);
+    }
+    if (kind <= 1 && (draw_counts.x < asked_counts.x || draw_counts.y < asked_counts.y)) {
+        InterlockedAdd(budget[5], 1u, noted);
+    }
     if (cost > 0) {
         uint before;
         InterlockedOr(budget[0], 0, before);
@@ -121,6 +132,11 @@ void main(uint3 id : SV_DispatchThreadID) {
             before = prev;
         }
         over = before >= BUDGET || BUDGET - before < cost;
+        if (over) {
+            // Diagnostics: records that asked for work and run empty because
+            // the list's budget is spent.
+            InterlockedAdd(budget[3], 1u, noted);
+        }
     }
     if (kind <= 1) {
         if (over) {
@@ -173,14 +189,37 @@ fn make() -> windows::core::Result<Clamp> {
     make_for(device)
 }
 
+/// `VICTORY_INDIRECT_BUDGET_LOG2=<20..=31>`: the per-list budget of the
+/// clamp is 2^N vertex instances or threads instead of 2^27. For A/B runs
+/// on what the budget empties (the frame line's "indirect records ... run
+/// empty: the list's budget spent"). A larger budget lets garbage records
+/// run longer before they are cut: 2^31 is sixteen times the work a list
+/// may ask for, which on a slow card can be seconds, and a card reset.
+fn budget_log2() -> u32 {
+    static LOG2: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LOG2.get_or_init(|| {
+        std::env::var("VICTORY_INDIRECT_BUDGET_LOG2")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|n| (20..=31).contains(n))
+            .unwrap_or(27)
+    })
+}
+
+/// The clamp's source with the budget [`budget_log2`] asks for.
+fn source() -> String {
+    SOURCE.replace("BUDGET = 1u << 27;", &format!("BUDGET = 1u << {};", budget_log2()))
+}
+
 fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
+    let source = source();
     // SAFETY: the source and names live through the call; out pointers ours.
     let compiled = unsafe {
         D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
+            source.as_ptr().cast(),
+            source.len(),
             s!("clamp"),
             None,
             None,
@@ -1113,7 +1152,7 @@ void main() {
         // SAFETY: mapped buffers have sufficient capacity.
         unsafe {
             std::ptr::copy_nonoverlapping(initial_src.as_ptr(), src_ptr, total_bytes);
-            (budget_ptr as *mut u32).write_volatile(0);
+            std::ptr::write_bytes(budget_ptr, 0, 256);
             std::ptr::write_bytes(readback_ptr, 0, total_bytes);
         }
 
@@ -1179,6 +1218,12 @@ void main() {
             assert_eq!(rec[5], 0xCAFE_0000 | (i as u32));
         }
         assert_eq!((kept, zeroed), (2, (RECORDS as usize) - 2));
+        // The clamp's notes (`HostList::budget` takes them): the records run
+        // empty with the budget spent, those asking for nothing, and the
+        // draws cut to the bounds (all of them: both counts are all ones).
+        // SAFETY: GPU work completed; the budget buffer's mapping.
+        let notes: Vec<u32> = unsafe { (3..6).map(|k| (budget_ptr as *const u32).add(k).read_volatile()).collect() };
+        assert_eq!(notes, vec![RECORDS - 2, 0, RECORDS]);
     }
 
     /// Exercises `HostList::indirect_scratch`, `bound`, `done`, `Host::execute`,
