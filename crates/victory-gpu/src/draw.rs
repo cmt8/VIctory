@@ -3138,7 +3138,12 @@ impl State {
         };
         if !ran {
             crate::indirect::done(list, &bounded);
-            why("prepare failed");
+            // (with what stopped the binding, which would otherwise be left
+            // for the next drop to be counted under)
+            match DROP_WHY.take() {
+                Some(inner) => why(&format!("prepare failed: {inner}")),
+                None => why("prepare failed"),
+            }
             return false;
         }
         #[cfg(feature = "diagnostics")]
