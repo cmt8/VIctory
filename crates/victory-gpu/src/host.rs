@@ -33,8 +33,81 @@ pub(crate) fn texture_state(state: u32) -> u32 {
 }
 
 /// Render target views live only until their command is recorded, so a
-/// ring of host descriptors is enough.
+/// ring of host descriptors is enough: one per thread
+/// ([`thread_view_slot`]), and this shared one only where a thread's own
+/// cannot be had.
 const RTV_RING: u32 = 1024;
+
+/// Slots in each thread's own ring of render target views, and in its ring
+/// of depth views. A thread makes at most nine views (eight targets and a
+/// depth) before it records them.
+const THREAD_RING: u32 = 64;
+
+/// A thread's own ring of CPU-only views of one kind.
+struct ThreadRing {
+    _heap: ID3D12DescriptorHeap,
+    start: usize,
+    step: usize,
+    next: u32,
+}
+
+thread_local! {
+    /// This thread's rings: render target views, depth views.
+    static THREAD_RINGS: std::cell::RefCell<[Option<ThreadRing>; 2]> =
+        const { std::cell::RefCell::new([None, None]) };
+}
+
+/// A slot of this thread's own ring of `kind` views (render target or
+/// depth), made on first use; `None` if it cannot be had (the heap is not
+/// made, or the thread is ending).
+///
+/// The views are made and recorded on the same thread. With one ring for
+/// all threads (before, and upstream's `RTV_RING` until its PR #2844, whose
+/// fix this follows in spirit: slots held until recording consumes them)
+/// the ring could come round while a thread was between making a view and
+/// recording it, as when the next target's host copy is made first, which
+/// takes milliseconds: the slot then held another thread's view (or part of
+/// one, vkd3d-proton writing a descriptor field by field), and the draw or
+/// clear went to that thread's texture. A thread's own ring comes round
+/// only after the thread has made `THREAD_RING` views itself.
+fn thread_view_slot(device: &ID3D12Device, kind: D3D12_DESCRIPTOR_HEAP_TYPE) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+    let which = usize::from(kind == D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+    THREAD_RINGS
+        .try_with(|rings| {
+            let mut rings = rings.try_borrow_mut().ok()?;
+            let ring = &mut rings[which];
+            if ring.is_none() {
+                // SAFETY: a plain description of a CPU-only heap; the
+                // device is live.
+                let made = unsafe {
+                    device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: kind,
+                        NumDescriptors: THREAD_RING,
+                        ..Default::default()
+                    })
+                };
+                let heap = match made {
+                    Ok(heap) => heap,
+                    Err(e) => {
+                        static ONCE: std::sync::Once = std::sync::Once::new();
+                        ONCE.call_once(|| tracing::warn!(error = %e, "no view ring of a thread's own: the shared one is used"));
+                        return None;
+                    }
+                };
+                // SAFETY: the heap just made; a live device.
+                let (start, step) = unsafe {
+                    (heap.GetCPUDescriptorHandleForHeapStart().ptr, device.GetDescriptorHandleIncrementSize(kind) as usize)
+                };
+                *ring = Some(ThreadRing { _heap: heap, start, step, next: 0 });
+            }
+            let ring = ring.as_mut()?;
+            let slot = ring.next % THREAD_RING;
+            ring.next = ring.next.wrapping_add(1);
+            Some(D3D12_CPU_DESCRIPTOR_HANDLE { ptr: ring.start + slot as usize * ring.step })
+        })
+        .ok()
+        .flatten()
+}
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
@@ -1244,6 +1317,35 @@ mod tests {
     }
 
     use super::*;
+
+    /// A view one thread has made and not yet recorded keeps its slot while
+    /// other threads make far more views than the old shared ring had
+    /// (after upstream PR #2844's `pending_rtv_survives_other_recorders`).
+    #[test]
+    fn a_view_not_yet_recorded_keeps_its_slot_while_other_threads_make_views() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let null_rtv = D3D12_RENDER_TARGET_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        let pending = host.rtv(None, Some(&null_rtv));
+        let others: Vec<usize> = std::thread::scope(|scope| {
+            (0..4)
+                .map(|_| scope.spawn(|| (0..2 * RTV_RING).map(|_| host.rtv(None, Some(&null_rtv)).ptr).collect::<Vec<_>>()))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .flat_map(|t| t.join().unwrap())
+                .collect()
+        });
+        assert!(!others.contains(&pending.ptr), "another thread's view took a slot not yet recorded");
+        // The thread's own ring comes round only after its own views.
+        let mine: Vec<usize> = (0..THREAD_RING).map(|_| host.rtv(None, Some(&null_rtv)).ptr).collect();
+        assert_eq!(mine.last(), Some(&pending.ptr));
+        assert!(!mine[..mine.len() - 1].contains(&pending.ptr));
+    }
 
     /// The card compare as the runtime makes it (`make_card_work`: its
     /// pipeline and root signature), on the host GPU: the steps and
@@ -6632,12 +6734,15 @@ impl Host {
         resource: Option<&ID3D12Resource>,
         desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>,
     ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        let slot = self.next_rtv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
         // SAFETY: a slot of our heap and a live resource, or none with a
         // description (a typed null view).
         unsafe {
-            let mut handle = self.rtvs.GetCPUDescriptorHandleForHeapStart();
-            handle.ptr += (slot * self.rtv_size) as usize;
+            let handle = thread_view_slot(&self.device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV).unwrap_or_else(|| {
+                let slot = self.next_rtv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
+                let mut handle = self.rtvs.GetCPUDescriptorHandleForHeapStart();
+                handle.ptr += (slot * self.rtv_size) as usize;
+                handle
+            });
             self.device
                 .CreateRenderTargetView(resource, desc.map(|d| d as *const _), handle);
             handle
@@ -6650,11 +6755,14 @@ impl Host {
         resource: &ID3D12Resource,
         desc: Option<&D3D12_DEPTH_STENCIL_VIEW_DESC>,
     ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        let slot = self.next_dsv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
         // SAFETY: a slot of our heap and a live resource.
         unsafe {
-            let mut handle = self.dsvs.GetCPUDescriptorHandleForHeapStart();
-            handle.ptr += (slot * self.dsv_size) as usize;
+            let handle = thread_view_slot(&self.device, D3D12_DESCRIPTOR_HEAP_TYPE_DSV).unwrap_or_else(|| {
+                let slot = self.next_dsv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
+                let mut handle = self.dsvs.GetCPUDescriptorHandleForHeapStart();
+                handle.ptr += (slot * self.dsv_size) as usize;
+                handle
+            });
             self.device
                 .CreateDepthStencilView(resource, desc.map(|d| d as *const _), handle);
             handle
