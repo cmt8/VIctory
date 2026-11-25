@@ -11,10 +11,11 @@ The default branch, `main`, is upstream's code as of `ffe310e` plus this
 section. The work is on the branches below. Upstream's README follows,
 unchanged; it describes the Windows build.
 
-## Status (2026-11-24)
+## Status (2026-11-25)
 
-**Not playable.** One person's observations on one machine, with
-`linux/fx-next`; other GPUs, drivers and Proton versions have not been tried.
+**Not playable: about 6 fps in the world.** One person's observations on one
+machine, with `linux/fx-next8`; other GPUs, drivers and Proton versions have
+not been tried.
 
 Machine: Arch Linux, kernel 7.3, AMD RX 7900 XTX (RADV, Mesa 26.3), Ryzen 7
 7800X3D, 32 GB RAM, Proton Experimental (based on wine-11.0) with its own
@@ -24,16 +25,22 @@ vkd3d-proton.
 |-------|------|
 | Boot screens and menus | 30 fps |
 | Boot logo video | plays cleanly |
-| Entering the world | a few minutes at under 1 fps while about 59,000 textures upload |
-| Opening scenes, first playable section | reached; visible defects: blocky texture patches, some broken or missing geometry, dark shadows; 300-800 draws a frame dropped for shaders or pipelines not handled yet |
-| The world, textures streamed in | about 4-6 fps |
-| Memory | about 14 GB of RAM and most of the card's 24 GB |
+| Entering the world | about four and a half minutes from launch, cutscenes skipped |
+| First playable section (the boat) | renders close to right: sky, water, shoreline, characters and the map; the boat floats and the mission goes on. Known defects: grain on eyes, glass and some skin; 70-90 draws a frame dropped for pipelines not handled yet |
+| Speed there | about 175 ms a frame (5.7 fps) at 3,900 draws; the title's own rate is 30 fps |
+| Stability | Three 8-10 minute unattended runs of this branch and its parent without a crash. Before the fix carried from fxceless #1033, one run in five ended in a GPU page fault and an amdgpu ring reset; one earlier run ended in a title crash that has not been seen again or explained |
+
+Where the frame goes now: about 55 ms preparing on the CPU (copying title
+memory the card needs), 80-90 ms waiting for the card, 30 ms copying results
+back. The card time is mostly work this layer adds, not the title's
+rendering, and is what is being looked at next.
 
 ## Branches
 
 | Branch | What it is |
 |--------|------------|
-| [`linux/fx-next`](https://github.com/cmt8/VIctory/tree/linux/fx-next) | Current best. [fxceless/victory-fork](https://github.com/fxceless/victory-fork)'s `main` (itself based on upstream `ffe310e`) plus the commits below |
+| [`linux/fx-next8`](https://github.com/cmt8/VIctory/tree/linux/fx-next8) | Current best. `linux/fx-next` brought up to fxceless `main` of 2026-11-25, plus picks from other forks and open pull requests (texture copy-back from vx-layer, deferred views from fxceless #1033, plain copies and lazy alias guards for Wine, shader fixes) and a few fixes of our own. Every pick keeps its author and its `-x` line; `git log linux/fx-next..linux/fx-next8` lists them |
+| [`linux/fx-next`](https://github.com/cmt8/VIctory/tree/linux/fx-next) | The branch the list below describes. [fxceless/victory-fork](https://github.com/fxceless/victory-fork)'s `main` (itself based on upstream `ffe310e`) plus the commits below |
 | [`linux/hardware-test-v4-1279-port`](https://github.com/cmt8/VIctory/tree/linux/hardware-test-v4-1279-port) | Upstream `main` at `940d32f` plus upstream's Wine-related PRs (#151, #454, part of #994, #1152, #1218, #1849, #1279). Renders much less of the world; kept for comparison |
 | other `linux/*` | Earlier test merges and drafts, kept as history |
 
