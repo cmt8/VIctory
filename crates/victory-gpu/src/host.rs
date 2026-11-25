@@ -6159,11 +6159,12 @@ impl Meter {
                      {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there)"
                 );
             }
-            let [first, on] = [2, 3].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            let [first, on, partly] = [2, 3, 4].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if first + on > 0.0 {
                 tracing::info!(
                     "texture refreshes read through the kernel's copy first, per frame (VICTORY_TEXTURE_COPY_FIRST=1): \
-                     {first:.1} read whole that way, {on:.1} read under the lock as before (a page was not there)"
+                     {first:.1} read whole that way, {on:.1} not (a page was not there), {partly:.1} of them taken as partly \
+                     mapped while the runtime remapped instead of waiting for it (VICTORY_TEXTURE_PARTLY_WAIT=1 waits)"
                 );
             }
             let blind = crate::texture::BLIND.swap(0, Ordering::Relaxed);

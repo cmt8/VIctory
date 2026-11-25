@@ -393,7 +393,30 @@ fn no_wait() -> bool {
 /// left for the next refresh because a page was not there; with
 /// [`copy_first`]: refreshes read through the kernel's copy first, and
 /// those that went on to the read under the lock (a page was not there).
-pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// With [`partly_no_wait`]: refreshes read as partly mapped without
+/// waiting while the runtime remapped.
+pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// Whether a texture the kernel's copy could not read whole
+/// ([`copy_first`]) is read as a partly mapped one (zeros where a page is
+/// not there, at most every 30 frames) when the runtime is remapping title
+/// memory, instead of waiting for it to finish: on whenever [`copy_first`]
+/// is (by default under Wine); `VICTORY_TEXTURE_PARTLY_WAIT=1` waits, as
+/// before. When the runtime is not remapping, the read goes on as before.
+///
+/// Run 212937 (world entry and play, Proton): of the texture refreshes'
+/// time summed over its 180 lines, 61.4 of 70.0 s (88%) was this wait;
+/// lines of 140-209 ms a frame of it while 348-388 refreshes a frame found
+/// a page not there. Most of those then returned at once: a partly mapped
+/// texture is read at most every 30 frames, and that rule was looked at
+/// only after the wait. The read is through the kernel's copy, which a
+/// page that goes or comes meanwhile cannot fault; a texture caught while
+/// the runtime remaps it is read again once it has (its guards are reset
+/// by the remapping), so at worst it shows its holes for a frame.
+fn partly_no_wait() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| copy_first() && std::env::var_os("VICTORY_TEXTURE_PARTLY_WAIT").is_none_or(|v| v != "1"))
+}
 
 /// Whether a texture refresh reads the texture's memory through the
 /// kernel's copy first, without the lock the runtime takes to remap
@@ -862,6 +885,19 @@ impl Staging {
             if read {
                 return size;
             }
+            // A page was not there: a texture streaming in, or one the
+            // runtime is remapping right now. While it remaps, the texture
+            // is read as a partly mapped one, without waiting for it
+            // (`partly_no_wait`).
+            if partly_no_wait() {
+                match crate::watch::title_memory_reading_now() {
+                    Some(mapped) => return self.read_locked(last, size, mapped),
+                    None => {
+                        UNLOCKED[4].fetch_add(1, Relaxed);
+                        return self.read_partly(last, size);
+                    }
+                }
+            }
         }
         // From here on the texture's memory may be read in place. Held until
         // that read is done: the runtime changes what title memory shows
@@ -869,7 +905,7 @@ impl Staging {
         // stays mapped (see `crate::watch::title_memory_reading`; without
         // it a page went between the asking and the read in runs 71 and
         // 74).
-        let _mapped = if no_wait() {
+        let mapped = if no_wait() {
             // Not waited for: while the runtime remaps title memory the
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
@@ -880,40 +916,14 @@ impl Staging {
         } else {
             waited(2, crate::watch::title_memory_reading)
         };
+        self.read_locked(last, size, mapped)
+    }
+
+    /// [`Staging::read_now`] holding `_mapped` (the runtime remaps nothing
+    /// meanwhile): partly mapped, or read in place.
+    fn read_locked(&self, last: &mut Last, size: usize, _mapped: crate::watch::Reading) -> usize {
         if !committed(self.memory, size) {
-            // Partly mapped: a streamed texture with only some mips' pages
-            // there, the usual state while it streams in. Read through the
-            // copy, which stands unmapped pages (zeros), and upload what
-            // is there; nothing at all mapped changes nothing.
-            // shortcut: read again at most every 30 frames (reading around
-            // unmapped pages is slow, and nothing tells us when pages
-            // arrive): a mip that streams in shows up to 30 frames late.
-            let frame = crate::frame::current();
-            if last.partial.is_some_and(|at| frame < at + 30) {
-                return 0;
-            }
-            last.partial = Some(frame);
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-            let changed = with_read(size, |read| {
-                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                let hash = blake3::hash(read);
-                if last.hash == Some(hash) {
-                    return false;
-                }
-                last.hash = Some(hash);
-                if read.iter().all(|&b| b == 0) {
-                    return false;
-                }
-                self.detile(read);
-                true
-            });
-            #[cfg(feature = "diagnostics")]
-            if changed {
-                crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
-            }
-            let _ = changed;
-            return size;
+            return self.read_partly(last, size);
         }
         if through_copy() {
             return with_title(self.memory, size, |tiled| {
@@ -943,6 +953,43 @@ impl Staging {
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+        size
+    }
+
+    /// Partly mapped: a streamed texture with only some mips' pages there,
+    /// the usual state while it streams in. Read through the copy, which
+    /// stands unmapped pages (zeros) and needs no lock, and upload what is
+    /// there; nothing at all mapped changes nothing. Returns the bytes read.
+    ///
+    /// shortcut: read again at most every 30 frames (reading around
+    /// unmapped pages is slow, and nothing tells us when pages arrive): a
+    /// mip that streams in shows up to 30 frames late.
+    fn read_partly(&self, last: &mut Last, size: usize) -> usize {
+        let frame = crate::frame::current();
+        if last.partial.is_some_and(|at| frame < at + 30) {
+            return 0;
+        }
+        last.partial = Some(frame);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+        let changed = with_read(size, |read| {
+            crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+            let hash = blake3::hash(read);
+            if last.hash == Some(hash) {
+                return false;
+            }
+            last.hash = Some(hash);
+            if read.iter().all(|&b| b == 0) {
+                return false;
+            }
+            self.detile(read);
+            true
+        });
+        #[cfg(feature = "diagnostics")]
+        if changed {
+            crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+        }
+        let _ = changed;
         size
     }
 
