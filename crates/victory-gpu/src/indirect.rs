@@ -345,7 +345,7 @@ mod tests {
         let shadow = crate::shadow::find(at, len).unwrap();
         let list = host.new_list().expect("command list");
         shadow.refresh(&list, at, len);
-        shadow.gpu_writes(&list, at, len);
+        shadow.gpu_writes(&list, at, len, false);
         for (kind, row, records) in [(0, 1, 1), (2, 2, 2), (10, 4, 1), (1, 5, 1)] {
             let gpu = shadow.gpu(at + row * 32);
             assert!(super::bound(&list, &shadow.buffer, gpu, (kind, 32, records)));
