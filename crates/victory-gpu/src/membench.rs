@@ -911,3 +911,83 @@ fn clock_bench() {
         std::hint::black_box(Instant::now().elapsed());
     }));
 }
+
+/// What sending many small runs up to a copy in the card's memory costs
+/// (`VICTORY_MEMBENCH=1`, on the first hardware adapter): a `CopyBufferRegion`
+/// of 8 bytes each, from an upload buffer into a buffer in the card's
+/// memory, recorded and run, against the same bytes as one copy. Run
+/// 232629 sent 45.6 MB a frame up in 207,525 ranges in one stretch.
+#[test]
+fn small_copies_bench() {
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4};
+    use windows::core::Interface;
+    if !on() {
+        return;
+    }
+    const SIZE: u64 = 16 << 20;
+    // SAFETY: plain D3D12 setup, objects of the test's own.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+        let adapter: IDXGIAdapter1 = factory.EnumAdapters1(0).unwrap();
+        let mut device: Option<ID3D12Device> = None;
+        D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).unwrap();
+        let device = device.unwrap();
+        let buffer = |kind: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATES| -> ID3D12Resource {
+            let heap = D3D12_HEAP_PROPERTIES { Type: kind, ..Default::default() };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: SIZE,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut out: Option<ID3D12Resource> = None;
+            device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut out).unwrap();
+            out.unwrap()
+        };
+        let upload = buffer(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        let card = buffer(D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON);
+        let queue: ID3D12CommandQueue = device
+            .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() })
+            .unwrap();
+        let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+        let list: ID3D12GraphicsCommandList =
+            device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).unwrap();
+        list.Close().unwrap();
+        let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+        let mut value = 0u64;
+        let mut run = |copies: usize, bytes: u64, stride: u64| -> (f64, f64) {
+            allocator.Reset().unwrap();
+            list.Reset(&allocator, None).unwrap();
+            let started = Instant::now();
+            for i in 0..copies as u64 {
+                let at = (i * stride) % (SIZE - bytes);
+                list.CopyBufferRegion(&card, at, &upload, at, bytes);
+            }
+            list.Close().unwrap();
+            let recorded = started.elapsed().as_secs_f64() * 1e3;
+            let started = Instant::now();
+            queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+            value += 1;
+            queue.Signal(&fence, value).unwrap();
+            while fence.GetCompletedValue() < value {
+                std::thread::yield_now();
+            }
+            (recorded, started.elapsed().as_secs_f64() * 1e3)
+        };
+        run(1000, 8, 64);
+        for (copies, bytes, stride) in [(200_000usize, 8u64, 64u64), (20_000, 8, 64), (1, 200_000 * 8, 0)] {
+            let (recorded, ran) = run(copies, bytes, stride);
+            println!(
+                "membench: {copies} CopyBufferRegion of {bytes} bytes into a card buffer: recorded in {recorded:.1} ms ({:.2} us each), run in {ran:.1} ms",
+                recorded * 1e3 / copies as f64
+            );
+        }
+    }
+}
