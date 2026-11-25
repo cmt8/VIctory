@@ -41,14 +41,20 @@ struct TableGroup {
     indexed: Vec<RootIndexedView>,
     // Descriptor number -> first declaration, matching the bind-time search.
     by_descriptor: Vec<(u32, usize)>,
+    /// The dwords of this table's descriptors the shader moves halves
+    /// through (`HostShader::half_views`).
+    half: Vec<u32>,
 }
 
 impl TablePlan {
-    pub(crate) fn new(used: &[UsedResource], indexed: &[RootIndexedView]) -> Self {
+    /// `half`: the table places the shader moves 16-bit halves through
+    /// (`HostShader::half_views`), as (root parameter, dword).
+    pub(crate) fn new(used: &[UsedResource], indexed: &[RootIndexedView], half: &[(u8, u32)]) -> Self {
         let mut slots: Vec<_> = used
             .iter()
             .filter(|u| u.root == RootType::Table)
             .map(|u| u.slot)
+            .chain(half.iter().map(|&(slot, _)| slot))
             .collect();
         slots.sort_unstable();
         slots.dedup();
@@ -62,6 +68,7 @@ impl TablePlan {
                 entries: Vec::new(),
                 by_descriptor: Vec::new(),
                 indexed: indexed.iter().filter(|v| v.table_slot == slot).copied().collect(),
+                half: half.iter().filter(|&&(s, _)| s == slot).map(|&(_, at)| at).collect(),
             })
             .collect();
         let mut direct = Vec::new();
@@ -82,6 +89,8 @@ impl TablePlan {
         for group in &mut groups {
             group.by_descriptor.sort_unstable();
             group.by_descriptor.dedup_by_key(|item| item.0);
+            group.half.sort_unstable();
+            group.half.dedup();
         }
         Self { groups, direct }
     }
@@ -3451,6 +3460,33 @@ impl State {
         }
     }
 
+    /// Whether the table of `group` holds, at a place its shader moves
+    /// halves through, a 16-bit float or signed buffer view: one shown as
+    /// its unsigned twin, so the table is made afresh for the draw.
+    fn half_shown(&self, group: &TableGroup, compute: bool) -> bool {
+        if group.half.is_empty() {
+            return false;
+        }
+        let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(group.slot)) else {
+            return false;
+        };
+        let mut shown = false;
+        for &at in &group.half {
+            let Some(view) = crate::descriptor::view(table + u64::from(at) * 4) else {
+                continue;
+            };
+            if crate::descriptor::host::half_view(&view).is_some() {
+                shown = true;
+            } else if let Some(format) = crate::descriptor::host::half_inexact(&view) {
+                once!(
+                    format,
+                    "a shader moves a buffer's 16-bit channels as integers through a view whose values the console converts: they are read and written unconverted"
+                );
+            }
+        }
+        shown
+    }
+
     fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
@@ -3484,6 +3520,13 @@ impl State {
     /// once: its constant data is copied at submission either way, and the
     /// big tables the world binds would otherwise take hundreds of slots per
     /// draw, wrapping the dynamic slots onto lists not yet submitted.
+    ///
+    /// `half`: the table descriptors the shader moves sixteen bits a
+    /// channel as unsigned integers (`HostShader::half_views`). A table
+    /// with a 16-bit float or signed buffer view at one of them is made
+    /// afresh as well, with that view in the unsigned format of the same
+    /// layout (`descriptor::host::half_view`): the title's own slot keeps
+    /// the title's format for the shaders that read it as floats.
     pub(crate) fn tables(
         &mut self,
         list: &HostList,
@@ -3502,7 +3545,7 @@ impl State {
                     }),
                     _ => false,
                 };
-            if needs_snapshot {
+            if needs_snapshot || self.half_shown(group, compute) {
                 fresh[usize::from(slot / 64)] |= 1u64 << (slot % 64);
             }
         }
@@ -3545,6 +3588,11 @@ impl State {
                     index.byte_offset.wrapping_add(constant << index.shift) / 32
                 })
                 .collect();
+            // The descriptors the shader moves halves through are made too,
+            // and the table reaches them: they may lie past the range starts
+            // the entries give (a range of several views names only its
+            // first; review on #927).
+            selected.extend(group.half.iter().map(|&at| at / 8));
             selected.sort_unstable();
             selected.dedup();
             let n = (group.max_dword / 8).max(selected.last().copied().unwrap_or(0)) + 1;
@@ -3562,6 +3610,11 @@ impl State {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
                     h.add(unsafe { (at as *const [u32; 3]).read_unaligned() });
+                    // (Another table than the same slots made for a shader
+                    // that reads them in the title's formats.)
+                    if group.half.contains(&(k * 8)) {
+                        h.add([0x4841_4c46, k, !0]);
+                    }
                 }
                 (table, n, h.0)
             };
@@ -3648,9 +3701,19 @@ impl State {
             // used-resource list names (descriptor arrays).
             for k in 0..n {
                 let index = first + k;
+                // The unsigned twin of the title's view, where the shader
+                // moves halves through it (never a listed copy of the title's).
+                let shown = if group.half.binary_search(&(k * 8)).is_ok() {
+                    crate::descriptor::view(table + u64::from(k) * 32)
+                        .as_ref()
+                        .and_then(crate::descriptor::host::half_view)
+                } else {
+                    None
+                };
                 // A view this list has made before: its descriptor copied,
                 // and nothing more if nothing changed in the list since.
                 if list_views
+                    && shown.is_none()
                     && let Some(words) = crate::descriptor::record_at(table + u64::from(k) * 32)
                     && let Some(mut listed) = host.make_listed(recording, words, index)
                 {
@@ -3716,7 +3779,10 @@ impl State {
                         host.constant_at(index, &buffer, gpu, size);
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
+                        match &shown {
+                            Some(shown) => host.make_at(index, shown),
+                            None => host.make_at(index, &view),
+                        }
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });

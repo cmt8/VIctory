@@ -106,6 +106,7 @@ fn lowered(wave64: bool, host_wave: u32, pin: bool) -> (HostShader, Option<u32>)
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
         root_indexed_views: res.root_indexed_views,
+        half_views: l.half_views,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut dxil = shader.dxil.clone();
