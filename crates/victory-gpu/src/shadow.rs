@@ -2357,7 +2357,8 @@ impl Shadow {
 
     /// At submission: copies what changed of `[address, address + len)`
     /// since it was last copied (all of it if the memory is not
-    /// write-watched). Returns the bytes copied.
+    /// write-watched). Returns the bytes copied (a range an earlier list
+    /// declared as written by shaders is not counted).
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
         // In place: the card reads title memory itself.
         if self.place.is_some() {
@@ -2379,12 +2380,30 @@ impl Shadow {
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
-            // gaps whole cost ~1 s per frame).
+            // gaps whole cost ~1 s per frame). Under them, what the title
+            // wrote since the list that declared them was refreshed:
+            // skipped, those constants stayed stale in the copy for the
+            // whole submission (a dispatch read its sizes as zeros and
+            // looped until the device was removed). See
+            // [`Shadow::merge_under_writes`], which puts the same bytes into
+            // the snapshot so the copy-back does not take them for the
+            // shaders' and put the older bytes back over the title's.
             busy.sort_unstable();
             let (mut at, mut bytes) = (from, 0);
             for (a, e) in busy {
+                let (a, e) = (a.max(from), e.min(to));
                 if a > at {
                     bytes += self.update_free(at, a);
+                }
+                if e > a.max(at) {
+                    let (a, e) = (a.max(at), e);
+                    let mut left = usize::MAX;
+                    if self.merge_under_writes(a, e, &mut left) {
+                        // Not write-watched: the whole range is copied, and
+                        // so is the snapshot's part of it.
+                        bytes += self.update_free(a, e);
+                        self.reference(a - start, e - start);
+                    }
                 }
                 at = at.max(e);
             }
@@ -2394,6 +2413,22 @@ impl Shadow {
             return bytes;
         }
         self.update_free(from, to)
+    }
+
+    /// The copy's bytes at offsets `[from, to)` were brought up to date
+    /// before its snapshot was: the snapshot gets the same bytes, so the
+    /// copy-back does not take them for the shaders'.
+    fn reference(&self, from: usize, to: usize) {
+        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(snapshot) = before.as_mut() else {
+            return;
+        };
+        if from >= to {
+            return;
+        }
+        // SAFETY: the copy's mapping and the snapshot's allocation (`pooled`)
+        // both hold `self.len` bytes, and `to` is inside.
+        unsafe { copy_wide(self.data.add(from), snapshot.as_mut_ptr().add(from), to - from) };
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
@@ -3290,4 +3325,115 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod copy_tests {
+    use super::*;
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter, IDXGIFactory4};
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    /// `len` bytes of title memory, as a copy mapped on a WARP device: the
+    /// copy if made, `None` where this PC has no WARP device.
+    fn copy(title: usize, len: usize) -> Option<(ID3D12Resource, *mut u8, Shadow)> {
+        // SAFETY: plain WARP and D3D12 setup, a buffer of our own.
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+            let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
+            let mut device: Option<ID3D12Device> = None;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
+            let device = device?;
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_CUSTOM,
+                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: len as u64,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            let mut buffer: Option<ID3D12Resource> = None;
+            device
+                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buffer)
+                .ok()?;
+            let buffer = buffer?;
+            let mut data = std::ptr::null_mut();
+            buffer.Map(0, None, Some(&mut data)).ok()?;
+            let shadow = Shadow::new(buffer.clone(), data.cast(), 0, title as u64, len as u64);
+            Some((buffer, data.cast(), shadow))
+        }
+    }
+
+    /// The title writes a constant under a range an earlier list of the
+    /// submission declared as written by shaders: the refresh before the
+    /// submission runs still brings it to the copy, a shader's write still
+    /// goes back, and a title write made after the refresh is not undone.
+    /// Whether it ran here: a PC with no WARP device has no copy to test.
+    fn under_busy_range(title: usize) -> bool {
+        let len = 2 * PAGE;
+        let Some((_buffer, data, shadow)) = copy(title, len) else {
+            return false;
+        };
+        let host = |at: usize| {
+            // SAFETY: inside the copy's mapping.
+            unsafe { std::slice::from_raw_parts(data.add(at), 1)[0] }
+        };
+        shadow.update(title, len);
+        // An earlier list declares all of it as written by shaders.
+        shadow.writing(title, len);
+        // SAFETY: (all title reads and writes below) bytes of the block.
+        unsafe { ((title + PAGE + 20) as *mut u8).write_volatile(0x55) };
+        shadow.update(title + PAGE + 16, 16);
+        assert_eq!(host(PAGE + 20), 0x55, "the title's constant reaches the copy");
+        // The shaders run: one byte written. The title writes meanwhile.
+        // SAFETY: a byte of the copy's mapping.
+        unsafe { data.add(10).write(0xaa) };
+        // SAFETY: a byte of the block.
+        unsafe { ((title + PAGE + 20) as *mut u8).write_volatile(0x66) };
+        shadow.copy_back(title, len);
+        // SAFETY: bytes of the block.
+        unsafe {
+            assert_eq!((title as *mut u8).add(10).read_volatile(), 0xaa, "the shader's write goes back");
+            assert_eq!((title as *mut u8).add(PAGE + 20).read_volatile(), 0x66, "the title's later write stays");
+        }
+        true
+    }
+
+    /// The same on write-watched memory (the journal names the pages) and on
+    /// plain memory (the whole range is copied).
+    #[test]
+    fn title_writes_under_a_busy_range_are_copied() {
+        let len = 2 * PAGE;
+        // SAFETY: two fresh allocations of ours. Not freed: the journal
+        // would keep their pages' writes, and a test that got the pages
+        // next (get the write journal's) would see them as its own.
+        unsafe {
+            let watched = VirtualAlloc(
+                std::ptr::null(),
+                len,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            ) as usize;
+            let plain = VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert!(watched != 0 && plain != 0);
+            if under_busy_range(watched) {
+                under_busy_range(plain);
+            }
+        }
+    }
 }
