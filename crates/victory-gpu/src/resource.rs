@@ -2378,7 +2378,7 @@ impl HostTexture {
         self.flags
     }
 
-    fn new(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) -> HostTexture {
+    pub(crate) fn new(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) -> HostTexture {
         use std::sync::atomic::Ordering::Relaxed;
         let bytes = host_bytes(&texture);
         // SAFETY: a live texture.
