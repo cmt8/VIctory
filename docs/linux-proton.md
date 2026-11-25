@@ -409,12 +409,21 @@ time, the frame line before and after):
   `VICTORY_ASYNC_PRESENT=1` (off, needs the first and a present that does
   not settle flights) also puts the present behind the queue's line. Part
   of fxceless's "3.5-4 to 6-7 frames a second with all the switches".
-- `VICTORY_COPY_PLAIN=1` (off): copies of title memory into memory of the
-  layer are made in place, a fault handler catching a page that is not
-  there, instead of through `ReadProcessMemory`; reads under 256 bytes and
-  sources that faulted in the last two seconds go to the kernel. Under
-  Wine every fault takes ntdll's process-wide lock, so this may cost more
-  than it saves here: measure.
+- `VICTORY_COPY_PLAIN` (on under Wine, `=0` turns it off): copies of
+  title memory into memory of the layer are made in place, a fault handler
+  catching a page that is not there, instead of through
+  `ReadProcessMemory`; the layer's reads under 256 bytes (its "is this page
+  there" probes) and sources whose 64 KiB block faulted in the last two
+  seconds go to the kernel. Under Proton the kernel's copy is itself a
+  `memmove` in ntdll's unix side, so the gain is only the call around it:
+  the frame line's copies 65 against 49 ms a frame in the world scene, the
+  frame time about the same (193-204 against ~200 ms, profiling off).
+  With it the copy-back writes title memory in place too
+  (`VICTORY_WRITE_PLAIN=0` keeps the kernel's write; fxceless#1032).
+- `VICTORY_ALIAS_LAZY` (on, `=0` turns it off): a title write through one
+  view of a guarded page opens that view only; the page's other views stay
+  read-only and are noted written, and the open view is guarded again when
+  a copy next takes the pages (triippywhale 7e88d165b).
 - `VICTORY_QUEUE2=1` (off; bit 1 fetches, bit 2 sends; `=3` both): what
   shaders wrote to card copies is fetched on a copy queue (bit 1), the
   title's bytes go up to card copies through a copy queue and a landing

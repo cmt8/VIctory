@@ -7297,6 +7297,22 @@ impl HostList {
         }
     }
 
+    /// Batches multiple [`HostList::defer_refresh`] insertions under one lock.
+    pub(crate) fn defer_refreshes<'a>(
+        &self,
+        spans: impl IntoIterator<Item = (&'a std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    ) {
+        let mut deferred = self.deferred();
+        for (shadow, address, len) in spans {
+            let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+            if deferred.refreshed.insert(key) {
+                deferred
+                    .copies
+                    .push(Step::Refresh(shadow.clone(), address, len));
+            }
+        }
+    }
+
     /// Shaders of the list write `[address, address + len)` of a buffer's
     /// host copy: copied back into title memory once the list has run.
     pub(crate) fn defer_gpu_write(
@@ -8122,7 +8138,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     let moved = std::time::Instant::now();
     // Into host memory: in place first, if asked for (`crate::plaincopy`);
     // through the kernel if that is off or met a page that was not there.
-    let whole = (!title_dst && crate::plaincopy::copy(dst, src, len)) || read(src, dst, len);
+    let whole = (!title_dst && crate::plaincopy::copy_buffer(dst, src, len)) || read(src, dst, len);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -8225,6 +8241,15 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
     // In place first, if asked for (`crate::plaincopy`): the destination is
     // memory of ours, as in `copy_mapped`.
     crate::plaincopy::copy(dst.as_mut_ptr(), src, dst.len()) || read(src, dst.as_mut_ptr(), dst.len())
+}
+
+/// Reads title memory at `src` into `dst`; false if a page of it is not
+/// readable. For bytes that are all real, however few: no
+/// [`crate::plaincopy`] floor.
+pub(crate) fn read_buffer_into(src: *const u8, dst: &mut [u8]) -> bool {
+    // In place first, if asked for (`crate::plaincopy`): the destination is
+    // memory of ours, as in `copy_mapped`.
+    crate::plaincopy::copy_buffer(dst.as_mut_ptr(), src, dst.len()) || read(src, dst.as_mut_ptr(), dst.len())
 }
 
 /// Copies `len` bytes from `src` to `dst` in the kernel: false if a source
@@ -8346,7 +8371,7 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     let write = |at: usize, n: usize| {
         write(at, n) || (crate::watch::kernel_write_refused(at, n) && write(at, n))
     };
-    if len == 0 || write(dst as usize, len) {
+    if len == 0 || crate::plaincopy::write(dst, src, len) || write(dst as usize, len) {
         return;
     }
     for_pieces(dst as usize, len, 64 << 10, |at, n| {

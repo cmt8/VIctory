@@ -1703,7 +1703,13 @@ pub(crate) fn staged(resource: This) -> Option<(u64, bool)> {
             BOOKS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             mapped == size as u64
         }
-        None => committed(s.memory, size),
+        // By 64 KiB block, one page asked of each ([`mapped_bytes`]): the
+        // answer only says when the slot is looked at again, and feeds the
+        // drop-reason count. Asked page by page (`committed`), a look cost
+        // one kernel read per 4 KiB of the texture, and the draws ask it of
+        // every texture they sample with `VICTORY_DROP_REASONS=1`: 3.2
+        // million reads a frame once the runtime's word was lost (run a2).
+        None => mapped_bytes(s.memory, size) >= size as u64,
     };
     Some((size as u64, whole))
 }
