@@ -6666,13 +6666,14 @@ impl Meter {
                 [0, 1, 2].map(|i| crate::texture::BOOKS[i].swap(0, Ordering::Relaxed) as f64 / frames);
             let copies = COPY_BOOKS.swap(0, Ordering::Relaxed) as f64 / frames;
             let folded = crate::descriptor::host::CHANGES_FOLDED.load(Ordering::Relaxed);
-            if looks + refreshes + staged + copies > 0.0 || folded > 0 {
+            let pass_ms = crate::draw::HEAP_TEXTURE_MICROS.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
+            if looks + refreshes + staged + copies + pass_ms > 0.0 || folded > 0 {
                 tracing::info!(
                     "what is mapped, from the runtime's word, per frame (VICTORY_VIEW_BOOKS=0: asked of the kernel): \
                      {looks:.1} looks of the texture pass at a slot, {staged:.1} at a staged texture, {refreshes:.1} texture \
                      refreshes of one with a page not there, {copies:.1} copies into host memory read around holes; \
                      since the start, {folded} changes of a texture's memory folded into a look an earlier change made due \
-                     (VICTORY_TEXTURE_QUIET_FRAMES=0: none)"
+                     (VICTORY_TEXTURE_QUIET_FRAMES=0: none); the texture part of the heap passes {pass_ms:.1} ms a frame"
                 );
             }
             let c: Vec<f64> = crate::shadow::COPIES.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
