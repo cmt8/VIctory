@@ -191,10 +191,13 @@ pub extern "system" fn XMemVirtualQuery(
     out: *mut BasicInformation,
 ) -> BOOL {
     let size = size_of::<MEMORY_BASIC_INFORMATION>();
+    let timed = victory_gpu::vmstat::time(victory_gpu::vmstat::Site::TitleQuery);
     // SAFETY: the title passes room for the whole structure; the host
     // fails on a null one.
     unsafe {
-        if VirtualQueryEx(process, address, out.cast(), size) == 0 {
+        let found = VirtualQueryEx(process, address, out.cast(), size);
+        drop(timed);
+        if found == 0 {
             return 0;
         }
         let info = &mut *out;
@@ -652,6 +655,7 @@ impl View {
     /// Maps `n` slices from `slice` on.
     fn map(slice: &Slice, n: usize) -> Option<View> {
         use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+        let _timed = victory_gpu::vmstat::time(victory_gpu::vmstat::Site::DiskWindow);
         let (offset, len) = ((slice.index * PAGE) as u64, n * PAGE);
         if let Some(whole) = slice.section.whole()
             && offset as usize + len <= slice.section.size
@@ -691,6 +695,7 @@ impl View {
 impl Drop for View {
     fn drop(&mut self) {
         if self.kept.is_none() {
+            let _timed = victory_gpu::vmstat::time(victory_gpu::vmstat::Site::DiskWindow);
             // SAFETY: our view.
             unsafe { UnmapViewOfFile(self.at) };
         }

@@ -355,6 +355,7 @@ fn submission_us(i: usize, us: u64) {
     crate::framelog::add([crate::framelog::T::PrepareUs, crate::framelog::T::CardWaitUs][i], us);
     if i == 0 {
         crate::framelog::add(crate::framelog::T::Submissions, 1);
+        crate::vmstat::mark(crate::vmstat::SUBMIT);
     }
 }
 
@@ -7951,7 +7952,10 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
         let remaining = len - offset;
         // SAFETY: the query inspects an address and fills a local structure.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        let size = unsafe { VirtualQuery(at.cast(), &mut info, size_of_val(&info)) };
+        let size = {
+            let _timed = crate::vmstat::time(crate::vmstat::Site::QueryCopy);
+            unsafe { VirtualQuery(at.cast(), &mut info, size_of_val(&info)) }
+        };
         let n = (info.BaseAddress as usize).saturating_add(info.RegionSize)
             .saturating_sub(at as usize).min(remaining);
         if size != size_of_val(&info) || n == 0 {
@@ -8009,6 +8013,12 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 /// page is not readable or a destination page not writable (the bytes
 /// before that page may have been copied).
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    let _timed = crate::vmstat::time(crate::vmstat::Site::KernelRead);
+    kernel_copy(src, dst, len)
+}
+
+/// [`read`], untimed: the copy-back's writes are timed as theirs.
+fn kernel_copy(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
@@ -8094,11 +8104,12 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
         let mut done = 0;
+        let _timed = crate::vmstat::time(crate::vmstat::Site::KernelWrite);
         match how {
             // The kernel refuses an unmapped or read-only destination page
             // as it does a source page (the caller opened its guards:
             // `crate::watch::writing`).
-            Writes::Copy => read(from, at as *mut u8, n),
+            Writes::Copy => kernel_copy(from, at as *mut u8, n),
             // SAFETY: as below; the kernel checks the destination and
             // writes nothing it cannot.
             Writes::Nt => unsafe {

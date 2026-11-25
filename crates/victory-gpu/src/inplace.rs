@@ -606,8 +606,10 @@ fn in_placeholder(at: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_FREE, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery};
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let timed = crate::vmstat::time(crate::vmstat::Site::QueryInplace);
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(start as *const c_void, &mut info, size_of_val(&info)) };
+    drop(timed);
     let told = || views().views.range(..=start).next_back().is_some_and(|(&base, view)| base + view.0 > start);
     let there = n != 0
         && info.State != MEM_FREE
@@ -848,8 +850,10 @@ pub(crate) fn cover(at: usize, len: usize) -> Cover {
 pub(crate) fn private_whole(at: usize, len: usize) -> bool {
     // SAFETY: plain data filled in by the query.
     let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let timed = crate::vmstat::time(crate::vmstat::Site::QueryInplace);
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { mem::VirtualQuery(at as *const c_void, &mut info, size_of_val(&info)) };
+    drop(timed);
     n != 0
         && info.State == mem::MEM_COMMIT
         && info.Type == mem::MEM_PRIVATE
@@ -1345,8 +1349,10 @@ fn kind_of(at: usize, len: usize, known: &mut Vec<(usize, usize)>) -> usize {
     }
     // SAFETY: plain data filled in by the query.
     let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let timed = crate::vmstat::time(crate::vmstat::Site::QueryInplace);
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { mem::VirtualQuery(at as *const c_void, &mut info, size_of_val(&info)) };
+    drop(timed);
     if n == 0 {
         return 5;
     }
