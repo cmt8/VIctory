@@ -510,6 +510,70 @@ structures; fxceless refused it, the picture loses its indirect light;
 `VICTORY_BVH_MISS` does the job here), `VICTORY_CARD_REHASH_RUNS=alt` (an
 A/B of its own, twenty seconds each way).
 
+### fxceless round of 2026-11-25 afternoon, and ambient light (linux/fx-next7)
+
+fxceless 0b0074e0..ca8829ff merged. Their figures are from Windows 11, an
+i7-14700KF and an RTX 4070, in the first rooms (about 3,850 draws a frame)
+with the scene standing still, on top of their usual set of switches; not
+measured here. Worth an A/B run under Proton, one switch at a time. Most
+new switches also take `=alt`: twenty seconds on, twenty off, each change
+said in the log, so that one run measures both in the same scene.
+
+- `VICTORY_JOIN_PARTS=1` (off; needs `VICTORY_ASYNC_SUBMIT=1` and late
+  waits, `VICTORY_LATE_WAIT` or the relay's; `VICTORY_JOIN_MOST` 4 parts,
+  `VICTORY_JOIN_LISTS` 48 lists): the
+  parts a frame's memory waits cut the title's submissions into go to the
+  host as one submission where the waits are known to be met (29 to 9 a
+  frame there). fxceless: "about 6 %".
+- `VICTORY_BACK_OWN_VIEW=1` (off): what shaders wrote goes back into view
+  memory through a view of the layer's own on the section, and the copy
+  that wrote it is not refreshed again. fxceless: "about 9 % (submit
+  thread 93 -> 81 ms a frame)"; with the switch above, 104 ms a frame
+  (9.6 frames a second) from about 120. Under Wine
+  `VICTORY_BACK_KEPT_VIEWS` (on) stays the default: both write with a
+  plain copy, but the own view costs a `MapViewOfFile` per section and a
+  commit call per 64 KiB block the first time each is written, every one
+  under ntdll's process-wide lock; with `=1` the own view is used first.
+  `VICTORY_BACK_OWN_CHECK=1` counts stores gone astray (a diagnostic).
+- `VICTORY_INDIRECT_GATHER=1` (off; needs `VICTORY_INDIRECT_WINDOW=1`): a
+  lone indirect record that misses its window gets a slot that the list's
+  prelude fills in one clamp pass for the whole list, instead of a pass of
+  ours before its draw. fxceless: 104 -> 97 ms a frame (10.3 frames a
+  second) with `VICTORY_CARD_REHASH_RUNS=1`; 7.9 million records checked
+  against a fresh clamp, none differed. The clamp's gather form builds
+  with Wine's compiler, in both its forms (a host-GPU test checks it).
+  Windows have faulted the card before (see above): watch the first run.
+- `VICTORY_COPY_CHANGED=1` (off): a refresh of a card copy sends on only
+  the 256-byte chunks that differ. fxceless: "no net gain yet".
+- Measured at nothing by fxceless, left off: `VICTORY_WINDOW_JUMP=1`,
+  `VICTORY_SPREAD=1` (more processors for the title's crowded thread
+  groups), `VICTORY_REFRESH_ONCE`, `VICTORY_ASYNC_PRESENT`,
+  `VICTORY_VIEW_KNOWN`, `VICTORY_QUEUE2=3`.
+
+On by default from this round (`=0` or the named value turns each off):
+
+- `VICTORY_FPS_COUNTER` (on): the frame rate, measured once a second, is
+  drawn in the top left corner of every frame shown (a copy onto the back
+  buffer; no shader). `=0` leaves the frame as the title drew it.
+- `VICTORY_CLZERO_LOOP15` (on): the title's 15-byte `clzero` loop is run
+  whole by the instruction handler instead of one exception a line.
+- `VICTORY_AMBIENT` (0.35; `off` keeps the title's own output; `0` is no
+  indirect diffuse light at all; `VICTORY_AMBIENT_TINT=r,g,b`, default
+  `0.94,0.97,1.0`): right after the title's screen-probe resolve
+  (`CS_ScreenProbes_TemporalResolve*`, found by name in the program's
+  bytes), its indirect diffuse light image is overwritten with a constant
+  (by Davi Andrei, after beloooo's: their reports were magenta on leaves,
+  cloth and paper and blocks of colour indoors, from what the resolve
+  gives while no ray-tracing structure is built). Its pass is in a form
+  Wine's compiler builds (picked as it was, it was never made under
+  Proton). It replaces the diffuse light only: reflections and ray-traced
+  shadows still go through `VICTORY_BVH_MISS`, and with both on the
+  diffuse light is the constant whatever the misses gave. For an A/B of
+  the shading: `VICTORY_AMBIENT=off` against unset, then a level up or
+  down (0.2, 0.6).
+
+The shader cache key does not change with this round: no warm-up again.
+
 ## Tests
 
 ```sh
