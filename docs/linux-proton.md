@@ -246,6 +246,17 @@ frames later).
   their draws (`VICTORY_HEAP_SYNC_TABLES=1` mirrors those too). The line
   "descriptor records the title copied into its heap as bytes" gives pages,
   slots looked at, slots made again and the milliseconds per frame.
+- `VICTORY_COPIED_VIEWS` (on; `=0` as before): a view the title places
+  exactly where a texture lies that the host copied into (the character
+  bake copies its result into block-compressed textures), of the same size,
+  levels, layers and texel width, reads that texture's texels (copied on
+  the card when the copy lands), instead of a host copy of its own filled
+  from title memory, which the host's copy never reached. Such a view's
+  slots are made due again whenever the host copies into the texture. The
+  log line "HERO LEAD (view made before the copy)" (up to 200) names every
+  host-copied texture whose memory holds views the title placed earlier;
+  "HERO LEAD: a placed texture view lies in the memory ..." still names
+  views placed after the copy.
 
 ## Tests
 
