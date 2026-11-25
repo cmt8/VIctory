@@ -308,8 +308,41 @@ fn no_wait() -> bool {
 
 /// Since the last frame-rate line, with [`no_wait`]: refreshes that read
 /// through the kernel because title memory was being remapped, and those
-/// left for the next refresh because a page was not there.
-pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// left for the next refresh because a page was not there; with
+/// [`copy_first`]: refreshes read through the kernel's copy first, and
+/// those that went on to the read under the lock (a page was not there).
+pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Whether a texture refresh reads the texture's memory through the
+/// kernel's copy first, without the lock the runtime takes to remap
+/// (`crate::watch::title_memory_reading`) and without asking whether the
+/// memory is all mapped (`committed`); only if a page is not there does it
+/// go on as before. On by default under Wine, off elsewhere;
+/// `VICTORY_TEXTURE_COPY_FIRST=1` or `=0` says.
+///
+/// Under Wine the runtime's remapping holds that lock across wineserver
+/// requests for every view it maps and unmaps, each of which walks the
+/// server's list of the process's views (Valve's Wine 11.0,
+/// `server/mapping.c`: `map_view` checks the new view against every view,
+/// `unmap_view` looks its view up in the list): 67-112 us a view with
+/// 40,000 views (`membench`), so the waits for the lock were the frame
+/// line's "textures" (run 13: 2,947 of 3,587 ms a frame). The question
+/// whether the memory is mapped (`QueryWorkingSetEx`) takes Wine's lock on
+/// the memory map, which the same requests hold: 2 us idle, 10-160 us for
+/// 16-256 pages while one thread remaps, milliseconds with two. The kernel
+/// copy is a copy in our own process there (1.1 us for 64 KiB, the same
+/// while another thread remaps), safe from a page that goes away: it fails
+/// instead of faulting. A texture read whole that way is the one the read
+/// in place would have seen; one with a page not there is read as before.
+/// On Windows the copy costs twice the read in place (see
+/// [`through_copy`]), so it stays off there.
+fn copy_first() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var_os("VICTORY_TEXTURE_COPY_FIRST") {
+        Some(v) => v == "1",
+        None => crate::host::on_wine(),
+    })
+}
 
 /// Since the last frame-rate line, of texture refreshes on every thread, in
 /// microseconds: waiting for the texture's own lock (another thread is
@@ -718,6 +751,30 @@ impl Staging {
             let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
             if unwritten && !turn {
                 return 0;
+            }
+        }
+        // Read through the kernel's copy, which needs no lock: whole, or on
+        // to the read under the lock below (`copy_first`).
+        if copy_first() {
+            use std::sync::atomic::Ordering::Relaxed;
+            let read = with_read(size, |read| {
+                if !crate::host::read_into(self.memory, read) {
+                    return false;
+                }
+                let hash = blake3::hash(read);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+                if last.hash != Some(hash) {
+                    last.hash = Some(hash);
+                    self.detile(read);
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+                }
+                true
+            });
+            UNLOCKED[if read { 2 } else { 3 }].fetch_add(1, Relaxed);
+            if read {
+                return size;
             }
         }
         // From here on the texture's memory may be read in place. Held until
