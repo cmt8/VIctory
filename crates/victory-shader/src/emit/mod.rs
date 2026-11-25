@@ -207,6 +207,18 @@ pub fn buffer_guard() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_BUFFER_GUARD").is_none_or(|v| v != "0"))
 }
 
+/// Whether pixel programs the console depth-tests before they run
+/// (`DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER`) declare early depth
+/// (`lower::early_depth`; fxceless/victory-fork #907 by
+/// SpaghettiMaster545). `VICTORY_EARLY_DEPTH`: on, `=0` off, for A/B runs
+/// (one tester reported a hard lock on Windows 10 with an RTX 3080 that the
+/// change has not been shown to cause). Part of the translation: the
+/// shader cache keys on it.
+pub fn early_depth_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EARLY_DEPTH").is_none_or(|v| v != "0"))
+}
+
 /// Whether the ray-tracing node tests (`image_bvh_intersect_ray`,
 /// `image_bvh64_intersect_ray`) answer "nothing here" without reading the
 /// node: a box node has no child the ray enters, any other node is a

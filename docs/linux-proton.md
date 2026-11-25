@@ -493,11 +493,22 @@ On by default from this merge (`=0` or the named value turns each off):
   vertices an instance or more.
 
 Two shader fixes picked on top, for the coloured grain on eyes, a forearm
-and glass (no switch; both change translations): pixel programs the
-console depth-tests before they run declare early depth (ad1e85de by
-SpaghettiMaster545: the glass prepass over characters), and a pixel's
-quad is read through quad reads, helper lanes included (2b3c339e by
-beloooo: lines on car paint, glass and skin).
+and glass (both change translations): pixel programs the console
+depth-tests before they run declare early depth (ad1e85de by
+SpaghettiMaster545: the glass prepass over characters;
+`VICTORY_EARLY_DEPTH=0` turns it off, for an A/B run after one
+unconfirmed report of a hard lock on Windows 10 with an RTX 3080), and a
+pixel's quad is read through quad reads, helper lanes included (2b3c339e
+by beloooo: lines on car paint, glass and skin; no switch).
+
+Also picked, no switch: a cube sampled with explicit gradients takes its
+level as log2 of the footprint, not 1.44 times that, and `_cl` clamps it
+(after DexNom 921d8d3b4, as uiliannn ported it in a290636e2); and
+normalized buffer codes convert to the float nearest their quotient, not
+the host's division (Marvisak da82e444e, as RecompLive ported it in
+9619e8959), with the tbuffer d16 loads its tests assume packing two
+16-bit channels per register (c430b1de2 by Duff). All change
+translations: the warm-up is due again.
 
 On by default in diagnostics builds and available with `=1` in release
 builds: `VICTORY_FRAME_LOG` (every frame's length and what long frames

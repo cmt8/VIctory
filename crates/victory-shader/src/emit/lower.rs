@@ -1340,7 +1340,7 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
-        if early_depth(&x.native.io, &x.outputs) {
+        if super::early_depth_on() && early_depth(&x.native.io, &x.outputs) {
             s.flags |= flags::EARLY_DEPTH;
         }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
