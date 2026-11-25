@@ -1552,6 +1552,10 @@ pub(crate) fn tick() {
 }
 
 #[cfg(test)]
+#[path = "inplace_probe_tests.rs"]
+mod probe_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
