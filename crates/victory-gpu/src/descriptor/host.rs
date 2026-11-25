@@ -4412,6 +4412,12 @@ mod tests {
     #[test]
     fn an_old_unmapped_observation_preserves_a_replacement_view() {
         let Some(heap) = HostHeap::new(false, 8) else { return };
+        // Nothing on the card, and every host resource older than what
+        // finished: the process's own counts are those of the tests that
+        // run beside this one and submit to the host (a texture made while
+        // one of theirs was on the card was a view held back, and the slot
+        // was never made: 1 run in 3 failed).
+        set_card(&heap, ON_CARD, ON_CARD, 1);
         let slot = 1;
         heap.queue_texture(slot, true, false, 10);
         let (_, observed) = heap.texture_slots_due(10, 1).0[0];
