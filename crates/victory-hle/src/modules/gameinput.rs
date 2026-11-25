@@ -1156,6 +1156,17 @@ mod host {
                     if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
                         pad.buttons |= button;
                     }
+                    match vk {
+                        b'L' => pad.right_x = 1.0,
+                        b'J' => pad.right_x = -1.0,
+                        b'I' => pad.right_y = 1.0,
+                        b'K' => pad.right_y = -1.0,
+                        b'D' => pad.left_x = 1.0,
+                        b'A' => pad.left_x = -1.0,
+                        b'W' => pad.left_y = 1.0,
+                        b'S' => pad.left_y = -1.0,
+                        _ => {}
+                    }
                 }
             }
             Some(pad)
@@ -1198,16 +1209,21 @@ mod host {
         }
     }
 
-    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts, with or without focus. A key is a
-    /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
+    /// Debugging aid: `VICTORY_KEYS=<seconds>[+<dur>]:<key>,...` holds each
+    /// key for `<dur>` seconds (default 0.2 s) that long after input starts,
+    /// with or without focus. A key is a letter, a digit, or `Enter`, `Esc`,
+    /// `Tab`, `Back`, `Up`, `Down`, `Left`, `Right` (the stand-in pad's table
+    /// maps them to buttons and sticks, e.g. `L`/`J`/`I`/`K` for right stick).
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
+        static SCRIPT: LazyLock<(Instant, Vec<(Duration, Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
-                let (at, key) = entry.split_once(':')?;
+                let (when, key) = entry.split_once(':')?;
+                let (at_s, dur_s) = match when.split_once('+') {
+                    Some((a, d)) => (a.trim(), Some(d.trim())),
+                    None => (when.trim(), None),
+                };
                 let vk = match key.trim() {
                     "Enter" => 0x0D,
                     "Esc" => 0x1B,
@@ -1222,18 +1238,20 @@ mod host {
                     }
                     _ => return None,
                 };
-                Some((
-                    Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
-                    vk,
-                ))
+                let at = Duration::try_from_secs_f64(at_s.parse().ok()?).ok()?;
+                let dur = match dur_s {
+                    Some(d) => Duration::try_from_secs_f64(d.parse().ok()?).ok()?,
+                    None => Duration::from_millis(200),
+                };
+                Some((at, dur, vk))
             });
             (Instant::now(), keys.collect())
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
         keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
-            .map(|&(_, vk)| vk)
+            .filter(|&&(at, dur, _)| (at..at + dur).contains(&now))
+            .map(|&(_, _, vk)| vk)
             .collect()
     }
 
