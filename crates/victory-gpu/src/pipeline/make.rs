@@ -76,9 +76,9 @@ impl Pending {
     }
 }
 
-/// Why a pipeline has no host pipeline (diagnostics): its shaders that do
-/// not translate, else "refused" or "being made"; `None` if it has one.
-#[cfg(feature = "diagnostics")]
+/// Why a pipeline has no host pipeline (`super::drop_reasons`): its
+/// shaders that do not translate, else "refused" or "being made"; `None`
+/// if it has one.
 pub(crate) fn missing(p: &Pending) -> Option<String> {
     match p.made.get() {
         Some(Some(_)) => None,

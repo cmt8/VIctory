@@ -110,6 +110,14 @@ logo then stutters).
 In every build, a draw of depth-tested geometry whose pixel shader does
 not translate (or that the host refuses) is drawn with that debug shader
 instead of dropped; `VICTORY_PS_FALLBACK=0` turns that off.
+`VICTORY_DROP_REASONS=1` (any build; always on in the diagnostics build)
+follows the frame line every five seconds with up to 40 lines
+`dropped N/frame without a host pipeline: <why>`: the shaders of a pipeline
+that do not translate (stage and hash), a pipeline the host refused, "no
+pipeline set", the ray-tracing structure builder's dispatches (off unless
+`VICTORY_BVH_BUILDER=1`), or what else dropped a draw whose pipeline is
+there (an index buffer outside title buffers, a table without free slots,
+...). It writes to the log only.
 `VICTORY_PIPELINE_WAIT_MS` sets how long a frame may wait for pipelines
 being made (500 by default; 0 never waits, pipelines then appear a few
 frames later).

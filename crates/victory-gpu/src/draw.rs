@@ -416,10 +416,23 @@ pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(
 pub(crate) static HEAP_TEXTURES_PARTLY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
-/// Marks the last traced draw as not run on the host.
-#[cfg(feature = "diagnostics")]
+thread_local! {
+    /// Why the last draw this thread prepared was dropped though its
+    /// pipeline has a host pipeline (`State::prepare_for`, `State::bind`),
+    /// for the reasons line (`crate::pipeline::drop_reasons`).
+    static DROP_WHY: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+/// Notes why the draw being prepared is dropped (see [`DROP_WHY`]).
+fn drop_why(why: &'static str) {
+    DROP_WHY.set(Some(why));
+}
+
+/// Counts a dropped draw by reason (`crate::pipeline::drop_reasons`), and
+/// marks the last traced draw as not run on the host (diagnostics).
 fn dropped(pipeline: usize) {
-    crate::pipeline::note_drop(pipeline as This);
+    crate::pipeline::note_drop_or(pipeline as This, DROP_WHY.take());
+    #[cfg(feature = "diagnostics")]
     if let Some(last) = FRAME.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
         last.push_str(" DROPPED");
     }
@@ -827,6 +840,7 @@ impl State {
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
+        DROP_WHY.set(None);
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
@@ -836,6 +850,7 @@ impl State {
         };
         if p.compute || p.mesh != mesh {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
+            drop_why("a draw or mesh dispatch with another kind of pipeline");
             return false;
         }
         if p.rects && self.topology != RECTANGLES {
@@ -876,6 +891,7 @@ impl State {
         if indexed {
             let v = self.index;
             let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
+                drop_why("an index buffer outside title buffers");
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
@@ -982,6 +998,7 @@ impl State {
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
+                drop_why("a descriptor table found no free slots");
                 return false;
             }
             // What the shader stores through root views and raw addresses is
@@ -992,6 +1009,7 @@ impl State {
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
                 let Some(ready) = self.memory_ready(list, compute, writes) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
+                    drop_why("title memory by address without a view heap");
                     return false;
                 };
                 Some(ready)
@@ -1080,6 +1098,7 @@ impl State {
                         once!(slot, "a shader reads a root view the title did not set");
                         // A table left unset is undefined: a null view.
                         if tabled && !self.root_srv_table(list, None, param, compute, false) {
+                            drop_why("a root view table the host could not make");
                             return false;
                         }
                         continue;
@@ -1092,6 +1111,7 @@ impl State {
                         });
                     if tabled {
                         if !self.root_srv_table(list, Some(address), param, compute, biased) {
+                            drop_why("a root view table the host could not make");
                             return false;
                         }
                         continue;
@@ -1143,6 +1163,7 @@ impl State {
                     }
                 };
                 if !self.root_uav(list, address, param, compute, writes) {
+                    drop_why("a root unordered view the host could not make");
                     return false;
                 }
             }
@@ -2023,11 +2044,9 @@ impl State {
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
             #[cfg(feature = "diagnostics")]
-            {
-                crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
-                self.list_dropped_roots([x, y, z]);
-            }
+            self.list_dropped_roots([x, y, z]);
             return;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
@@ -2036,19 +2055,19 @@ impl State {
                 "a dispatch without a host pipeline dropped"
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::pipeline::note_drop(self.pipeline as This);
             #[cfg(feature = "diagnostics")]
-            {
-                crate::pipeline::note_drop(self.pipeline as This);
-                self.list_dropped_roots([x, y, z]);
-            }
+            self.list_dropped_roots([x, y, z]);
             return;
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        DROP_WHY.set(None);
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::pipeline::note_drop_or(self.pipeline as This, DROP_WHY.take());
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
             if crate::pipeline::is_builder(self.pipeline as This) {
@@ -2338,7 +2357,6 @@ impl State {
             };
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
     }
@@ -2716,6 +2734,9 @@ impl State {
         // vertices as they are; any other gets its rectangles expanded.
         let rects = self.topology == RECTANGLES && !self.completes_rects();
         let ran = ready && (!rects || self.rectangles(list, vertices, first));
+        if ready && !ran {
+            drop_why("rectangles not drawn");
+        }
         if ran {
             // Rectangles were expanded into their own vertex buffers.
             let (count, from) = if rects {
@@ -2734,7 +2755,6 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
     }
@@ -2821,6 +2841,7 @@ impl State {
         let lost = self.topology == RECTANGLES && !self.completes_rects();
         if lost {
             once!("indexed rectangles not drawn");
+            drop_why("indexed rectangles");
         }
         let ran = !lost && self.prepare(list, true);
         if ran {
@@ -2835,7 +2856,6 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
     }
@@ -2868,12 +2888,12 @@ impl State {
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
-        #[cfg(feature = "diagnostics")]
-        let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
-        #[cfg(not(feature = "diagnostics"))]
-        let why = |_: &str| {};
+        let why = |what: &str| {
+            if crate::pipeline::drop_reasons() {
+                crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
+            }
+        };
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
-            #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         };

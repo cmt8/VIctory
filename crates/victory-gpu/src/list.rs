@@ -1723,12 +1723,14 @@ extern "system" fn execute_indirect(
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
     } else {
-        #[cfg(all(windows, feature = "diagnostics"))]
-        crate::pipeline::note_why(format!(
-            "indirect signature {args:?}: arguments in a buffer {}, count in a buffer {}",
-            address.is_some(),
-            count.is_null() || counter.is_some()
-        ));
+        #[cfg(windows)]
+        if crate::pipeline::drop_reasons() {
+            crate::pipeline::note_why(format!(
+                "indirect signature {args:?}: arguments in a buffer {}, count in a buffer {}",
+                address.is_some(),
+                count.is_null() || counter.is_some()
+            ));
+        }
     }
     if ran {
         return;
