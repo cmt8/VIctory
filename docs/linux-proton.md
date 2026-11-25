@@ -136,6 +136,10 @@ with the indirect executions dropped, and named in the drop reasons);
 `VICTORY_MESH_INDIRECT=1` runs it as an indirect execution of one record,
 as upstream #1749 does: that record layout is unchecked against the title,
 and the first Linux run with it ended in a GPU page fault and reset.
+A draw or dispatch whose root descriptor (title memory's directory, the
+view heap's address or stride table, a root constant buffer, a root view
+outside title memory) has nothing to bind is dropped, named in the drop
+reasons, instead of running with the parameter unbound.
 `VICTORY_PIPELINE_WAIT_MS` sets how long a frame may wait for pipelines
 being made (500 by default; 0 never waits, pipelines then appear a few
 frames later).

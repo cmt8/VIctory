@@ -488,6 +488,22 @@ fn drop_why(why: &'static str) {
     DROP_WHY.set(Some(why));
 }
 
+/// A root descriptor of the draw being prepared has nothing to bind: the
+/// draw is dropped (`why` in the drop reasons) rather than run with the
+/// parameter unbound. A root descriptor has no size and no null form; left
+/// unset after the root signature was set, the host reads whatever address
+/// the parameter last held (an earlier draw's, of a buffer that may be gone
+/// by now) or none: a page fault, and on AMD with RADV a reset of the card
+/// that can take the desktop session with it (owner's run 220839). Before,
+/// these bindings were skipped and the draw ran.
+fn unbound_root(why: &'static str) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    if COUNT.fetch_add(1, Ordering::Relaxed) == 0 {
+        tracing::warn!(why, "a root descriptor with nothing to bind: its draws are dropped (first time)");
+    }
+    drop_why(why);
+}
+
 /// Counts a dropped draw by reason (`crate::pipeline::drop_reasons`), and
 /// marks the last traced draw as not run on the host (diagnostics).
 fn dropped(pipeline: usize) {
@@ -1105,15 +1121,18 @@ impl State {
                 for &(slot, param) in views {
                     if srv && slot == victory_shader::emit::SLOT_MEMORY {
                         // Ours: the directory of title memory by address.
-                        if let Some(m) = &memory {
-                            // SAFETY: an open list; the directory lives as
-                            // long as the process and the list holds it.
-                            unsafe {
-                                if compute {
-                                    l.SetComputeRootShaderResourceView(param, m.directory);
-                                } else {
-                                    l.SetGraphicsRootShaderResourceView(param, m.directory);
-                                }
+                        let Some(m) = &memory else {
+                            // (Never left unbound: see `unbound_root`.)
+                            unbound_root("title memory by address without its directory");
+                            return false;
+                        };
+                        // SAFETY: an open list; the directory lives as
+                        // long as the process and the list holds it.
+                        unsafe {
+                            if compute {
+                                l.SetComputeRootShaderResourceView(param, m.directory);
+                            } else {
+                                l.SetGraphicsRootShaderResourceView(param, m.directory);
                             }
                         }
                         continue;
@@ -1131,7 +1150,11 @@ impl State {
                                     l.SetGraphicsRootShaderResourceView(param, gpu);
                                 }
                             },
-                            None => once!("a shader reads view addresses of a heap that is not set"),
+                            None => {
+                                once!("a shader reads view addresses of a heap that is not set: the draw is dropped");
+                                unbound_root("view addresses of a heap that is not set");
+                                return false;
+                            }
                         }
                         continue;
                     }
@@ -1148,7 +1171,11 @@ impl State {
                                     l.SetGraphicsRootShaderResourceView(param, gpu);
                                 }
                             },
-                            None => once!("a shader picks buffers from a view heap that is not set"),
+                            None => {
+                                once!("a shader picks buffers from a view heap that is not set: the draw is dropped");
+                                unbound_root("element strides of a view heap that is not set");
+                                return false;
+                            }
                         }
                         continue;
                     }
@@ -1157,11 +1184,17 @@ impl State {
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
                         // A table left unset is undefined: a null view.
-                        if tabled && !self.root_srv_table(list, None, param, compute, false) {
-                            drop_why("a root view table the host could not make");
-                            return false;
+                        if tabled {
+                            if !self.root_srv_table(list, None, param, compute, false) {
+                                drop_why("a root view table the host could not make");
+                                return false;
+                            }
+                            continue;
                         }
-                        continue;
+                        // A root descriptor (a constant buffer, or a root SRV
+                        // with `VICTORY_ROOT_SRV_DIRECT=1`) has no null form.
+                        unbound_root("a root view the title did not set");
+                        return false;
                     };
                     // The shader adds the bytes a raw view begins early by.
                     let biased = srv
@@ -1177,7 +1210,8 @@ impl State {
                         continue;
                     }
                     let Some(mut gpu) = root_view(list, address, srv) else {
-                        continue;
+                        unbound_root("a root view outside title memory's copies");
+                        return false;
                     };
                     if biased {
                         gpu -= u64::from(self.host_word(
@@ -1202,15 +1236,17 @@ impl State {
             for &(slot, param) in &stage.root_uavs {
                 if slot == victory_shader::emit::SLOT_FAULTS {
                     // Ours: where shaders note the pages they found empty.
-                    if let Some(m) = &memory {
-                        // SAFETY: an open list; the buffer lives as long as
-                        // the process and the list holds it.
-                        unsafe {
-                            if compute {
-                                l.SetComputeRootUnorderedAccessView(param, m.faults);
-                            } else {
-                                l.SetGraphicsRootUnorderedAccessView(param, m.faults);
-                            }
+                    let Some(m) = &memory else {
+                        unbound_root("the empty-page notes without title memory's directory");
+                        return false;
+                    };
+                    // SAFETY: an open list; the buffer lives as long as
+                    // the process and the list holds it.
+                    unsafe {
+                        if compute {
+                            l.SetComputeRootUnorderedAccessView(param, m.faults);
+                        } else {
+                            l.SetGraphicsRootUnorderedAccessView(param, m.faults);
                         }
                     }
                     continue;
