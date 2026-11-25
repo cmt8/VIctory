@@ -94,10 +94,12 @@ void main(uint3 id : SV_DispatchThreadID) {
     } else {
         // Mesh dispatches: the console's are one-dimensional.
         uint3 g = src_args.Load3(src_at);
-        // Ahead of its draw, a record over the most a dispatch runs is a
-        // slot the title has not filled (the title leaves all
-        // ones there): empty, and not counted below either.
-        if (ahead && g.x > 65535u) {
+        // A record over the most a dispatch runs (65,535 groups) is none
+        // D3D12 runs. Ahead of its draw it is a slot the title has not
+        // filled (the title leaves all ones there): empty, and not counted
+        // below either.
+        bool beyond = g.x > 65535u;
+        if (ahead && beyond) {
             g = uint3(0, 0, 0);
         }
         // Diagnostics, in the budget buffer's next words: the largest
@@ -105,6 +107,13 @@ void main(uint3 id : SV_DispatchThreadID) {
         uint was;
         InterlockedMax(budget[1], g.x, was);
         InterlockedAdd(budget[2], min(g.x, 1u << 24), was);
+        // A lone record (a `DispatchMeshX` whose counts are in GPU memory)
+        // that asks for more is empty too, counted above as asked: raised
+        // to 65,535 groups, a slot of all ones ran that many groups of a
+        // program over whatever its inputs hold.
+        if (beyond && records == 1u) {
+            g = uint3(0, 0, 0);
+        }
         g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
         cost = g.x * g.y * g.z * 128u;
         groups = g;
@@ -1310,13 +1319,20 @@ void main() {
         // (kind 2, stride 16) at byte 64, of which the count (one, at byte
         // 8 of its buffer) lets the first run; a mesh dispatch (kind 10,
         // stride 12) at byte 128.
+        // A second lone mesh dispatch at byte 192 asks for more groups
+        // than a dispatch runs.
         put(16, &[u32::MAX, 5, 11, 12, 13]);
         put(64, &[70_000, 2, 3, 0xab, 1, 1, 1, 0xcd]);
-        put(128, &[100_000, 7, 9]);
+        put(128, &[65_535, 7, 9]);
+        put(192, &[100_000, 7, 9]);
         // SAFETY: inside the mapped 256 bytes.
         unsafe { count_ptr.cast::<u32>().add(2).write_volatile(1) };
-        let cases: [(u64, Option<u64>, (u32, u32, u32), u64); 3] =
-            [(16, None, (1, 20, 1), 0), (64, Some(8), (2, 16, 2), 64), (128, None, (10, 12, 1), 128)];
+        let cases: [(u64, Option<u64>, (u32, u32, u32), u64); 4] = [
+            (16, None, (1, 20, 1), 0),
+            (64, Some(8), (2, 16, 2), 64),
+            (128, None, (10, 12, 1), 128),
+            (192, None, (10, 12, 1), 192),
+        ];
         for (at, count_at, spec, out) in cases {
             let clamped = bound(&list, (&src, at), count_at.map(|c| (&count, c)), spec).expect("clamped");
             // The scratch buffer is the same one each time: its record is
@@ -1353,6 +1369,9 @@ void main() {
         assert_eq!(read(64, 4), [65_535, 2, 3, 0xab]);
         // A mesh dispatch: one-dimensional, at most 65,535 groups.
         assert_eq!(read(128, 3), [65_535, 1, 1]);
+        // A lone mesh record over 65,535 groups runs empty (it was raised
+        // to 65,535 before).
+        assert_eq!(read(192, 3), [0, 0, 0]);
         // SAFETY: mapped above.
         unsafe { back.Unmap(0, None) };
         list.reset();
