@@ -1715,6 +1715,105 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     runs
 }
 
+/// Bytes compared at a time by [`changed_spans`]: equal chunks are passed
+/// over with one slice compare (the C library's `memcmp`, many bytes a
+/// cycle); only a chunk that differs is looked into.
+const SPAN_CHUNK: usize = 4 << 10;
+
+/// The stretches of `now` that differ from `was` (within their common
+/// length), each from its first differing byte to its last, those less
+/// than `gap` bytes apart joined with the bytes between: what
+/// `join_close(changed_runs(now, was), gap)` gives for a `gap` of at least
+/// [`SPAN_CHUNK`], found at memory speed. The echo compare
+/// ([`Shadow::copy_compared`]) went through `changed_runs`, eight bytes a
+/// slice compare and the differing bytes one at a time: in the owner's run
+/// of linux/fx-next3 it took about 113 ms a frame for some 80 MB (well
+/// under 1 GB/s). Here a chunk of [`SPAN_CHUNK`] bytes that is equal costs
+/// one compare, and one that differs two searches 32 bytes at a time
+/// ([`first_difference`], [`last_difference`]).
+fn changed_spans(now: &[u8], was: &[u8], gap: usize) -> Vec<(usize, usize)> {
+    debug_assert!(gap >= SPAN_CHUNK);
+    let n = now.len().min(was.len());
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut at = 0;
+    while at < n {
+        let end = (at + SPAN_CHUNK).min(n);
+        let (a, b) = (&now[at..end], &was[at..end]);
+        if a != b
+            && let Some(first) = first_difference(a, b)
+        {
+            let last = last_difference(a, b).unwrap_or(first);
+            let (lo, hi) = (at + first, at + last + 1);
+            match out.last_mut() {
+                Some(span) if lo <= span.0 + span.1 + gap => span.1 = hi - span.0,
+                _ => out.push((lo, hi - lo)),
+            }
+        }
+        at = end;
+    }
+    out
+}
+
+#[cfg(test)]
+mod span_tests {
+    use super::{ECHO_JOIN, SPAN_CHUNK, changed_runs, changed_spans, join_close};
+
+    /// The chunked search gives what the byte-wise one joined gives, for
+    /// differences at chunk edges, across them, at the ends, and none.
+    #[test]
+    fn changed_spans_match_the_joined_runs() {
+        let len = 5 * SPAN_CHUNK + 123;
+        let was: Vec<u8> = (0..len).map(|i| (i * 31 + i / 977) as u8).collect();
+        let cases: &[&[usize]] = &[
+            &[],
+            &[0],
+            &[len - 1],
+            &[SPAN_CHUNK - 1, SPAN_CHUNK],
+            &[10, 11, 12, 900],
+            &[100, 100 + ECHO_JOIN],
+            &[100, 100 + ECHO_JOIN - 1],
+            &[5, 2 * SPAN_CHUNK + 7, 2 * SPAN_CHUNK + 4000, 4 * SPAN_CHUNK + 1],
+            &[3 * SPAN_CHUNK - 2, 4 * SPAN_CHUNK + 3, len - 2],
+        ];
+        for &places in cases {
+            let mut now = was.clone();
+            for &p in places {
+                now[p] ^= 0x5a;
+            }
+            for gap in [ECHO_JOIN, 2 * ECHO_JOIN] {
+                assert_eq!(
+                    changed_spans(&now, &was, gap),
+                    join_close(changed_runs(&now, &was), gap),
+                    "differences at {places:?}, gap {gap}"
+                );
+            }
+        }
+        // Every byte differs.
+        let now: Vec<u8> = was.iter().map(|b| !b).collect();
+        assert_eq!(changed_spans(&now, &was, ECHO_JOIN), [(0, len)]);
+    }
+
+    /// Loosely pinned: equal memory is compared at well over 1 GB/s even
+    /// in a test build (the echo compare ran at about 0.7 GB/s in a
+    /// release build before).
+    #[test]
+    fn changed_spans_compare_equal_memory_fast() {
+        let len = 64 << 20;
+        let a = vec![7u8; len];
+        let mut b = a.clone();
+        // A few differences, as a page the copy-back wrote has.
+        for p in [1 << 20, 17 << 20, (40 << 20) + 5] {
+            b[p] = 9;
+        }
+        let began = std::time::Instant::now();
+        let spans = changed_spans(&a, &b, ECHO_JOIN);
+        let ms = began.elapsed().as_secs_f64() * 1e3;
+        assert_eq!(spans.len(), 3);
+        eprintln!("changed_spans: 64 MiB in {ms:.1} ms ({:.1} GB/s)", 64.0 / 1024.0 / (ms / 1e3));
+        assert!(ms < 64.0, "64 MiB took {ms:.1} ms");
+    }
+}
+
 #[cfg(test)]
 mod merge_tests {
     use super::{PIECE, back_piece, changed_runs};
@@ -3147,7 +3246,7 @@ impl Shadow {
                 // writing, which a refresh leaves alone, only the refresh of
                 // this copy writes it, as `copy_whole` does.
                 let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(off), n) };
-                for (r, m) in join_close(changed_runs(&title[..n], held), ECHO_JOIN) {
+                for (r, m) in changed_spans(&title[..n], held, ECHO_JOIN) {
                     held[r..r + m].copy_from_slice(&title[r..r + m]);
                     self.changed(off + r, off + r + m);
                     self.card_changed(off + r, off + r + m);
