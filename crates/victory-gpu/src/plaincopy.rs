@@ -1,5 +1,6 @@
 //! Copies of title memory made in place, by this process, with a way back
-//! when a page is not there (`VICTORY_COPY_PLAIN=1`; off by default).
+//! when a page is not there (`VICTORY_COPY_PLAIN`: on by default under
+//! Wine, off elsewhere; `=1` or `=0` says).
 //!
 //! Every copy of title memory into a host buffer goes through the kernel
 //! (`ReadProcessMemory` on our own process, `crate::host::copy_mapped`):
@@ -75,11 +76,36 @@ unsafe extern "C" {
 }
 
 /// Whether copies of title memory into host memory are made in place
-/// (`VICTORY_COPY_PLAIN=1`).
+/// (`VICTORY_COPY_PLAIN`: on by default under Wine, off elsewhere; `=1` or
+/// `=0` says).
+///
+/// Under Wine the "kernel's copy" is no system call: `NtReadVirtualMemory`
+/// of our own process is a `memmove` inside ntdll's unix side under its own
+/// exception guard, after `virtual_check_buffer_for_write` has touched every
+/// page of the destination (dlls/ntdll/unix/virtual.c, Proton 11.0), with a
+/// PE-to-unix call around it. Here the same copy is made without the call
+/// and without the destination walk; a page that is not there costs a fault
+/// (tens of microseconds under Wine, ntdll's lock on the memory map) where a
+/// failed kernel copy costs a microsecond, which is why probes under
+/// [`LEAST`] and blocks that faulted lately ([`RECENT`]) stay with the
+/// kernel. In the world scene the frame line's copies took 65 ms a frame
+/// with the kernel's copy and 49 with these for the same 115-120 MB (runs a1
+/// and a3 of linux/fx-next7, both with VICTORY_VM_STATS=1), 0 to 0.2 faults a
+/// frame, two ten-minute runs without a crash; the frame time with
+/// profiling off was about the same either way (193-204 against ~200 ms),
+/// so no frame-time gain is claimed. On Windows the kernel's copy is a real
+/// system call and these were not measured there.
 pub(crate) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = cfg!(target_arch = "x86_64") && std::env::var_os("VICTORY_COPY_PLAIN").is_some_and(|v| v == "1");
+        let asked = std::env::var("VICTORY_COPY_PLAIN");
+        let on = cfg!(target_arch = "x86_64")
+            && match asked.as_deref().map(str::trim) {
+                Ok("1") => true,
+                Ok("0") => false,
+                _ => crate::host::on_wine(),
+            };
+        let how = if asked.is_ok() { "VICTORY_COPY_PLAIN" } else { "the default under Wine; VICTORY_COPY_PLAIN=0 turns it off" };
         if on {
             if !install() {
                 tracing::warn!("plain copies unavailable: the exception handler could not be registered; using kernel copies");
@@ -87,7 +113,7 @@ pub(crate) fn on() -> bool {
             }
             tracing::info!(
                 "copies of title memory into host buffers are made in place, with the kernel's copy behind them for a \
-                 page that is not there (VICTORY_COPY_PLAIN=1)"
+                 page that is not there ({how})"
             );
         }
         on
@@ -135,7 +161,7 @@ impl RecentFaults {
 
     fn contains(&self, from: usize, len: usize) -> bool {
         let first = Self::block(from);
-        let last = Self::block(from.saturating_add(len - 1));
+        let last = Self::block(from.saturating_add(len.max(1) - 1));
         if last - first < self.0.len() {
             (first..=last).any(|block| self.0[block % self.0.len()].load(Relaxed) == block)
         } else {
@@ -240,7 +266,10 @@ fn guarded(_: *mut u8, _: *const u8, len: usize) -> usize {
 /// false if a destination page is not mapped or not writable.
 #[cfg(target_arch = "x86_64")]
 fn guarded_write(to: *mut u8, from: *const u8, len: usize) -> bool {
-    install();
+    // Without the handler a write that faults would not come back.
+    if !install() {
+        return false;
+    }
     // SAFETY: `from` is our readable host buffer; any unmapped or read-only
     // destination page ends the write with 0 via [`install`].
     unsafe { victory_write_guarded(to, from, len) != 0 }
@@ -334,7 +363,7 @@ pub(crate) fn line(frames: f64) {
     let [copies, bytes, gone, lately, small] = [0, 1, 2, 3, 4].map(|i| COUNT[i].swap(0, Relaxed) as f64 / frames);
     let [writes, wbytes, wgone] = [0, 1, 2].map(|i| WRITE_COUNT[i].swap(0, Relaxed) as f64 / frames);
     tracing::info!(
-        "copies of title memory made in place per frame (VICTORY_COPY_PLAIN=1): {copies:.0}, {:.1} MB; {gone:.1} met a page \
+        "copies of title memory made in place per frame (VICTORY_COPY_PLAIN): {copies:.0}, {:.1} MB; {gone:.1} met a page \
          that was not there and went through the kernel's copy; left to the kernel's copy untried: {lately:.0} whose source \
          faulted in the last two seconds, {small:.0} of under {LEAST} bytes; writes back in place: {writes:.0}, {:.1} MB, \
          {wgone:.1} fell back",
