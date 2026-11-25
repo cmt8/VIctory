@@ -52,7 +52,9 @@ cbuffer Record : register(b0) {
     uint args_offset;
     // Bit 0: a count buffer bounds the records. Bit 1: the records are a
     // window clamped ahead of their draws: one that asks for more than can
-    // run is left empty and costs nothing.
+    // run is left empty and costs nothing. Bit 2: the records are gathered
+    // (`gather`): record i lies in the source where word i of the table
+    // behind `count_buf` says (from `count_offset` on), and goes to slot i.
     uint has_count;
     uint count_offset;
 };
@@ -97,6 +99,16 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     if (!active) return;
 #endif
     uint src_at = args_offset + id.x * stride;
+    // Gathered records (bit 2): record i lies where word i of the table
+    // behind `count_buf` says. (A branch, not a select: without the bit the
+    // view behind `count_buf` is a count of four bytes, or the source
+    // itself, and is not read here. Threads past the records, which by
+    // group stay to charge, do not read it either.)
+    bool gathered = (has_count & 4u) != 0;
+    [branch]
+    if (active && gathered) {
+        src_at = count_buf.Load(count_offset + id.x * 4u);
+    }
     // In words: the stride is a multiple of 4.
     uint dst_at = id.x * (stride / 4);
     uint cost = 0;
@@ -153,8 +165,9 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         // A lone record (a `DispatchMeshX` whose counts are in GPU memory)
         // that asks for more is empty too, counted below as asked: raised
         // to 65,535 groups, a slot of all ones ran that many groups of a
-        // program over whatever its inputs hold.
-        if (beyond && records == 1u) {
+        // program over whatever its inputs hold. A gathered record is such
+        // a lone record too (it comes out as if clamped alone).
+        if (beyond && (records == 1u || gathered)) {
             g = uint3(0, 0, 0);
         }
         g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
@@ -645,6 +658,196 @@ fn record_clamp_as(
         l.ResourceBarrier(&second[skip..]);
     }
     true
+}
+
+/// The most records of one argument buffer gathered for a list
+/// ([`gather`]): a multiple of the clamp's 64 threads a group, so that the
+/// threads past the last record read inside the table.
+pub(crate) const GATHER_MOST: u32 = 4096;
+/// The widest record gathered: its slot in the scratch buffer.
+pub(crate) const GATHER_STRIDE: u32 = 32;
+
+/// The records of one argument buffer that a list's draws read, to be
+/// clamped in one pass before the list runs ([`gather`]): the buffer (a
+/// host copy, and its number), the records' kind and stride, the scratch
+/// buffer whose slot `i` holds record `i` clamped, and the table of the
+/// records' offsets in the buffer (upload memory of the list).
+pub(crate) struct GatherSet {
+    pub(crate) src: ID3D12Resource,
+    pub(crate) src_id: u64,
+    pub(crate) kind: u32,
+    pub(crate) stride: u32,
+    pub(crate) scratch: ID3D12Resource,
+    table_gpu: u64,
+    table: usize,
+    /// A record's offset in the buffer, and its slot.
+    slots: std::collections::HashMap<u32, u32>,
+}
+
+// SAFETY: D3D12 objects are free-threaded; the table is the list's own
+// upload memory, written under the list's lock before the list is submitted.
+unsafe impl Send for GatherSet {}
+
+impl GatherSet {
+    pub(crate) fn new(src: ID3D12Resource, src_id: u64, (kind, stride): (u32, u32), scratch: ID3D12Resource, (table_gpu, table): (u64, *mut u8)) -> Self {
+        Self { src, src_id, kind, stride, scratch, table_gpu, table: table as usize, slots: Default::default() }
+    }
+
+    /// The records gathered so far.
+    pub(crate) fn records(&self) -> u32 {
+        self.slots.len() as u32
+    }
+
+    /// The slot of the record at `offset`: the one it has, or the next
+    /// free one. None when the set is full.
+    pub(crate) fn slot(&mut self, offset: u32) -> Option<u32> {
+        if let Some(&slot) = self.slots.get(&offset) {
+            return Some(slot);
+        }
+        let slot = self.slots.len() as u32;
+        if slot >= GATHER_MOST {
+            return None;
+        }
+        // SAFETY: the table holds `GATHER_MOST` words.
+        unsafe { (self.table as *mut u32).add(slot as usize).write_volatile(offset) };
+        self.slots.insert(offset, slot);
+        Some(slot)
+    }
+
+    /// The scratch buffer `src`'s set uses, to keep for the list's next recording.
+    pub(crate) fn into_scratch(self) -> ID3D12Resource {
+        self.scratch
+    }
+}
+
+/// Whether [`gather`] can take a record of `kind` and `stride` at `offset`
+/// of a buffer at `src_gpu`: what [`record_gather_as`] asks of its
+/// arguments, checked when the record is taken, because a record once
+/// given a slot is drawn from the slot.
+pub(crate) fn gatherable(src_gpu: u64, offset: u64, (kind, stride): (u32, u32)) -> Option<u32> {
+    let min = min_stride(kind)?;
+    if stride < min || stride > GATHER_STRIDE || !stride.is_multiple_of(4) || !offset.is_multiple_of(4) || !src_gpu.is_multiple_of(4) {
+        return None;
+    }
+    u32::try_from(offset).ok().filter(|o| o.checked_add(stride).is_some())
+}
+
+/// For a single record of `kind` and `stride` at `offset` of the host copy
+/// `src` (its number `src_id`) that a draw of `list` is about to read: a
+/// slot in the list's scratch buffer for that argument buffer, which the
+/// list's prelude fills with the record clamped, in one pass with all the
+/// other records the list's draws read (`HostList::prelude`,
+/// [`record_gathers`]). Nothing is recorded in the list. The scratch
+/// buffer and the record's place in it; None if the list no longer
+/// gathers (something in it may write arguments), the set is full, or the
+/// record does not fit the clamp: the caller clamps it as before.
+///
+/// Why: the title keeps its mesh records scattered through one argument
+/// buffer of about 100 MB (from one draw to the next 16 to 33,056 bytes
+/// on, or back), so a window of records at one step cannot serve them, and
+/// about 1,450 draws a frame each had a compute pass of ours in front of
+/// them: the card left drawing for compute and came back, about nine
+/// microseconds each (run 243, and the windows' own measurement).
+pub(crate) fn gather(list: &HostList, (src, src_id): (&ID3D12Resource, u64), offset: u64, spec: (u32, u32)) -> Option<(ID3D12Resource, u64)> {
+    clamp()?;
+    // SAFETY: a live D3D12 buffer resource.
+    let Some(offset) = gatherable(unsafe { src.GetGPUVirtualAddress() }, offset, spec) else {
+        GATHER_NONE[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return None;
+    };
+    list.gather_slot(src, src_id, offset, spec)
+}
+
+/// Since the last line: records that got no slot because they do not fit
+/// the clamp, because their list had stopped gathering, because the list
+/// gathers from too many buffers, because their set was full, because a
+/// buffer could not be made.
+pub(crate) static GATHER_NONE: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// Records the clamp of `records` gathered records into `dst`, which is in
+/// state `before`, and leaves `dst` in `INDIRECT_ARGUMENT`: record `i` is
+/// read at the offset word `i` of the table at `table_gpu` names, in the
+/// buffer `src`, and stored clamped at `i * stride`. Charged to the budget
+/// word at `budget` as records clamped one by one are. False, with nothing
+/// recorded, if the layout or the addresses do not fit the clamp.
+fn record_gather_as(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
+    budget: u64,
+    src: &ID3D12Resource,
+    table_gpu: u64,
+    (kind, stride, records): (u32, u32, u32),
+) -> bool {
+    // SAFETY: live D3D12 buffer resources.
+    let (src_gpu, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
+    if gatherable(src_gpu, 0, (kind, stride)).is_none()
+        || records == 0
+        || records > GATHER_MOST
+        || !dst_gpu.is_multiple_of(4)
+        || !budget.is_multiple_of(4)
+        || !table_gpu.is_multiple_of(4)
+    {
+        return false;
+    }
+    let constants = [kind, stride, records, 0u32, 4u32, 0u32];
+    let first = [uav_barrier(), transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)];
+    let second = [
+        uav_barrier(),
+        transition(dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
+    ];
+    // SAFETY: an open list; our root signature and pipeline; live source,
+    // table, scratch destination and budget buffers. The first wait puts
+    // the pass behind every earlier shader write (the title's argument
+    // passes of the lists before); the second puts the list's draws behind
+    // the pass.
+    unsafe {
+        l.ResourceBarrier(&first);
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+        l.SetComputeRootShaderResourceView(1, src_gpu);
+        l.SetComputeRootShaderResourceView(2, table_gpu);
+        l.SetComputeRootUnorderedAccessView(3, dst_gpu);
+        l.SetComputeRootUnorderedAccessView(4, budget);
+        l.Dispatch(records.div_ceil(64), 1, 1);
+        l.ResourceBarrier(&second);
+    }
+    true
+}
+
+/// Records, into a list's prelude `l`, the passes that fill the scratch
+/// buffers of `sets` ([`gather`]), charged to the words of `budget`, which
+/// is zeroed first (the gathered records have a budget of their own: the
+/// list's own clamps zero and charge theirs inside the list, after this).
+/// False if anything could not be recorded: the slots then hold no clamped
+/// records and the list must not run.
+pub(crate) fn record_gathers(l: &ID3D12GraphicsCommandList, sets: &[GatherSet], budget: &ID3D12Resource) -> bool {
+    use windows::core::Interface;
+    let (Some(c), Ok(l2)) = (clamp(), l.cast::<ID3D12GraphicsCommandList2>()) else {
+        return false;
+    };
+    // SAFETY: a live buffer.
+    let at = unsafe { budget.GetGPUVirtualAddress() };
+    // (All six words: the clamp's diagnostics words 3 to 5 too, as the
+    // list's own budget is zeroed.)
+    let zeros = [0u64, 4, 8, 12, 16, 20].map(|offset| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: at + offset, Value: 0 });
+    // SAFETY: an open list; the budget buffer is the list's own and common
+    // between its runs.
+    unsafe {
+        l.ResourceBarrier(&[transition(budget, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
+        l2.WriteBufferImmediate(zeros.len() as u32, zeros.as_ptr(), None);
+        l.ResourceBarrier(&[transition(budget, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+    }
+    let mut all = true;
+    for set in sets.iter().filter(|s| s.records() > 0) {
+        all &= record_gather_as(c, l, (&set.scratch, D3D12_RESOURCE_STATE_COMMON), at, &set.src, set.table_gpu, (set.kind, set.stride, set.records()));
+    }
+    // SAFETY: as above.
+    unsafe {
+        l.ResourceBarrier(&[transition(budget, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON)]);
+    }
+    all
 }
 
 /// Whether every draw served from a window is checked against a fresh
@@ -1536,6 +1739,115 @@ void main() {
     /// charge nothing; clamped as single records the same slots are clamped
     /// to the most and spend the budget.
     #[test]
+    fn gathered_records_must_fit_the_clamp() {
+        // a mesh record 12 bytes wide at a 4-byte offset of a buffer on a 4-byte address
+        assert_eq!(gatherable(0x1000, 0x6d71550, (10, 12)), Some(0x6d71550));
+        assert_eq!(gatherable(0x1000, 0, (1, 20)), Some(0));
+        // not on four bytes, too narrow, too wide, an unknown kind, past 4 GiB
+        assert_eq!(gatherable(0x1000, 0x6d71552, (10, 12)), None);
+        assert_eq!(gatherable(0x1002, 0x40, (10, 12)), None);
+        assert_eq!(gatherable(0x1000, 0x40, (10, 8)), None);
+        assert_eq!(gatherable(0x1000, 0x40, (10, GATHER_STRIDE + 4)), None);
+        assert_eq!(gatherable(0x1000, 0x40, (7, 12)), None);
+        assert_eq!(gatherable(0x1000, 1 << 32, (10, 12)), None);
+        assert_eq!(gatherable(0x1000, u64::from(u32::MAX) - 3, (10, 12)), None);
+    }
+
+    /// Mesh records scattered through a buffer as the title keeps them, for
+    /// the gather tests: 16 to thousands of bytes apart, not in order, one
+    /// of them over the most a dispatch runs (65,535 groups), one of all
+    /// ones (garbage).
+    const GATHERED: [(u32, [u32; 3]); 7] = [
+        (0x3350, [5, 1, 1]),
+        (0x0040, [519, 1, 1]),
+        (0x0050, [0, 1, 1]),
+        (0x7ff0, [70000, 1, 1]),
+        (0x1230, [u32::MAX, u32::MAX, u32::MAX]),
+        (0x0010, [9, 7, 3]),
+        (0x2000, [1, 0, 0]),
+    ];
+
+    /// A mesh record as the clamp leaves it clamped alone: one-dimensional,
+    /// at most 65,535 groups; a lone record that asks for more runs empty
+    /// (this tree's rule; fxceless's clamp raises it to 65,535, and its
+    /// form of the WARP test below expected that).
+    fn mesh_alone(w: [u32; 3]) -> [u32; 3] {
+        if w[0] > 65535 { [0, 0, 0] } else { [w[0], w[1].min(1), w[2].min(1)] }
+    }
+
+    #[test]
+    fn warp_gathered_records_come_out_as_if_clamped_one_by_one() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const KIND_MESH: u32 = 10;
+        const STRIDE: u32 = 12;
+        let records = GATHERED;
+        let total = 0x8000usize;
+        let mut src = vec![0x5Au8; total];
+        for (at, words) in records {
+            for (w, word) in words.into_iter().enumerate() {
+                let i = at as usize + w * 4;
+                src[i..i + 4].copy_from_slice(&word.to_le_bytes());
+            }
+        }
+        let slots = (GATHER_MOST * STRIDE) as u64;
+        let (src_buf, src_ptr, _) = warp.shared_buffer(total as u64);
+        let (_table_buf, table_ptr, table_gpu) = warp.shared_buffer(u64::from(GATHER_MOST) * 4);
+        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (readback_buf, readback_ptr, _) = warp.shared_buffer(slots);
+        let dst_buf = warp.default_uav(slots);
+        // SAFETY: mapped buffers of these sizes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), src_ptr, total);
+            std::ptr::write_bytes(table_ptr, 0, GATHER_MOST as usize * 4);
+            for (i, (at, _)) in records.into_iter().enumerate() {
+                (table_ptr as *mut u32).add(i).write_volatile(at);
+            }
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            std::ptr::write_bytes(readback_ptr, 0xEE, slots as usize);
+        }
+        assert!(record_gather_as(
+            &warp.clamp,
+            &warp.list,
+            (&dst_buf, D3D12_RESOURCE_STATE_COMMON),
+            budget_gpu,
+            &src_buf,
+            table_gpu,
+            (KIND_MESH, STRIDE, records.len() as u32),
+        ));
+        // SAFETY: an open list; the scratch buffer, which the pass left
+        // readable as arguments, is copied for the check.
+        unsafe {
+            warp.list.ResourceBarrier(&[transition(
+                &dst_buf,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            warp.list.CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, slots);
+        }
+        warp.submit_and_wait();
+        // SAFETY: the work is done; mapped buffers.
+        let (spent, out) = unsafe {
+            (
+                (budget_ptr as *const u32).read_volatile(),
+                std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), records.len() * 3).to_vec(),
+            )
+        };
+        // Slot i holds record i as the clamp leaves a mesh record clamped
+        // alone ([`mesh_alone`]).
+        let want: Vec<[u32; 3]> = records.iter().map(|&(_, w)| mesh_alone(w)).collect();
+        for (i, want) in want.iter().enumerate() {
+            assert_eq!(&out[i * 3..i * 3 + 3], want, "slot {i} (the record at {:#x})", records[i].0);
+        }
+        let charged: u32 = want.iter().map(|w| w[0] * w[1] * w[2] * 128).sum();
+        assert_eq!(spent, charged, "each record charged once, as clamped alone");
+        // The source is read only.
+        // SAFETY: a mapped buffer.
+        assert_eq!(unsafe { std::slice::from_raw_parts(src_ptr.cast_const(), total) }, &src[..]);
+    }
+
+    #[test]
     fn warp_window_leaves_unfilled_slots_empty_and_uncharged() {
         let Some(mut warp) = WarpHarness::new() else {
             return;
@@ -2215,6 +2527,94 @@ void main() {
             // SAFETY: the list has run; a mapped buffer.
             let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
             assert_eq!(hits, expected, "every record of both windows runs once");
+        }
+    }
+
+    /// Gathered records on the host GPU (the WARP test above needs a WARP
+    /// adapter, which Wine has not), in both forms of the clamp: charging
+    /// by group (the default) and record by record
+    /// (`VICTORY_CLAMP_BY_GROUP=0`, or a compiler that does not build the
+    /// other). Each slot holds its record as if clamped alone, each record
+    /// is charged once, the source is not written.
+    #[test]
+    fn gathered_records_come_out_as_if_clamped_alone_on_the_host_in_both_forms() {
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        const KIND_MESH: u32 = 10;
+        const STRIDE: u32 = 12;
+        let total = 0x8000usize;
+        let mut src = vec![0x5Au8; total];
+        for (at, words) in GATHERED {
+            for (w, word) in words.into_iter().enumerate() {
+                let i = at as usize + w * 4;
+                src[i..i + 4].copy_from_slice(&word.to_le_bytes());
+            }
+        }
+        let want: Vec<[u32; 3]> = GATHERED.iter().map(|&(_, w)| mesh_alone(w)).collect();
+        let charged: u32 = want.iter().map(|w| w[0] * w[1] * w[2] * 128).sum();
+        let slots = u64::from(GATHER_MOST * STRIDE);
+        for by_group in [true, false] {
+            let form = if by_group { "by group" } else { "record by record" };
+            let clamp = make_from(&host.device, &source(by_group)).unwrap_or_else(|e| panic!("the clamp {form} must build: {e}"));
+            let list = host.new_list().expect("command list");
+            let (src_buf, src_ptr) = host.shared_buffer(total as u64).expect("source buffer");
+            let (table_buf, table_ptr) = host.shared_buffer(u64::from(GATHER_MOST) * 4).expect("table");
+            let (budget_buf, budget_ptr) = host.shared_buffer(256).expect("budget");
+            let dst = host.uav_buffer(slots).expect("slots");
+            let back = host.read_back_buffer(slots).expect("read-back buffer");
+            // SAFETY: mapped buffers of these sizes.
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.as_ptr(), src_ptr, total);
+                std::ptr::write_bytes(table_ptr, 0, GATHER_MOST as usize * 4);
+                for (i, (at, _)) in GATHERED.into_iter().enumerate() {
+                    table_ptr.cast::<u32>().add(i).write_volatile(at);
+                }
+                std::ptr::write_bytes(budget_ptr, 0, 256);
+            }
+            // SAFETY: live buffers.
+            let (table_gpu, budget_gpu) = unsafe { (table_buf.GetGPUVirtualAddress(), budget_buf.GetGPUVirtualAddress()) };
+            assert!(
+                record_gather_as(
+                    &clamp,
+                    &list.list,
+                    (&dst, D3D12_RESOURCE_STATE_COMMON),
+                    budget_gpu,
+                    &src_buf,
+                    table_gpu,
+                    (KIND_MESH, STRIDE, GATHERED.len() as u32),
+                ),
+                "{form}: recorded"
+            );
+            // SAFETY: an open list; the slots, left readable as arguments,
+            // are copied out for the check.
+            unsafe {
+                list.list.ResourceBarrier(&[transition(&dst, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                list.list.CopyBufferRegion(&back, 0, &dst, 0, slots);
+                list.list.ResourceBarrier(&[transition(&dst, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]);
+            }
+            list.close();
+            host.execute(&[&list]);
+            let mut mapped = std::ptr::null_mut();
+            // SAFETY: a read-back buffer the list has written and the host
+            // has waited for (`execute`).
+            unsafe { back.Map(0, None, Some(&mut mapped)) }.expect("mapped");
+            // SAFETY: the mapped slots; the budget's mapped words.
+            let (out, spent) = unsafe {
+                (
+                    std::slice::from_raw_parts(mapped.cast::<u32>().cast_const(), GATHERED.len() * 3).to_vec(),
+                    budget_ptr.cast::<u32>().read_volatile(),
+                )
+            };
+            // SAFETY: mapped above.
+            unsafe { back.Unmap(0, None) };
+            for (i, want) in want.iter().enumerate() {
+                assert_eq!(&out[i * 3..i * 3 + 3], want, "{form}: slot {i} (the record at {:#x})", GATHERED[i].0);
+            }
+            assert_eq!(spent, charged, "{form}: each record charged once, as clamped alone");
+            // SAFETY: a mapped buffer.
+            assert_eq!(unsafe { std::slice::from_raw_parts(src_ptr.cast_const(), total) }, &src[..], "{form}: the source is read only");
+            list.reset();
         }
     }
 
