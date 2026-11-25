@@ -1040,6 +1040,23 @@ impl State {
                         }
                         continue;
                     }
+                    if srv && slot == victory_shader::emit::SLOT_VIEWS {
+                        // Ours: the title addresses of the heap's buffer
+                        // views, for a descriptor read as data.
+                        match self.heap_views(list) {
+                            // SAFETY: an open list; the table lives as long
+                            // as the heap the list holds.
+                            Some(gpu) => unsafe {
+                                if compute {
+                                    l.SetComputeRootShaderResourceView(param, gpu);
+                                } else {
+                                    l.SetGraphicsRootShaderResourceView(param, gpu);
+                                }
+                            },
+                            None => once!("a shader reads view addresses of a heap that is not set"),
+                        }
+                        continue;
+                    }
                     if srv && slot == victory_shader::emit::SLOT_STRIDES {
                         // Ours, not the title's: the shader picks buffers
                         // from the view heap by an index it computes.
@@ -1495,6 +1512,26 @@ impl State {
                 ms = started.elapsed().as_millis(),
                 "buffer views of the heap made ready for shaders that pick them by index"
             );
+        }
+        Some(gpu)
+    }
+
+    /// [`State::heap_buffers`] for a shader that reads a descriptor's
+    /// address as data: the GPU address of the host's table of the buffer
+    /// views' title addresses by heap slot. The pass that readies the
+    /// buffer views also fills the table.
+    fn heap_views(&self, list: &HostList) -> Option<u64> {
+        let heap = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())?;
+        let host = heap.host()?;
+        let gpu = host.views_gpu()?;
+        self.heap_buffers(list)?;
+        if let Some(buffer) = host.views_buffer() {
+            list.keep(buffer);
         }
         Some(gpu)
     }
