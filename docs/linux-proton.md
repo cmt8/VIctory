@@ -211,6 +211,18 @@ frames later).
   shader cache key are not in this tree (its own key and
   `translate --cache` are).
 
+### Rendering round 5 (linux/fx-next5-render)
+
+- `VICTORY_VIEW_OWN_COPY` (on; `=0` as before): a buffer view that does
+  not start on an element of its buffer's host copy (the title places
+  structured views at ring positions in its big GPU heap) is made on a copy
+  of its own bytes instead of being refused and read as zeros (upstream
+  86a5ed6 by Marvis, as ported by fxceless a26859fc: meshlet culling
+  constants and colour-bake parameter blocks among them). The line "buffer
+  views off their copy's elements" counts them; the once-only warnings
+  "buffer view not on an element of its host copy" no longer appear with
+  it on.
+
 ## Tests
 
 ```sh

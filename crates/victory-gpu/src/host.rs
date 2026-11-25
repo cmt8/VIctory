@@ -6520,6 +6520,7 @@ impl Meter {
                 "indirect records per frame: {emptied:.1} run empty with their list's budget spent ({spent:.1} lists ran out; VICTORY_INDIRECT_BUDGET_LOG2 sets it), {nothing:.1} asked for nothing (or past what one execution runs), {cut:.1} draws cut to the vertex or instance bounds"
             );
         }
+        crate::shadow::exact_line(frames);
         late_line(frames);
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);
