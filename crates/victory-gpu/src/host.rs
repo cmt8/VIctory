@@ -5686,14 +5686,16 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
     read(src, dst.as_mut_ptr(), dst.len())
 }
 
-/// Copies `len` bytes from `src` to `dst` unless a source page is not
-/// readable.
+/// Copies `len` bytes from `src` to `dst` in the kernel: false if a source
+/// page is not readable or a destination page not writable (the bytes
+/// before that page may have been copied).
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
-    // SAFETY: the destination is mapped writable memory of `len` bytes; the
-    // kernel checks the source.
+    // SAFETY: the destination is `len` bytes the caller may write, host
+    // memory or title memory; the kernel checks both ranges, and a page it
+    // cannot read or write fails the call instead of faulting.
     unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
 }
 
@@ -5711,37 +5713,67 @@ unsafe extern "system" {
     ) -> i32;
 }
 
-/// Whether title memory is written with the kernel's own call
-/// (`NtWriteVirtualMemory`) and not `WriteProcessMemory`, which first asks
-/// what the pages are (as `VirtualQuery` does: about 2 ms a call in the
-/// title's big pools, see [`copy_mapped`]): putting back what shaders wrote
-/// cost 1.2-1.9 s a frame for 430-800 pieces, 2 ms each whatever their size
-/// (run 24). On by default; `VICTORY_DIRECT_WRITES=0` writes as before.
-fn direct_writes() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_DIRECT_WRITES").is_none_or(|v| v != "0"))
+/// How [`write_mapped`] writes title memory (`VICTORY_DIRECT_WRITES`).
+#[derive(Clone, Copy, PartialEq)]
+enum Writes {
+    /// Through the kernel copy the reads use, [`read`] with host memory as
+    /// its source (the default; upstream's since b58d198d).
+    Copy,
+    /// `VICTORY_DIRECT_WRITES=nt`: the kernel's write call
+    /// (`NtWriteVirtualMemory`), this fork's default before.
+    Nt,
+    /// `VICTORY_DIRECT_WRITES=0`: `WriteProcessMemory`, which first asks
+    /// what the pages are (as `VirtualQuery` does: about 2 ms a call in the
+    /// title's big pools, see [`copy_mapped`]): putting back what shaders
+    /// wrote cost 1.2-1.9 s a frame for 430-800 pieces, 2 ms each whatever
+    /// their size (run 24).
+    Process,
+}
+
+/// Under Wine the two write calls are wineserver requests that carry the
+/// bytes to the server, which writes them into our process; the kernel copy
+/// is a copy in our own process there. Measured under Wine 11.22
+/// (`membench`), 64 KiB: 1.2 us through the copy, 31 us with
+/// `NtWriteVirtualMemory`, 29 us with `WriteProcessMemory`; 1 MiB: 44 us,
+/// 368 us, 314 us. The requests also queue behind the server's work for the
+/// runtime's page mappings, whose cost grows with the views it holds (a run
+/// with 2,367 ms a frame of "copying back" for 11.4 MB). On Windows both
+/// are kernel copies; the copy fails on a page it cannot write as the write
+/// call does, without faulting, and leaves that page alone.
+fn writes() -> Writes {
+    static HOW: OnceLock<Writes> = OnceLock::new();
+    *HOW.get_or_init(|| match std::env::var("VICTORY_DIRECT_WRITES").as_deref().map(str::trim) {
+        Ok("0") => Writes::Process,
+        Ok("nt") => Writes::Nt,
+        _ => Writes::Copy,
+    })
 }
 
 /// Copies host memory into title memory after a submission (what shaders
-/// wrote), leaving pages that are not mapped alone.
+/// wrote), leaving pages that are not mapped (or not writable) alone.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    let direct = direct_writes();
+    let how = writes();
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
         let mut done = 0;
-        if direct {
-            // SAFETY: as below; the kernel checks the destination and
-            // writes nothing it cannot (the caller opened its guards:
+        match how {
+            // The kernel refuses an unmapped or read-only destination page
+            // as it does a source page (the caller opened its guards:
             // `crate::watch::writing`).
-            return unsafe {
+            Writes::Copy => read(from, at as *mut u8, n),
+            // SAFETY: as below; the kernel checks the destination and
+            // writes nothing it cannot.
+            Writes::Nt => unsafe {
                 NtWriteVirtualMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) >= 0
-            };
+            },
+            // SAFETY: the source is our mapped host copy; the kernel checks
+            // the destination.
+            Writes::Process => unsafe {
+                WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0
+            },
         }
-        // SAFETY: the source is our mapped host copy; the kernel checks the
-        // destination.
-        unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
     };
     if len == 0 || write(dst as usize, len) {
         return;
@@ -5764,6 +5796,101 @@ fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, us
         let next = ((at / step + 1) * step).min(end);
         f(at, next - at);
         at = next;
+    }
+}
+
+#[cfg(test)]
+mod title_copies {
+    use super::{copy_mapped, write_mapped};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
+        VirtualAlloc, VirtualFree, VirtualProtect,
+    };
+
+    const BLOCK: usize = 64 << 10;
+
+    /// Three reserved blocks, the first and the last committed and filled
+    /// with `fill`: title memory with an unmapped block in it.
+    fn holed(fill: u8) -> *mut u8 {
+        // SAFETY: a fresh reservation; the committed blocks are ours to fill.
+        unsafe {
+            let base =
+                VirtualAlloc(std::ptr::null(), 3 * BLOCK, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            for block in [0, 2] {
+                let at = base.add(block * BLOCK);
+                assert!(!VirtualAlloc(at.cast(), BLOCK, MEM_COMMIT, PAGE_READWRITE).is_null());
+                at.write_bytes(fill, BLOCK);
+            }
+            base
+        }
+    }
+
+    fn block<'a>(base: *const u8, n: usize) -> &'a [u8] {
+        // SAFETY: tests ask for committed blocks only.
+        unsafe { std::slice::from_raw_parts(base.add(n * BLOCK), BLOCK) }
+    }
+
+    fn release(base: *mut u8) {
+        // SAFETY: a reservation of `holed`.
+        assert_ne!(unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) }, 0);
+    }
+
+    fn pattern() -> Vec<u8> {
+        (0..3 * BLOCK).map(|i| (i % 251) as u8 + 1).collect()
+    }
+
+    #[test]
+    fn title_copies_reach_mapped_destinations_and_stop_at_unmapped_pages() {
+        let from = pattern();
+        // All mapped: copied, through a destination that was never asked.
+        let to = holed(0xee);
+        copy_mapped(to, from.as_ptr(), BLOCK, true);
+        assert_eq!(block(to, 0), &from[..BLOCK]);
+        release(to);
+        // An unmapped block in the destination: nothing faults, and nothing
+        // arrives from that block on.
+        let to = holed(0xee);
+        copy_mapped(to, from.as_ptr(), 3 * BLOCK, true);
+        assert!(block(to, 2).iter().all(|&b| b == 0xee));
+        release(to);
+        // An unmapped block in the source reads as zeros.
+        let holes = holed(7);
+        let mut to = vec![0xeeu8; 3 * BLOCK];
+        copy_mapped(to.as_mut_ptr(), holes, 3 * BLOCK, true);
+        assert!(to[..BLOCK].iter().all(|&b| b == 7));
+        assert!(to[BLOCK..2 * BLOCK].iter().all(|&b| b == 0));
+        assert!(to[2 * BLOCK..].iter().all(|&b| b == 7));
+        release(holes);
+    }
+
+    #[test]
+    fn copy_back_writes_mapped_pages_only() {
+        let from = pattern();
+        let to = holed(0xee);
+        write_mapped(to, from.as_ptr(), 3 * BLOCK);
+        assert_eq!(block(to, 0), &from[..BLOCK]);
+        assert_eq!(block(to, 2), &from[2 * BLOCK..]);
+        release(to);
+        // Neither aligned nor whole: the bytes around the range stay.
+        let to = holed(0xee);
+        // SAFETY: inside the first block.
+        write_mapped(unsafe { to.add(100) }, from.as_ptr(), BLOCK - 300);
+        let first = block(to, 0);
+        assert_eq!(first[100..BLOCK - 200], from[..BLOCK - 300]);
+        let around = first[..100].iter().chain(&first[BLOCK - 200..]);
+        assert!(around.into_iter().all(|&b| b == 0xee));
+        // A page that is mapped but not writable is not written either
+        // (guarded title blocks are opened before they are copied back).
+        let mut old = 0;
+        // SAFETY: a committed block of ours.
+        let protected =
+            unsafe { VirtualProtect(to.add(2 * BLOCK).cast(), BLOCK, PAGE_READONLY, &mut old) };
+        assert_ne!(protected, 0);
+        // SAFETY: the third block.
+        write_mapped(unsafe { to.add(2 * BLOCK) }, from.as_ptr(), BLOCK);
+        assert!(block(to, 2).iter().all(|&b| b == 0xee));
+        release(to);
     }
 }
 
