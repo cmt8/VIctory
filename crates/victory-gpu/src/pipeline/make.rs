@@ -630,6 +630,19 @@ fn next(screens_only: bool) -> Arc<Pending> {
     }
 }
 
+/// A worker's stack: 16 MiB, as victory.exe's own threads get
+/// (`apps/victory/build.rs`). A worker translates shaders and creates host
+/// pipelines, and the host's compilers run on its stack (vkd3d-proton's
+/// DXIL to SPIR-V, the driver's own). With the standard library's 2 MiB
+/// three workers overflowed at once in run 13 (Proton, RADV) while the
+/// world's compute shaders were made: Wine's
+/// `virtual_setup_exception: stack overflow 3456 bytes` on 2 MiB stacks,
+/// inside the standard library's overflow handler, after which Wine ends
+/// the thread, and the frame lines said "(3 being made)" for the rest of
+/// the run: those three pipelines were never made. Only the pages used are
+/// committed.
+const WORKER_STACK: usize = 16 << 20;
+
 /// How many workers make pipelines: `asked` (`VICTORY_PIPELINE_WORKERS`, 1 to
 /// 64), else two thirds of the logical processors, 2 to 16. They run below the
 /// title's own threads, and a cold cache queues hundreds at once.
@@ -669,6 +682,7 @@ fn spawn_worker(screens_only: bool) -> bool {
     let slot = NEXT_SLOT.fetch_add(1, Ordering::Relaxed);
     let spawned = std::thread::Builder::new()
         .name(format!("victory-pipelines-{slot}"))
+        .stack_size(WORKER_STACK)
         .spawn(move || {
             WORKER_SLOT.set(slot);
             // Below the title's own threads (loading, recording),
