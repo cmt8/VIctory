@@ -635,6 +635,50 @@ Neither says what the card runs. Three switches, all off by default:
   from before that flight. For measuring what the fill settles cost; the
   count says how often the bytes were stale.
 
+### The waits for title memory read (linux/fx-next10-wait)
+
+Runs auto-b1 and b5 (boat scene, about 3,900 draws a frame) stood once a
+frame 55-78 ms for "a buffer copy at 2048 bytes in 0xe011e0000+64K" and
+several times 4-8 ms for fills of 32 and 480 bytes elsewhere. All of them
+waited because one read ahead (`VICTORY_FILL_WAIT` unset) had missed once
+during loading, which turned waiting back on for every fill and copy. The
+copy is real: a dispatch writes a 14 KiB buffer (0xe011ea300 and
+0xe011eab00, one frame and the other) and the title copies 2 KiB of it
+into a small buffer of its own; reading it ahead took the bytes from
+before some 950 times in eight minutes of run b3.
+
+- From fxceless/victory-fork#860 (turbinedogbla), on by default: a read
+  ahead keeps a fingerprint of the bytes it read, and a landing that finds
+  title memory rewritten since does not count it as a miss; a real miss
+  holds back only the 64 KiB pieces it read (fills and copies there wait)
+  for 60 frames, twice as long at each miss of the same piece after; past
+  8 pieces held at once every fill waits as before. The fills line says
+  "N pieces of 64 KiB held back now" and "fills not compared because the
+  title had rewritten their bytes since". `VICTORY_FILL_WAIT=0` stays the
+  blunt switch it was: nothing ever waits or is held, misses are counted
+  (now only real ones).
+- `VICTORY_CARD_COPY=1` (off by default): a title buffer copy whose source
+  flights in the air may write, and which is not read ahead (its piece is
+  held back, or ever was, or every fill waits), is done on the card behind
+  those flights instead of waiting: from the host copy the flights write
+  into the host copy of the destination, in a list of ours sent between
+  the submission's sends of title bytes and its lists, and the
+  destination's bytes are declared written by shaders of this submission,
+  so the landing puts them into title memory before the title is told
+  anything of the flight. Refused, and waited for as before: a source
+  written through more than one host copy or by bottom-of-pipe writes or
+  read-backs of the flights, a destination with no host copy of its own, a
+  later step of the submission that reads the destination or writes the
+  source or destination, another host copy of the destination brought up
+  to date in the submission. While the copy is in the air its destination
+  is a range flights write: a fill or copy that reads it is never read
+  ahead, and a refresh of another host copy of it waits. A line with the
+  frame-rate line: "title buffer copies done on the card behind flights
+  ... per frame: N (bytes); refused, and waited for: ...; waits for a
+  destination of one still in the air: N". What it does not see: work of
+  ours that reads title memory outside a submission's steps finds the
+  destination's bytes when the flight has landed, not at once.
+
 ### Taking a profile (linux/fx-next6-prof)
 
 Every speed change so far was made without an in-game measurement of

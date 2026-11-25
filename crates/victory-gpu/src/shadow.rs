@@ -2531,6 +2531,11 @@ impl Shadow {
         self.gpu + (address - self.start)
     }
 
+    /// Whether it is no copy but title memory itself (`crate::inplace`).
+    pub(crate) fn in_place(&self) -> bool {
+        self.place.is_some()
+    }
+
     /// The title memory the copy is of: its start and length.
     pub(crate) fn span(&self) -> (u64, u64) {
         (self.start, self.len)
@@ -4071,6 +4076,15 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
     let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     spans.extend(loose.keys().map(|&(start, len)| (start, len, true)));
     spans
+}
+
+/// The copy of the innermost title buffer holding `[address, address +
+/// len)`, if it has been made; never makes one (a title buffer copy done on
+/// the card asks where its bytes go, `crate::host`'s `card_copy`).
+pub(crate) fn made(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let end = address.checked_add(len.max(1))?;
+    let map = buffers_read();
+    map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end)?.1.shadow.clone()
 }
 
 /// The copy of the innermost title buffer holding `[address, address +
