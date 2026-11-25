@@ -335,6 +335,128 @@ pub(crate) fn views_gone(at: usize, len: usize) {
     }
 }
 
+/// How the runtime writes bytes into one of its sections of physical pages
+/// through a view of its own that no title address is, kept for the
+/// section's life: `(section handle, byte offset, bytes)`, true if written
+/// (`victory-hle` xmem `write_section`).
+pub type SectionWrite = fn(usize, u64, &[u8]) -> bool;
+
+static SECTION_WRITE: std::sync::OnceLock<SectionWrite> = std::sync::OnceLock::new();
+
+/// The runtime tells how it writes its sections' pages through views of
+/// its own ([`SectionWrite`]); the copy-back writes view memory that way
+/// ([`write_kept`]). The first call counts.
+pub fn title_memory_section_writer(write: SectionWrite) {
+    let _ = SECTION_WRITE.set(write);
+}
+
+/// Whether the copy-back writes view memory through the runtime's kept
+/// views of its sections ([`write_kept`]; `VICTORY_BACK_KEPT_VIEWS`: on
+/// under Wine, `=0` writes at the title's address as before, `=1` turns it
+/// on elsewhere, where the runtime keeps no such views unless
+/// `VICTORY_SECTION_VIEWS=1`).
+pub(crate) fn back_kept_views() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_BACK_KEPT_VIEWS").as_deref().map(str::trim) {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => crate::host::on_wine(),
+    })
+}
+
+/// Since the last status line: copy-back writes through the runtime's kept
+/// views and their bytes; writes at the title's address instead because
+/// the memory is no view the runtime told of (or spans two), because the
+/// runtime was changing a mapping, or because the runtime could not write.
+pub(crate) static KEPT: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// Since the start: copy-back writes through the runtime's kept views.
+pub(crate) static KEPT_ALL: AtomicU64 = AtomicU64::new(0);
+
+/// For tests, in place of the runtime's [`SectionWrite`]: a view of the
+/// section mapped for the write and unmapped after (the runtime keeps one).
+#[cfg(test)]
+pub(crate) fn test_section_writer() {
+    fn write(section: usize, offset: u64, bytes: &[u8]) -> bool {
+        use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, UnmapViewOfFile};
+        let base = offset - offset % K64 as u64;
+        let within = (offset - base) as usize;
+        // SAFETY: a view of the test's own section, unmapped below.
+        let at = unsafe { MapViewOfFile(section as _, FILE_MAP_WRITE, (base >> 32) as u32, base as u32, within + bytes.len()) };
+        if at.Value.is_null() {
+            return false;
+        }
+        // SAFETY: the view holds `within + bytes.len()` bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), at.Value.cast::<u8>().add(within), bytes.len());
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: at.Value });
+        }
+        true
+    }
+    title_memory_section_writer(write);
+}
+
+/// Title memory `[at, at + len)`, inside one view the runtime told of, as
+/// its section and the byte offset there.
+fn section_of(at: usize, len: usize) -> Option<(usize, u64)> {
+    let v = views();
+    let (&base, &(bytes, section, offset)) = v.views.range(..=at).next_back()?;
+    let within = at - base;
+    (within.checked_add(len)? <= bytes).then_some((section, offset + within as u64))
+}
+
+/// The copy-back's write of `len` bytes from `src` into title memory at
+/// `at`, through the runtime's kept view of the section the title shows
+/// there ([`title_memory_section_writer`]) instead of at `at`: the guards
+/// over `at` and over every other title view of the same pages stay
+/// armed, and their blocks are noted written (`crate::watch::written_behind`),
+/// so their next check reports them without a protection change and a
+/// write of the title's after ours still faults. False, writing nothing,
+/// where that cannot be done: not view memory the runtime told of, the
+/// runtime changing a mapping this moment (not waited for), or no kept
+/// view to be had; the caller then writes at `at` as before.
+///
+/// While the runtime cannot change a mapping (`title_memory_reading_now`),
+/// so that the views told of are what the title shows and the section
+/// cannot go.
+pub(crate) fn write_kept(at: usize, src: *const u8, len: usize) -> bool {
+    if len == 0 || !back_kept_views() {
+        return false;
+    }
+    let Some(write) = SECTION_WRITE.get() else {
+        return false;
+    };
+    write_kept_with(*write, at, src, len)
+}
+
+/// [`write_kept`] with the runtime's write `write`.
+pub(crate) fn write_kept_with(write: impl FnOnce(usize, u64, &[u8]) -> bool, at: usize, src: *const u8, len: usize) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some(_reading) = crate::watch::title_memory_reading_now() else {
+        KEPT[3].fetch_add(1, Relaxed);
+        return false;
+    };
+    let Some((section, offset)) = section_of(at, len) else {
+        KEPT[2].fetch_add(1, Relaxed);
+        return false;
+    };
+    // SAFETY: the caller's `len` bytes at `src`, host memory of ours.
+    let bytes = unsafe { std::slice::from_raw_parts(src, len) };
+    if !write(section, offset, bytes) {
+        KEPT[4].fetch_add(1, Relaxed);
+        return false;
+    }
+    // After the write: a check between the two would note the blocks clean
+    // again before the bytes were there.
+    let mut shown = views_of_section(section, offset, len);
+    shown.push((at, len));
+    crate::watch::written_behind(&shown);
+    KEPT[0].fetch_add(1, Relaxed);
+    KEPT[1].fetch_add(len as u64, Relaxed);
+    KEPT_ALL.fetch_add(1, Relaxed);
+    true
+}
+
 /// The title views that overlap `[start, end)`, as `(address, bytes)`.
 pub(crate) fn views_between(start: usize, end: usize) -> Vec<(usize, usize)> {
     if start >= end {

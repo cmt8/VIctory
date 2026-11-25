@@ -988,6 +988,29 @@ pub fn writing(at: usize, len: usize) {
     crate::descriptor::host::remapped(at, len);
 }
 
+/// Our copy-back wrote the title ranges `shown` (`(address, bytes)`)
+/// through the runtime's kept view of their pages
+/// (`crate::inplace::write_kept`), which no guard covers: the guarded
+/// blocks there are noted written and stay read-only, so that their next
+/// check reports them without a protection change (`guard`: "written
+/// through the runtime, still read-only") and a write of the title's after
+/// ours still faults. Blocks not guarded are reported written anyway.
+pub(crate) fn written_behind(shown: &[(usize, usize)]) {
+    let mut g = guards();
+    for &(at, len) in shown {
+        let blocks: Vec<usize> = g.clean.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
+        for block in blocks {
+            g.clean.remove(&block);
+        }
+    }
+}
+
+/// For `membench`: [`guard`] (the check a refresh makes).
+#[cfg(test)]
+pub(crate) fn check(start: usize, end: usize) -> Option<Vec<usize>> {
+    guard(start, end, None)
+}
+
 /// Whether a kernel write into title memory that is refused is tried again
 /// once the guards over it are opened ([`kernel_write_refused`]), and the
 /// runtime reads files beside and copies them in (`victory-hle`'s `fread`
@@ -2046,6 +2069,55 @@ mod tests {
         unsafe { ((view + BLOCK + 8) as *mut u8).write(1) };
         assert_eq!(guard(view, view + SIZE, None), Some(vec![pages(1)]));
         drop_views(section, &[view, other], SIZE);
+    }
+
+    /// The copy-back writes into a guarded view through another view of
+    /// its section (`crate::host::write_back` with
+    /// `VICTORY_BACK_KEPT_VIEWS`): the bytes show at both views, both stay
+    /// read-only, the next check reports the block at both, and a write of
+    /// the title's after ours still faults and is reported. Memory that is
+    /// no view is written at its address as before.
+    #[test]
+    fn a_copy_back_through_the_kept_view_leaves_the_guards_and_is_reported() {
+        const SIZE: usize = 2 * BLOCK;
+        crate::inplace::test_section_writer();
+        let (section, view, other) = two_views(SIZE);
+        let pages = |at: usize, block: usize| (at + block * BLOCK) / PAGE;
+        assert!(guard(view, view + SIZE, None).is_some());
+        assert!(guard(other, other + SIZE, None).is_some());
+        assert_eq!(guard(view, view + SIZE, None), Some(Vec::new()), "nothing written yet");
+        let bytes = [0x5au8; 48];
+        let kept = crate::inplace::back_kept_views();
+        if kept {
+            // Not while another test changes a mapping (it does not wait).
+            let mut tries = 0;
+            while !crate::inplace::write_kept(view + BLOCK + 16, bytes.as_ptr(), bytes.len()) {
+                tries += 1;
+                assert!(tries < 5000, "the kept view was never written");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        } else {
+            crate::host::write_back(view + BLOCK + 16, bytes.as_ptr(), bytes.len());
+        }
+        // SAFETY: both views map the section; read only.
+        unsafe {
+            assert_eq!(std::slice::from_raw_parts((view + BLOCK + 16) as *const u8, 48), bytes);
+            assert_eq!(std::slice::from_raw_parts((other + BLOCK + 16) as *const u8, 48), bytes);
+        }
+        assert_eq!(writable(view + BLOCK), !kept, "left guarded unless written at the title's address");
+        assert_eq!(guard(view, view + SIZE, None), Some(vec![pages(view, 1)]));
+        if view_guard() {
+            assert_eq!(guard(other, other + SIZE, None), Some(vec![pages(other, 1)]), "the other view too");
+        }
+        assert_eq!(guard(view, view + SIZE, None), Some(Vec::new()));
+        // SAFETY: the view, read-write once the handler has opened it.
+        unsafe { ((view + BLOCK + 8) as *mut u8).write_volatile(1) };
+        assert_eq!(guard(view, view + SIZE, None), Some(vec![pages(view, 1)]), "the title's write after ours");
+        drop_views(section, &[view, other], SIZE);
+        // Not view memory: written at its address.
+        let mut plain = vec![0u8; 64];
+        crate::host::write_back(plain.as_mut_ptr() as usize, bytes.as_ptr(), bytes.len());
+        assert_eq!(plain[..48], bytes);
     }
 
     /// Blocks are joined into one protection change where they are

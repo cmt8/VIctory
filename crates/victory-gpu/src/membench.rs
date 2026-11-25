@@ -1054,3 +1054,111 @@ fn slab_bench() {
         started.elapsed().as_nanos() as f64 / ops as f64
     );
 }
+
+/// What the copy-back's writes into guarded view memory cost both ways
+/// (`VICTORY_MEMBENCH=1`): through the title's address with its guards
+/// opened first (`crate::watch::writing`, then the kernel copy), or
+/// through a kept view of the whole section with the guards left armed
+/// and the blocks noted written (`crate::inplace::write_kept`); each round
+/// followed by the check the next refresh makes (which guards the opened
+/// blocks again, or notes the written ones clean). 16 MiB of a section in
+/// two title views (the second guarded with the first, as
+/// `VICTORY_VIEW_GUARD` does), written in pieces one per 64 KiB block;
+/// idle and beside a thread remapping (each protection change waits for
+/// ntdll's lock on the memory map under Wine).
+#[test]
+fn back_kept_bench() {
+    use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+    if !on() {
+        return;
+    }
+    const LEN: usize = 16 << 20;
+    // SAFETY: a fresh committed pagefile section of the bench's, mapped
+    // three times (two title views and the kept one), never unmapped.
+    let (section, view, other, whole) = unsafe {
+        let section = CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE | SEC_COMMIT, 0, LEN as u32, std::ptr::null());
+        assert!(!section.is_null());
+        let map = || MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, LEN).Value as usize;
+        (section as usize, map(), map(), map())
+    };
+    assert!(view != 0 && other != 0 && whole != 0);
+    crate::title_memory_remapped(view, LEN);
+    crate::title_memory_remapped(other, LEN);
+    crate::inplace::title_memory_view(view, LEN, section, 0);
+    crate::inplace::title_memory_view(other, LEN, section, 0);
+    let kept = |_: usize, offset: u64, bytes: &[u8]| {
+        // SAFETY: the kept view maps the whole section.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), (whole + offset as usize) as *mut u8, bytes.len()) };
+        true
+    };
+    let source = vec![0x3cu8; PAGE];
+    let blocks = LEN / PAGE;
+    let round = |label: &str, piece: usize, through_kept: bool, rounds: usize| {
+        let (mut writing, mut checking) = (0.0f64, 0.0f64);
+        let mut fell_back = 0;
+        for r in 0..rounds {
+            assert!(crate::watch::check(view, view + LEN).is_some());
+            assert!(crate::watch::check(other, other + LEN).is_some());
+            let started = Instant::now();
+            for b in 0..blocks {
+                let at = view + b * PAGE + (r * 64) % (PAGE - piece + 1);
+                if through_kept {
+                    if crate::inplace::write_kept_with(kept, at, source.as_ptr(), piece) {
+                        crate::descriptor::host::remapped(at, piece);
+                    } else {
+                        fell_back += 1;
+                        crate::watch::writing(at, piece);
+                        crate::host::write_mapped(at as *mut u8, source.as_ptr(), piece);
+                    }
+                } else {
+                    crate::watch::writing(at, piece);
+                    crate::host::write_mapped(at as *mut u8, source.as_ptr(), piece);
+                }
+            }
+            writing += started.elapsed().as_secs_f64();
+            let started = Instant::now();
+            let a = crate::watch::check(view, view + LEN).expect("a view");
+            let b = crate::watch::check(other, other + LEN).expect("a view");
+            checking += started.elapsed().as_secs_f64();
+            assert_eq!(a.len(), blocks, "every block reported written");
+            assert_eq!(b.len(), blocks, "at the other view too");
+        }
+        let per = |s: f64| s * 1e3 / rounds as f64;
+        println!(
+            "membench: copy-back of {blocks} pieces of {piece} bytes (one per 64 KiB block, {:.2} MB) {label}, {}: written in {:.2} ms, next check {:.2} ms{}",
+            (blocks * piece) as f64 / 1e6,
+            if through_kept { "through the kept view, guards armed" } else { "at the title's address, guards opened" },
+            per(writing),
+            per(checking),
+            if fell_back > 0 { format!(" ({fell_back} fell back)") } else { String::new() }
+        );
+    };
+    for piece in [64usize, 4096, PAGE] {
+        for through_kept in [false, true] {
+            round("idle", piece, through_kept, 10);
+        }
+    }
+    let mut churn = Pool::new(64);
+    for page in 0..50 {
+        assert!(churn.map(page));
+        churn.mapped[page] = true;
+    }
+    let churn = Arc::new(churn);
+    let stop = Arc::new(AtomicBool::new(false));
+    let remapper = {
+        let (churn, stop) = (churn.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut i = 0;
+            while !stop.load(Ordering::Relaxed) {
+                assert!(churn.unmap(i % 50));
+                assert!(churn.remap(i % 50));
+                i += 1;
+            }
+        })
+    };
+    for through_kept in [false, true] {
+        round("beside a thread remapping", 4096, through_kept, 3);
+    }
+    stop.store(true, Ordering::Relaxed);
+    remapper.join().unwrap();
+}

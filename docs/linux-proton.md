@@ -297,6 +297,19 @@ frames later).
   the slabs" says how many regions were carved and how many requests were
   made as before, and "texture staging buffers per frame" how many staging
   buffers came from the slabs.
+- `VICTORY_BACK_KEPT_VIEWS` (on under Wine, off elsewhere; `=0` as
+  before, `=1` turns it on elsewhere, where it needs
+  `VICTORY_SECTION_VIEWS=1`): the copy-back writes what shaders wrote into
+  view memory (physical pages) through the runtime's kept view of the
+  pages' whole section (`VICTORY_SECTION_VIEWS`) instead of at the title's
+  address. The guards there and at every other title view of the pages
+  stay armed and their blocks are noted written, as for DirectStorage's
+  writes (`VICTORY_PAGE_WRITES_OPEN`): no `VirtualProtect` to open them,
+  none to guard them again at the next check, and a write of the title's
+  after ours still faults and is seen. Memory that is no view the runtime
+  told of, and a write while the runtime is changing a mapping, are
+  written at the title's address as before. The status line "copy-back
+  writes per frame through the runtime's kept views" counts both.
 
 ## Tests
 

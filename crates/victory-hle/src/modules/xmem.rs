@@ -420,6 +420,8 @@ impl Section {
 
 impl Drop for Section {
     fn drop(&mut self) {
+        // Before the handle is closed: until then no other section has it.
+        SECTIONS.lock().unwrap_or_else(|e| e.into_inner()).remove(&(self.handle as usize));
         if let Some(Some(at)) = self.whole.get() {
             // SAFETY: our whole view; nothing refers to it any more (a
             // `View` on it holds the section).
@@ -428,6 +430,53 @@ impl Drop for Section {
         // SAFETY: our handle; views keep the section alive on their own.
         unsafe { CloseHandle(self.handle) };
     }
+}
+
+/// The sections committed whole (under Wine), by handle, for
+/// [`write_section`]: a section goes from here when it goes. Taken alone
+/// (no other lock is taken while it is held).
+static SECTIONS: LazyLock<Mutex<HashMap<usize, std::sync::Weak<Section>>>> = LazyLock::new(Default::default);
+
+/// For the GPU side (`victory_gpu::title_memory_section_writer`): writes
+/// `bytes` at byte `offset` of the section `section` (a handle) through the
+/// section's kept whole view ([`whole_views`]), mapped now if it is not
+/// yet. False, writing nothing, if the section is gone or not committed
+/// whole, the bytes do not fit in it, or there is no whole view to be had.
+///
+/// The GPU side's copy-back writes what shaders wrote into title memory;
+/// a write at the title's address of guarded view memory first made the
+/// block writable (a `VirtualProtect` under ntdll's lock on the memory map
+/// under Wine, per block and per other view of its pages) and the next
+/// check made it read-only again. Through this view no guard lies in the
+/// way; the GPU side notes the blocks at every title address of the pages
+/// written itself, as for DirectStorage's writes ([`pages_written`]).
+/// The section is held while the bytes are copied, so its view stays
+/// mapped.
+pub(crate) fn write_section(section: usize, offset: u64, bytes: &[u8]) -> bool {
+    let Some(section) = SECTIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&section)
+        .and_then(std::sync::Weak::upgrade)
+    else {
+        return false;
+    };
+    let Ok(offset) = usize::try_from(offset) else {
+        return false;
+    };
+    if offset.checked_add(bytes.len()).is_none_or(|end| end > section.size) {
+        return false;
+    }
+    let Some(whole) = section.whole() else {
+        return false;
+    };
+    // SAFETY: the whole view maps all `size` bytes of the section, committed
+    // (`SEC_COMMIT`, the only kind in `SECTIONS`) and read-write, and stays
+    // mapped while `section` is held; the range lies inside it (checked
+    // above). Other views of the pages only alias these bytes, as the
+    // console's do; `bytes` is the caller's own memory.
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), (whole + offset) as *mut u8, bytes.len()) };
+    true
 }
 
 /// Whether physical pages written from outside the title's views
@@ -546,6 +595,15 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // opened as a host heap.
     victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
     let section = Arc::new(Section::new(handle, size));
+    if on_wine() {
+        // Committed whole (above): its kept view can be written as it is.
+        SECTIONS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(handle as usize, Arc::downgrade(&section));
+        static TOLD: std::sync::Once = std::sync::Once::new();
+        TOLD.call_once(|| victory_gpu::title_memory_section_writer(write_section));
+    }
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -1725,5 +1783,37 @@ mod tests {
         }
         assert_eq!(XMemMapPhysicalPages(title, 3, std::ptr::null()), title);
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    /// The GPU side's copy-back writes a section through its kept view
+    /// (`write_section`): the bytes show at every title address of the
+    /// pages; a range past the section is refused, and the section goes
+    /// when its pages and views do.
+    #[test]
+    fn a_section_written_through_its_kept_view_shows_at_the_titles_views() {
+        if !on_wine() || !whole_views() {
+            return;
+        }
+        let pages = allocate(2);
+        let section = physical().pages[&pages[0]].section.handle as usize;
+        let one = XMemVirtualAlloc(std::ptr::null_mut(), 2 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        let two = XMemVirtualAlloc(std::ptr::null_mut(), PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        assert!(!one.is_null() && !two.is_null());
+        assert_eq!(XMemMapPhysicalPages(one, 2, pages.as_ptr()), one);
+        assert_eq!(XMemMapPhysicalPages(two, 1, pages[1..].as_ptr()), two);
+        let bytes = [0x6bu8; 40];
+        assert!(write_section(section, (PAGE + 100) as u64, &bytes));
+        // SAFETY: both reservations show the pages read-write; read only.
+        unsafe {
+            assert_eq!(std::slice::from_raw_parts(one.cast::<u8>().add(PAGE + 100), 40), bytes);
+            assert_eq!(std::slice::from_raw_parts(two.cast::<u8>().add(100), 40), bytes);
+        }
+        assert!(!write_section(section, (2 * PAGE - 8) as u64, &bytes), "past the section's end");
+        assert_eq!(XMemMapPhysicalPages(one, 2, std::ptr::null()), one);
+        assert_eq!(XMemMapPhysicalPages(two, 1, std::ptr::null()), two);
+        let kept = SECTIONS.lock().unwrap().get(&section).cloned().expect("a section committed whole is kept");
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+        // (Its handle may be another test's section's by now.)
+        assert!(kept.upgrade().is_none(), "the section is gone, and with it what writes it");
     }
 }

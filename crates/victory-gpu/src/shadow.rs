@@ -2538,16 +2538,15 @@ impl Shadow {
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &before[at - from..at - from + n];
                 let read = |first: usize, title: &mut [u8]| crate::host::read_into((start + at + first) as *const u8, title);
-                let Some((first, n)) = back_piece(host, old, &mut title, &mut mask, &mut runs, read) else {
+                let Some((first, _)) = back_piece(host, old, &mut title, &mut mask, &mut runs, read) else {
                     continue;
                 };
                 let at = at + first;
-                crate::watch::writing(start + at, n);
                 // Only the GPU's bytes (upstream #2009): the rest of the
                 // stretch is the title's as read, and a title write landing
                 // there since stays.
                 for &(off, len) in &runs {
-                    crate::host::write_mapped((start + at + off) as *mut u8, title[off..].as_ptr(), len);
+                    crate::host::write_back(start + at + off, title[off..].as_ptr(), len);
                     written += len;
                 }
             }
@@ -2638,9 +2637,8 @@ impl Shadow {
         if !merge_piece(now, held, title) {
             return 0;
         }
-        crate::watch::writing(start + at, n);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "pc relay");
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        crate::host::write_back(start + at, title.as_ptr(), n);
         n
     }
 
@@ -3429,9 +3427,8 @@ impl Shadow {
                 *o = merged;
             }
             if differs != 0 {
-                crate::watch::writing(start + at, n);
                 merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card");
-                crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                crate::host::write_back(start + at, title.as_ptr(), n);
                 written = n;
                 // The CPU's side holds what was written, and goes up below.
                 if let Some(card) = &self.card {
@@ -3515,9 +3512,8 @@ impl Shadow {
         if !mapped || !changed {
             return 0;
         }
-        crate::watch::writing(start + at, n);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card relay");
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        crate::host::write_back(start + at, title.as_ptr(), n);
         card.merged
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -4369,6 +4365,41 @@ mod copy_tests {
         let [watched, view] = title_memory(2 * PAGE);
         if echoes_under_a_writing_title(watched) {
             echoes_under_a_writing_title(view);
+        }
+    }
+
+    /// `len` bytes of view memory as the runtime maps it: told of
+    /// (`crate::inplace::title_memory_view`), so that the copy-back writes
+    /// it through a view of the section's own
+    /// (`crate::inplace::write_kept`, with `VICTORY_BACK_KEPT_VIEWS`).
+    /// Never freed, as above.
+    fn told_view(len: usize) -> usize {
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile};
+        crate::inplace::test_section_writer();
+        // SAFETY: fresh memory of ours.
+        unsafe {
+            let section = CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, len as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len).Value as usize;
+            assert!(view != 0);
+            crate::title_memory_remapped(view, len);
+            crate::inplace::title_memory_view(view, len, section as usize, 0);
+            view
+        }
+    }
+
+    /// As the two tests above, in view memory the runtime told of: the
+    /// copy-back's writes go through another view of the pages, the
+    /// guards stay armed, and the title's writes after ours still reach
+    /// the card.
+    #[test]
+    fn the_card_holds_title_memory_written_back_through_the_runtimes_view() {
+        let (kept, len) = (crate::inplace::KEPT_ALL.load(Ordering::Relaxed), 2 * PAGE);
+        if echo_then_a_title_write(told_view(len)) {
+            echoes_under_a_writing_title(told_view(len));
+            if crate::inplace::back_kept_views() {
+                assert!(crate::inplace::KEPT_ALL.load(Ordering::Relaxed) > kept, "written through the section's view");
+            }
         }
     }
 

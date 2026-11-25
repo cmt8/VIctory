@@ -6305,6 +6305,23 @@ fn writes() -> Writes {
     })
 }
 
+/// The copy-back's write of what shaders wrote, `len` bytes from `src`,
+/// into title memory at `dst`: through the runtime's kept view of the
+/// pages where `dst` is view memory (`crate::inplace::write_kept`, which
+/// leaves the guards armed and notes the blocks written), else with the
+/// guards over `dst` opened ([`crate::watch::writing`]) and through the
+/// kernel at `dst` ([`write_mapped`]), as before.
+pub(crate) fn write_back(dst: usize, src: *const u8, len: usize) {
+    if crate::inplace::write_kept(dst, src, len) {
+        // A placed texture there changes with no descriptor written, as
+        // `writing` says.
+        crate::descriptor::host::remapped(dst, len);
+        return;
+    }
+    crate::watch::writing(dst, len);
+    write_mapped(dst as *mut u8, src, len);
+}
+
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped (or not writable) alone.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
@@ -6763,6 +6780,20 @@ impl Meter {
             }
             if let Some(line) = crate::slab::line(frames) {
                 tracing::info!("{line}");
+            }
+            let kept = [0, 1, 2, 3, 4].map(|i| crate::inplace::KEPT[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if kept.iter().any(|&k| k > 0.0) {
+                tracing::info!(
+                    "copy-back writes per frame through the runtime's kept views of the pages, the guards left armed \
+                     (VICTORY_BACK_KEPT_VIEWS=0: at the title's address, the guards opened): {:.1} ({:.2} MB); at the \
+                     title's address instead: {:.1} not view memory the runtime told of, {:.1} while it changed a \
+                     mapping, {:.1} refused",
+                    kept[0],
+                    kept[1] / 1e6,
+                    kept[2],
+                    kept[3],
+                    kept[4]
+                );
             }
             let blind = crate::texture::BLIND.swap(0, Ordering::Relaxed);
             if blind > 0 {
