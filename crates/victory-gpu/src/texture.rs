@@ -509,7 +509,11 @@ pub(crate) static REFRESH_WAITS: [std::sync::atomic::AtomicU64; 4] = [const { st
 fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
     let started = std::time::Instant::now();
     let out = f();
-    REFRESH_WAITS[slot].fetch_add(started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    let us = started.elapsed().as_micros() as u64;
+    REFRESH_WAITS[slot].fetch_add(us, std::sync::atomic::Ordering::Relaxed);
+    if slot == 2 {
+        crate::framelog::add(crate::framelog::T::RefreshStillUs, us);
+    }
     out
 }
 
@@ -577,7 +581,11 @@ impl Drop for Staging {
 /// Whether texture staging buffers are kept when their texture lets go of
 /// them, by size class, for the next texture that needs one of that class
 /// (`VICTORY_STAGING_POOL=0`: each made and freed with its texture, as
-/// before). On by default under Wine, off elsewhere (`=1` turns it on).
+/// before). On by default (fxceless f85101b6 turned its own pool of the
+/// same name on everywhere: 200 to 500 uploads a frame in a streaming
+/// burst there, each buffer a quarter of a millisecond to make; this pool
+/// takes its place, and off Wine keeps that pool's limits: buffers up to
+/// 8 MiB, 256 MB spare).
 ///
 /// Textures picked by index let go of their staging buffer right after
 /// the upload, so each upload made an upload-heap buffer, mapped it and
@@ -596,12 +604,13 @@ fn staging_pool() -> bool {
     *ON.get_or_init(|| match std::env::var("VICTORY_STAGING_POOL").as_deref().map(str::trim) {
         Ok("0") => false,
         Ok("1") => true,
-        _ => crate::host::on_wine(),
+        _ => true,
     })
 }
 
 /// The most bytes of staging buffers kept while no texture holds them
-/// (`VICTORY_STAGING_SPARE_MB`, 512).
+/// (`VICTORY_STAGING_SPARE_MB`: 512 under Wine, 256 elsewhere as in
+/// fxceless f85101b6).
 ///
 /// A buffer let go past it is freed, and the next texture of its class
 /// makes one again. Under Proton's vkd3d-proton an upload buffer made once
@@ -617,16 +626,24 @@ fn staging_pool() -> bool {
 fn staging_spare_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_STAGING_SPARE_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(512) << 20
+        std::env::var("VICTORY_STAGING_SPARE_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(if crate::host::on_wine() { 512 } else { 256 })
+            << 20
     })
 }
 
 /// The size class of a staging buffer of `size` bytes ([`staging_pool`]):
-/// 0 if it is not kept.
+/// 0 if it is not kept (past 64 MiB under Wine, past 8 MiB elsewhere).
 fn staging_class(size: u64) -> u64 {
+    staging_class_upto(size, if crate::host::on_wine() { 64 << 20 } else { 8 << 20 })
+}
+
+/// [`staging_class`] with buffers past `most` bytes not kept.
+fn staging_class_upto(size: u64, most: u64) -> u64 {
     const LEAST: u64 = 64 << 10;
-    const MOST: u64 = 64 << 20;
-    if size > MOST {
+    if size > most {
         return 0;
     }
     if size <= LEAST {
@@ -995,6 +1012,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::TexUploads, 1);
+    crate::framelog::add(crate::framelog::T::Uploads, 1);
     const COPY_DEST: u32 = 0x400;
     crate::list::ensure_state(list, resource, COPY_DEST);
     // The staging buffer lives as long as `staging`, which the deferred
@@ -1291,7 +1309,9 @@ impl Staging {
     fn refresh_now(&self) -> usize {
         let whole = std::time::Instant::now();
         let read = self.refresh_timed();
-        REFRESH_WAITS[3].fetch_add(whole.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        let us = whole.elapsed().as_micros() as u64;
+        REFRESH_WAITS[3].fetch_add(us, std::sync::atomic::Ordering::Relaxed);
+        crate::framelog::add(crate::framelog::T::RefreshUs, us);
         read
     }
 
@@ -2218,7 +2238,12 @@ mod guard_tests {
 
 #[cfg(test)]
 mod staging_pool_tests {
-    use super::staging_class;
+    use super::staging_class_upto;
+
+    /// Under Wine: buffers up to 64 MiB are kept.
+    fn staging_class(size: u64) -> u64 {
+        staging_class_upto(size, 64 << 20)
+    }
 
     /// A class holds its size, wastes at most a quarter of it (past the
     /// smallest class), grows with it, and is 0 (not kept) past 64 MiB.
@@ -2242,5 +2267,16 @@ mod staging_pool_tests {
         assert_eq!(staging_class((64 << 20) + 1), 0);
         let classes: Vec<u64> = (1..1600u64).map(|i| staging_class(i * 40_000)).collect();
         assert!(classes.windows(2).all(|w| w[0] <= w[1]));
+    }
+
+    /// Off Wine buffers past 8 MiB are not kept (fxceless f85101b6's limit);
+    /// the classes below it are the same.
+    #[test]
+    fn off_wine_staging_classes_stop_at_8_mib() {
+        assert_eq!(staging_class_upto(8 << 20, 8 << 20), 8 << 20);
+        assert_eq!(staging_class_upto((8 << 20) + 1, 8 << 20), 0);
+        for size in (1..=(8u64 << 20)).step_by(65_521) {
+            assert_eq!(staging_class_upto(size, 8 << 20), staging_class(size), "{size}");
+        }
     }
 }

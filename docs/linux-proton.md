@@ -386,6 +386,123 @@ frames later).
   them) are dropped and named "skipped shader <hash>" in the drop reasons.
   An A/B for which program draws a surface, with no translation changed.
 
+### fxceless round of 2026-11-25 (linux/fx-next6)
+
+fxceless a26859fc..0b0074e0 merged. Measured by fxceless on Windows with
+an RTX 4070, not here. Worth an A/B run under Proton (one switch at a
+time, the frame line before and after):
+
+- `VICTORY_INDIRECT_WINDOW=1` (off): records of one indirect argument
+  buffer are clamped together ahead of their draws, and the draws read
+  them with no pass of ours between. fxceless measured 145 ms against
+  124 ms a frame at 4,500 draws (271 against 211 ms at 10,000), windows on
+  together with `VICTORY_COPY_PLAIN=1`; their first figure, 6.0 against
+  8.9 frames a second, compared different scenes and was withdrawn. Two
+  device losses with an earlier form; since the fix, a draw record of 2^23
+  vertices an instance or more runs empty, and the driver watch (below)
+  turns windows off at the driver's first error on Windows (not under
+  Wine, whose event log takes no subscription).
+  `VICTORY_INDIRECT_WINDOW_CHECK=1` clamps every window draw's record again
+  and compares (a diagnostic, it costs).
+- `VICTORY_ASYNC_SUBMIT=1` (off): submissions are prepared and sent by a
+  thread of the layer, in order, not by the title's render thread.
+  `VICTORY_ASYNC_PRESENT=1` (off, needs the first and a present that does
+  not settle flights) also puts the present behind the queue's line. Part
+  of fxceless's "3.5-4 to 6-7 frames a second with all the switches".
+- `VICTORY_COPY_PLAIN=1` (off): copies of title memory into memory of the
+  layer are made in place, a fault handler catching a page that is not
+  there, instead of through `ReadProcessMemory`; reads under 256 bytes and
+  sources that faulted in the last two seconds go to the kernel. Under
+  Wine every fault takes ntdll's process-wide lock, so this may cost more
+  than it saves here: measure.
+- `VICTORY_QUEUE2=1` (off; bit 1 fetches, bit 2 sends; `=3` both): what
+  shaders wrote to card copies is fetched on a copy queue (bit 1), the
+  title's bytes go up to card copies through a copy queue and a landing
+  buffer in the card's memory (bit 2, `VICTORY_QUEUE2_LANDING_MB` 96).
+  Under Wine our own fetch queue (`VICTORY_RELAY_FETCH_QUEUE`, on) already
+  does what bit 1 does; bit 2 turns `VICTORY_CARD_SCATTER` off (both take
+  the same runs).
+- `VICTORY_MERGE_GAP=64 VICTORY_MERGE_RUNS=4096` (0 and 512): title bytes
+  put into card copies under flights' shader writes are joined over gaps
+  of up to that many bytes, and more runs a submission are sent before the
+  flights are settled. The gap form is not exact (a shader store inside a
+  gap is overwritten); fxceless runs it in their "all switches" set.
+- `VICTORY_CARD_FETCH_INFLIGHT=1` (off, `VICTORY_CARD_FETCH_INFLIGHT_MB`
+  64): with the relay, a flight's compare list also copies the pieces it
+  flagged into the PC's memory, so the landing needs no fetch of its own.
+  Its shader uses what Wine's compiler does not build (a root signature in
+  the source, atomics on a byte-address buffer): under Wine it falls back
+  to the fetch as before, with a warning.
+- `VICTORY_REFRESH_ONCE=1`, `VICTORY_VIEW_KNOWN=1`, `VICTORY_BACK_OWN_VIEW=1`
+  (all off): a copy's range brought up to date is not refreshed again in
+  the same submission until a step writes title memory; a block once
+  guarded stays known as view memory while its guard is open (ours,
+  always on, already keeps the first block of each such range); what
+  shaders wrote is stored through a view of the layer's own on the
+  section. fxceless measured 23-29 ms and 6.5-7.8 ms a frame of the
+  submitting thread for the first two; the third needs the picture
+  checked.
+
+On by default from this merge (`=0` or the named value turns each off):
+
+- `VICTORY_INDIRECT_CARD_BUDGET` (on): a list's indirect-work budget is
+  in the card's memory (zeroed in the list with `WriteBufferImmediate`, its
+  notes copied to the mapped words when the list closes) instead of memory
+  the CPU maps. The clamp charges the budget once per group of 64 records
+  (`VICTORY_CLAMP_BY_GROUP=0`: record by record; a compiler that does not
+  build the group form gets the other), and the scratch buffer of clamped
+  records stays readable as arguments until the next clamp (no barrier per
+  execution).
+- `VICTORY_FILL_WAIT` (unset: fills do not wait): a fill of upload memory,
+  or a title buffer copy that only reads, from title memory that flights
+  in the air may write no longer waits for them; what the flights then
+  write is compared with what the fill read, and the first difference
+  turns the waiting back on for the rest of the run (logged). `=1` waits
+  from the start.
+- `VICTORY_HEAP_SYNC_PAGE` (on): the heap sync hands a changed page's
+  records to the host heap in one go; the list of shader-visible heaps is a
+  reader-writer lock.
+- `VICTORY_STAGING_POOL` (now on everywhere; under Wine as before): ours
+  keeps the pool (size classes, slabs first), off Wine with fxceless's
+  limits (buffers up to 8 MiB, `VICTORY_STAGING_SPARE_MB` 256).
+- `VICTORY_PAGE_WRITES`: unset is `1` under Wine as before, `guards` (the
+  guarded blocks opened) elsewhere (fxceless a26859fc; `0` before).
+- `VICTORY_CARD_ROOM_FOR_BUFFERS` (now on) and
+  `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (3,072): the texture queue keeps room
+  on the card for the buffer copies and render targets a world makes in
+  its first frame.
+- `VICTORY_QUEUE2_REFETCH` (on): a piece fetched on a copy queue while a
+  later flight may have been writing it is fetched again when that flight
+  lands, whatever its compare says. This merge applies it to our own fetch
+  queue too (`VICTORY_RELAY_FETCH_QUEUE`, on under Wine), which had the
+  same hole: a later flight that left the piece as the earlier one left it
+  flagged nothing, and title memory kept the half-written bytes.
+- `VICTORY_FIRST_HALF`: a program is translated with first-half
+  interpolation pairs only when it was refused for one (before: every
+  program). Translations change: the shader cache key changes with this
+  merge, so run the warm-up (`victory translate --cache`) again.
+- `VICTORY_FAST_CORES` (on), `VICTORY_DISK_CORES=slow` (off),
+  `VICTORY_EFFICIENCY_MODE=1` (unset: the process opts out of the system's
+  efficiency mode): processor placement on hybrid processors; nothing to
+  do on a processor with one kind of core.
+- `VICTORY_DRIVER_WATCH` (on): the system's event log is watched for the
+  graphics driver's errors. Wine's `EvtSubscribe` is a stub: under Proton
+  this logs one warning and watches nothing.
+- A copy between two title textures that share one host texture is left
+  out (a copy of a texture onto itself), and so is a draw record of 2^23
+  vertices an instance or more.
+
+Diagnostics builds only: `VICTORY_FRAME_LOG` (every frame's length and
+what long frames were made of), `VICTORY_CARD_METER` (the card's time by
+kind of list), `VICTORY_PROFILE` and its `VICTORY_PROFILE_*` settings (a
+sampling profiler; fxceless says it needs a fix under Wine, whose threads
+have no cycle counter), `VICTORY_CAPTURE_WORLD_EVERY` (8; a saved frame
+costs some 235 ms in the present). Off and not to be turned on:
+`VICTORY_BVH_HOLD=1` (holds back the programs that walk ray-tracing
+structures; fxceless refused it, the picture loses its indirect light;
+`VICTORY_BVH_MISS` does the job here), `VICTORY_CARD_REHASH_RUNS=alt` (an
+A/B of its own, twenty seconds each way).
+
 ## Tests
 
 ```sh
