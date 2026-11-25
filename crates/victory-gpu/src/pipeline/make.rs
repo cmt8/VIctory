@@ -60,8 +60,16 @@ impl Pending {
     }
 
     fn make(&self) {
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        self.made.get_or_init(|| {
+            if super::apart::on() {
+                // Under Wine on a thread of its own: one the host's compiler
+                // ends leaves this pipeline out, not the worker gone and
+                // the pipeline waited for in every frame (`super::apart`).
+                super::apart::make(&self.shaders, self.graphics.as_deref())
+            } else {
+                HostPipeline::new(&self.shaders, self.graphics.as_deref())
+            }
+        });
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -302,7 +310,8 @@ fn next() -> Arc<Pending> {
 /// inside the standard library's overflow handler, after which Wine ends
 /// the thread, and the frame lines said "(3 being made)" for the rest of
 /// the run: those three pipelines were never made. Only the pages used are
-/// committed.
+/// committed. Run 14 lost the same three with 16 MiB: under Wine each
+/// pipeline is now made on a thread of its own (`super::apart`).
 const WORKER_STACK: usize = 16 << 20;
 
 /// Starts the workers (half the logical processors, 2 to 8) on first use.
