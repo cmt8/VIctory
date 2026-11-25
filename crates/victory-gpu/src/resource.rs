@@ -1190,6 +1190,32 @@ fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize
 static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// The water trace's texture touch tracer (`crate::water`): the title
+/// textures the host renders to or writes ([`TARGETS_AT`]) as their title
+/// memory's address and bytes, with a description for its lines.
+#[cfg(windows)]
+pub(crate) fn targets() -> Vec<(u64, u64, String)> {
+    // Under the table's lock: a texture leaves it before it is freed.
+    let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+    targets
+        .iter()
+        .filter_map(|(&at, &r)| {
+            let d = resource(r as This).desc;
+            // SAFETY: 56 bytes in the description's layout.
+            let words = unsafe { std::ptr::from_ref(&d).cast::<[u32; 14]>().read_unaligned() };
+            let bytes = placed_bytes(&words)?;
+            Some((
+                at,
+                bytes,
+                format!(
+                    "{}x{}x{} levels {} format {} flags {:#x}",
+                    d.width, d.height, d.depth_or_array_size, d.mip_levels, d.format, d.flags
+                ),
+            ))
+        })
+        .collect()
+}
+
 /// For `this`, a texture made for a view the title placed in memory
 /// ([`texture_at`]): the title texture the host writes that lies in the
 /// same memory, if there is one of the same size, levels and layers with

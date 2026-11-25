@@ -242,6 +242,16 @@ not there for the player. Every host and fork that got that far reports it
   overlapped one), an `fread` that came back short, and a DirectStorage
   zlib stream that ended short of its destination. DirectStorage requests
   that fail are logged without it (`dstorage: request failed`).
+- `VICTORY_WATER_TRACE=2`: all of the above, and the texture touch
+  tracer. No path copies a texture the host renders to or writes back into
+  title memory, so a title CPU that reads such a texture's memory (legal on
+  the console) reads stale bytes. Every 64 frames the read-write pages of
+  every such texture (up to `VICTORY_WATER_TEXTURE_MB`, 64, each) get
+  `PAGE_GUARD`; the first access to each raises once, and a line names the
+  texture (address, size, format, flags), the offset, read or write, and
+  the code (`module+rva`; the title's image is `victory-image-*.dll`).
+  Pages our write guard holds read-only are left alone. A kernel read of an
+  armed page fails once instead of faulting.
 
 ## Tests
 

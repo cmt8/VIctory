@@ -762,6 +762,9 @@ extern "system" fn present(
 ) -> HRESULT {
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
+    // The water trace's texture touch tracer (`VICTORY_WATER_TRACE=2`).
+    #[cfg(windows)]
+    crate::water::touch_frame();
     // Submissions sent to the card and not waited for are settled first,
     // and what that frees runs in its own order, before anything is forced.
     #[cfg(windows)]

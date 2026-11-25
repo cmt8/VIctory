@@ -1096,6 +1096,14 @@ fn install() {
     });
 }
 
+/// Runs `f` with the guards' lock held, so that no guard of ours changes
+/// a protection meanwhile (the water trace's texture touch tracer,
+/// `crate::water`, adds `PAGE_GUARD` to pages it finds read-write).
+pub(crate) fn with_guards_held<R>(f: impl FnOnce() -> R) -> R {
+    let _held = guards();
+    f()
+}
+
 /// Whether `at` is committed read-write memory now.
 fn writable(at: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
