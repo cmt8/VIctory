@@ -1254,3 +1254,91 @@ fn scatter_bench() {
         }
     }
 }
+
+/// What `VICTORY_VM_STATS` costs (`VICTORY_MEMBENCH=1`): a timed call
+/// against the same call untimed, the switch off and on, and the bare
+/// timing; then what a write fault on a guarded page costs whole (Wine's
+/// fault path, the dispatch to a vectored handler, its `VirtualProtect`),
+/// which the handler's own timing (`fault-handler`) does not see.
+#[test]
+fn vm_stats_bench() {
+    use crate::vmstat::{Site, force, time};
+    if !on() {
+        return;
+    }
+    let block = Block::new(PAGE, false);
+    let n = 200_000;
+    let raw = ns_per(n, |_| {
+        query(block.0);
+    });
+    force(false);
+    let off = ns_per(n, |_| {
+        let _t = time(Site::QueryView);
+        query(block.0);
+    });
+    let bare_off = ns_per(10 * n, |_| {
+        let _t = std::hint::black_box(time(Site::QueryView));
+    });
+    force(true);
+    let timed = ns_per(n, |_| {
+        let _t = time(Site::QueryView);
+        query(block.0);
+    });
+    let bare_on = ns_per(10 * n, |_| {
+        let _t = std::hint::black_box(time(Site::QueryView));
+    });
+    force(false);
+    report("VirtualQuery of 64 KiB, untimed", raw);
+    report("VirtualQuery of 64 KiB, VICTORY_VM_STATS off", off);
+    report("VirtualQuery of 64 KiB, VICTORY_VM_STATS on", timed);
+    report("a timed call with nothing in it, VICTORY_VM_STATS off", bare_off);
+    report("a timed call with nothing in it, VICTORY_VM_STATS on", bare_on);
+
+    // A write fault on a read-only page, opened by a vectored handler.
+    use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH, EXCEPTION_POINTERS,
+        RemoveVectoredExceptionHandler,
+    };
+    static PAGE_AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    unsafe extern "system" fn open(info: *mut EXCEPTION_POINTERS) -> i32 {
+        // SAFETY: the system passes the exception being dispatched.
+        let r = unsafe { &*(*info).ExceptionRecord };
+        let page = PAGE_AT.load(Ordering::Relaxed);
+        if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+            || r.NumberParameters < 2
+            || r.ExceptionInformation[1] & !0xffff != page
+        {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        let mut old = 0;
+        // SAFETY: the bench's own page.
+        unsafe { VirtualProtect(page as *const c_void, PAGE, PAGE_READWRITE, &mut old) };
+        EXCEPTION_CONTINUE_EXECUTION
+    }
+    let page = Block::new(PAGE, false);
+    PAGE_AT.store(page.0, Ordering::Relaxed);
+    // SAFETY: the handler only opens the bench's page.
+    let handler = unsafe { AddVectoredExceptionHandler(1, Some(open)) };
+    let faults = 20_000;
+    let mut old = 0;
+    let guard_and_write = ns_per(faults, |i| {
+        // SAFETY: the bench's own page; the write faults and is let through.
+        unsafe {
+            VirtualProtect(page.0 as *const c_void, PAGE, PAGE_READONLY, &mut old);
+            std::ptr::write_volatile((page.0 + (i % 16) * 4096) as *mut u8, i as u8);
+        }
+    });
+    let guard_only = ns_per(faults, |_| {
+        // SAFETY: as above, with no write.
+        unsafe {
+            VirtualProtect(page.0 as *const c_void, PAGE, PAGE_READONLY, &mut old);
+            VirtualProtect(page.0 as *const c_void, PAGE, PAGE_READWRITE, &mut old);
+        }
+    });
+    // SAFETY: the handler added above.
+    unsafe { RemoveVectoredExceptionHandler(handler) };
+    report("guard (VirtualProtect read-only) + a write fault opened by a vectored handler", guard_and_write);
+    report("guard + open by two VirtualProtect calls, no fault", guard_only);
+    report("so a write fault, beyond the handler's VirtualProtect", guard_and_write - guard_only);
+}

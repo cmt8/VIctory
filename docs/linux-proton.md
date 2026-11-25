@@ -499,12 +499,13 @@ SpaghettiMaster545: the glass prepass over characters), and a pixel's
 quad is read through quad reads, helper lanes included (2b3c339e by
 beloooo: lines on car paint, glass and skin).
 
-Diagnostics builds only: `VICTORY_FRAME_LOG` (every frame's length and
-what long frames were made of), `VICTORY_CARD_METER` (the card's time by
-kind of list), `VICTORY_PROFILE` and its `VICTORY_PROFILE_*` settings (a
-sampling profiler; fxceless says it needs a fix under Wine, whose threads
-have no cycle counter), `VICTORY_CAPTURE_WORLD_EVERY` (8; a saved frame
-costs some 235 ms in the present). Off and not to be turned on:
+On by default in diagnostics builds and available with `=1` in release
+builds: `VICTORY_FRAME_LOG` (every frame's length and what long frames
+were made of), `VICTORY_CARD_METER` (the card's time by kind of list).
+Diagnostics builds only: `VICTORY_PROFILE` and its `VICTORY_PROFILE_*`
+settings (a sampling profiler; works under Wine with fxceless#960, see
+"Taking a profile" below), `VICTORY_CAPTURE_WORLD_EVERY` (8; a saved
+frame costs some 235 ms in the present). Off and not to be turned on:
 `VICTORY_BVH_HOLD=1` (holds back the programs that walk ray-tracing
 structures; fxceless refused it, the picture loses its indirect light;
 `VICTORY_BVH_MISS` does the job here), `VICTORY_CARD_REHASH_RUNS=alt` (an
@@ -573,6 +574,95 @@ On by default from this round (`=0` or the named value turns each off):
   down (0.2, 0.6).
 
 The shader cache key does not change with this round: no warm-up again.
+### Taking a profile (linux/fx-next6-prof)
+
+Every speed change so far was made without an in-game measurement of
+where a frame goes under Wine. This branch adds one switch and brings the
+profiler's Wine fix (fxceless#960, cherry-picked); nothing changes with
+the switches off.
+
+The release exe is enough (`victory-fx-next6-prof.exe`; same shader cache
+key as `victory-fx-next6.exe`, no warm-up). Add to the run command:
+
+```sh
+VICTORY_FRAME_LOG=1 VICTORY_VM_STATS=1 \
+VICTORY_EXE=$PWD/target/ab/victory-fx-next6-prof.exe \
+scripts/proton-run.sh run /path/to/game/<the title's exe> --execute \
+    2>&1 | tee ~/victory-logs/run-$(date +%H%M%S).log
+target/ab/perf-summary.py ~/victory-logs/run-HHMMSS.log   # or scripts/perf-summary.py
+```
+
+- `VICTORY_FRAME_LOG=1`: every 5 s, every frame's length, the usual
+  frame's make-up (render thread in the present, submit and list calls;
+  preparing, waiting for the card, copies up, copy-back; remapping; page
+  and guard faults; process user and kernel time) and each long frame's.
+  Some of its counters (list calls' time) are counted in diagnostics
+  builds only and read 0 in a release build.
+- `VICTORY_VM_STATS=1`: our callers of the calls that take ntdll's
+  `virtual_mutex` under Wine (`VirtualProtect` of the guards by purpose,
+  `GetWriteWatch`, every `VirtualQuery`, `QueryWorkingSetEx`, the kernel
+  copies in and out of title memory, the write-fault handler, the
+  runtime's remapping, DirectStorage page windows, the title's
+  `XMemVirtualQuery`), timed with two performance-counter reads on the
+  calling thread. Every `VICTORY_VM_STATS_EVERY` seconds (5) per presented
+  frame: one `vm stats:` line in all (by thread kind: submitting,
+  presenting, recording, other), one per caller (calls, ms, calls of
+  `VICTORY_VM_STATS_SLOW_US` (50) or more and their ms, the longest), one
+  per thread (its processor time from `GetThreadTimes` beside its time in
+  those calls). An idle call is 1-30 us under Wine, so the slow calls'
+  time is mostly time spent waiting for the lock or the wineserver. Not
+  seen: the title's own calls into Wine's kernel32, and the part of a
+  write fault outside our handler (Wine's signal handler, which takes the
+  same lock, and the dispatch there and back: about 2.6 us idle under
+  system Wine 11.22, `membench` `vm_stats_bench`). Cost: about 0.13 us a timed
+  call on, 1 ns off (same bench), plus one `GetThreadTimes` per thread
+  every 5 s.
+- The status lines of the release build stay as they were (the frame
+  line's preparing, copies, GPU and copy-back split; the guards'
+  protection changes; the refreshes' copies and write-watch askings; the
+  texture part of the heap passes; descriptor sync).
+
+Stacks (`victory-fx-next6-diag.exe`, the diagnostics build; same shader
+cache key, but slower in itself: its counters cost per list call):
+`VICTORY_PROFILE=1 VICTORY_PROFILE_HZ=250 VICTORY_PROFILE_AFTER=120
+VICTORY_PROFILE_FOR=60 VICTORY_PROFILE_OUT='Z:\home\<user>\victory-logs\profile.txt'`
+(`AFTER` and `FOR` in seconds: start once in the world). A look suspends a
+thread and reads its registers, both wineserver requests (about 40 us
+under system Wine 11.22, 78 us reported in the title under GE-Proton);
+`QueryThreadCycleTime` fails under Wine, so every look takes a stack and
+the "on cpu" column reads 0. Wine's dbghelp names nothing in ntdll and
+kernelbase without their debug files; the fix names them from their
+export tables (`ntdll!NtProtectVirtualMemory`). Keep the `.pdb` beside
+the exe (the exe names its own `.pdb`).
+
+The Linux side (no code; the host's `perf`). With
+`kernel.perf_event_paranoid=2` (Arch's default) an unprivileged `perf`
+cannot attach to a running process (Yama's `ptrace_scope=1`) and gets no
+call chains, but can sample its own children's user-space time. Proton
+Experimental's `ntdll.so` and `wineserver` keep their symbol tables
+(`virtual_mutex`, `NtProtectVirtualMemory`, `virtual_handle_fault`,
+`server_call_unlocked` resolve); no debug package is needed. Started under
+`perf`, recording off until asked:
+
+```sh
+mkfifo /tmp/perf.ctl /tmp/perf.ack
+perf record -e cycles:u -F 499 -D -1 --control fifo:/tmp/perf.ctl,/tmp/perf.ack \
+    -o ~/victory-logs/perf-$(date +%H%M%S).data -- env VICTORY_FRAME_LOG=1 ... scripts/proton-run.sh run ...
+# in the world, from a second terminal: 30 s of samples
+echo enable > /tmp/perf.ctl; cat /tmp/perf.ack; sleep 30; echo disable > /tmp/perf.ctl; cat /tmp/perf.ack
+perf report -i ~/victory-logs/perf-HHMMSS.data --stdio --sort comm,dso,sym | head -60
+```
+
+With root, call chains and waits (off-CPU) of the running game, `pid`
+being the game's Wine process (of `pgrep -af victory-fx-next6-prof.exe`,
+the one `top` shows busy):
+
+```sh
+sudo perf record --call-graph dwarf -F 249 -p $pid -o ~/victory-logs/perf-cpu.data -- sleep 20
+sudo perf record -e sched:sched_switch --call-graph dwarf -p $pid -o ~/victory-logs/perf-off.data -- sleep 20
+sudo perf report -i ~/victory-logs/perf-off.data --stdio --no-children --sort sym | head -80
+top -H -p $(pgrep -x wineserver)   # is the wineserver one busy core?
+```
 
 ## Tests
 

@@ -149,6 +149,7 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
+    crate::vmstat::mark(crate::vmstat::RECORD);
     #[cfg(feature = "diagnostics")]
     crate::copystat::recorded(started);
     #[cfg(feature = "diagnostics")]

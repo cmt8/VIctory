@@ -1282,6 +1282,7 @@ extern "system" fn present(
         crate::framelog::frame();
         #[cfg(feature = "diagnostics")]
         crate::fence::pace::frame();
+        crate::vmstat::frame();
     }
     hr
 }

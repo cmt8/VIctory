@@ -363,6 +363,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;
     let started = std::time::Instant::now();
+    let timed = crate::vmstat::time(crate::vmstat::Site::WatchAhead);
     // SAFETY: the answer buffer holds `count` entries.
     let failed = unsafe {
         GetWriteWatch(
@@ -374,6 +375,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
             &mut granularity,
         )
     } != 0;
+    drop(timed);
     asked_kernel(started);
     if failed {
         return false;
@@ -449,8 +451,10 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     let asking = std::time::Instant::now();
     // SAFETY: the answer buffer holds `count` entries.
-    let failed = known_view
-        || unsafe {
+    let failed = known_view || {
+        let _timed = crate::vmstat::time(crate::vmstat::Site::WatchRange);
+        // SAFETY: as above.
+        let status = unsafe {
             GetWriteWatch(
                 WRITE_WATCH_FLAG_RESET,
                 (first * PAGE) as *const _,
@@ -459,7 +463,9 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
                 &mut count,
                 &mut granularity,
             )
-        } != 0;
+        };
+        status != 0
+    };
     if !known_view {
         asked_kernel(asking);
     }
@@ -858,8 +864,11 @@ fn is_view(start: usize, end: usize) -> bool {
     loop {
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: a valid out pointer of the right size.
-        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        let n = {
+            let _timed = crate::vmstat::time(crate::vmstat::Site::QueryView);
+            // SAFETY: a valid out pointer of the right size.
+            unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) }
+        };
         if n == 0 || (at == start && info.State == MEM_FREE) {
             return false;
         }
@@ -996,8 +1005,10 @@ fn set_protection(kind: usize, from: usize, to: usize, protection: u32) -> bool 
     use windows_sys::Win32::System::Memory::VirtualProtect;
     let started = std::time::Instant::now();
     let mut old = 0;
+    let timed = crate::vmstat::time(crate::vmstat::Site::protect(kind));
     // SAFETY: title view memory; only its protection changes.
     let took = unsafe { VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, protection, &mut old) } != 0;
+    drop(timed);
     let row = &PROTECTS[kind];
     row[0].fetch_add(1, Relaxed);
     row[1].fetch_add((to - from) as u64, Relaxed);
@@ -1151,6 +1162,7 @@ fn uncommitted_end(block: usize) -> usize {
     }
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let _timed = crate::vmstat::time(crate::vmstat::Site::QueryUncommitted);
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
     if n != 0 && matches!(info.State, MEM_RESERVE | MEM_FREE) {
@@ -1465,7 +1477,11 @@ static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 /// What the runtime holds while it changes what title memory shows
 /// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>, std::time::Instant);
+pub struct Remapping(
+    #[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>,
+    std::time::Instant,
+    #[allow(dead_code)] crate::vmstat::Timed,
+);
 
 impl Drop for Remapping {
     fn drop(&mut self) {
@@ -1479,11 +1495,12 @@ impl Drop for Remapping {
 /// place is under way and none begins ([`title_memory_reading`]). Taken
 /// around the whole change, the unmapping and the mapping again.
 pub fn title_memory_remapping() -> Remapping {
+    let timed = crate::vmstat::time(crate::vmstat::Site::Remap);
     let asked = std::time::Instant::now();
     let held = MAPPING.write().unwrap_or_else(|e| e.into_inner());
     crate::framelog::add(crate::framelog::T::Remaps, 1);
     crate::framelog::add(crate::framelog::T::RemapWaitUs, asked.elapsed().as_micros() as u64);
-    Remapping(held, asked)
+    Remapping(held, asked, timed)
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
@@ -1579,6 +1596,7 @@ fn install() {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let at = r.ExceptionInformation[1];
+        let _timed = crate::vmstat::time(crate::vmstat::Site::Fault);
         // Held across both checks: another thread may have opened the block
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
@@ -1610,6 +1628,7 @@ fn writable(at: usize) -> bool {
     };
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let _timed = crate::vmstat::time(crate::vmstat::Site::QueryWritable);
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
     n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE

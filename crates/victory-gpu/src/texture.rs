@@ -1777,6 +1777,7 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
         for (i, entry) in info[..n].iter_mut().enumerate() {
             entry.VirtualAddress = ((page + i) * KERNEL_PAGE) as *mut _;
         }
+        let timed = crate::vmstat::time(crate::vmstat::Site::WorkingSet);
         // SAFETY: `n` entries of the size given; our own process.
         let asked = unsafe {
             K32QueryWorkingSetEx(
@@ -1785,6 +1786,7 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
                 (n * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32,
             )
         } != 0;
+        drop(timed);
         for (i, entry) in info[..n].iter().enumerate() {
             // Bit 0 of the answer: the page is in the working set.
             // SAFETY: plain data the query filled in.
@@ -1834,7 +1836,10 @@ fn committed_by_query(at: *const u8, len: usize) -> bool {
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
-        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+        let n = {
+            let _timed = crate::vmstat::time(crate::vmstat::Site::QueryTexture);
+            unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) }
+        };
         if n == 0 || info.State != MEM_COMMIT {
             return false;
         }
@@ -1897,7 +1902,10 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
-        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+        let n = {
+            let _timed = crate::vmstat::time(crate::vmstat::Site::QueryTexture);
+            unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) }
+        };
         let next = (info.BaseAddress as usize).saturating_add(info.RegionSize).min(end);
         if n == 0 || next <= p {
             break;
