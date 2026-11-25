@@ -775,6 +775,8 @@ mod tests {
                 l.SetComputeRootShaderResourceView(1, now.GetGPUVirtualAddress());
                 l.SetComputeRootUnorderedAccessView(2, hashes.GetGPUVirtualAddress());
                 l.SetComputeRootUnorderedAccessView(3, differs.GetGPUVirtualAddress());
+                // Not read in these modes; bound as every use binds it.
+                l.SetComputeRootShaderResourceView(4, now.GetGPUVirtualAddress());
                 l.Dispatch(PIECES.div_ceil(64), 1, 1);
             }
             list.close();
@@ -804,6 +806,75 @@ mod tests {
         set(content[at]);
         assert_eq!(run(2), [0, 1, 0]);
         assert_eq!(run(2), [0, 0, 0]);
+    }
+
+    /// The hash pass over a list of pieces (`piece_lists`, mode 3), on the
+    /// host GPU: it stores the hashes of the pieces the list names and of
+    /// no other, as mode 0 does for a run of them.
+    #[test]
+    fn the_card_hash_pass_over_a_list_stores_the_listed_pieces_only() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let work = host.make_card_work().expect("the card compare must build on the host");
+        const PIECE: usize = 64 << 10;
+        const PIECES: u32 = 4;
+        let size = PIECE * PIECES as usize;
+        let (now, now_ptr) = host.shared_buffer(size as u64).unwrap();
+        let (hashes, _) = host.shared_buffer(16 * u64::from(PIECES)).unwrap();
+        let (differs, differs_ptr) = host.shared_buffer(64).unwrap();
+        let (list_buffer, list_ptr) = host.shared_buffer(64).unwrap();
+        let content: Vec<u8> = (0..size).map(|i| (i * 13 + i / 509) as u8).collect();
+        // SAFETY: the mappings hold what is read and written.
+        unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
+        let run = |mode: u32, listed: &[u32]| -> [u32; 4] {
+            let list = host.new_list().unwrap();
+            // SAFETY: an open list, live buffers, the compare's own root
+            // signature; the mappings hold what is read and written.
+            unsafe {
+                for piece in 0..PIECES as usize {
+                    differs_ptr.cast::<u32>().add(piece).write_volatile(7);
+                }
+                // Behind a word the pass must not read.
+                list_ptr.cast::<u32>().write_volatile(PIECES + 9);
+                for (i, &piece) in listed.iter().enumerate() {
+                    list_ptr.cast::<u32>().add(1 + i).write_volatile(piece);
+                }
+                let l = &list.list;
+                l.SetComputeRootSignature(&work.root);
+                l.SetPipelineState(&work.pso);
+                let constants = if mode == 3 {
+                    [0u32, 0, size as u32, listed.len() as u32, 4, 3]
+                } else {
+                    [0u32, 0, size as u32, PIECES, 0, mode]
+                };
+                l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                l.SetComputeRootShaderResourceView(1, now.GetGPUVirtualAddress());
+                l.SetComputeRootUnorderedAccessView(2, hashes.GetGPUVirtualAddress());
+                l.SetComputeRootUnorderedAccessView(3, differs.GetGPUVirtualAddress());
+                l.SetComputeRootShaderResourceView(4, list_buffer.GetGPUVirtualAddress());
+                l.Dispatch(PIECES.div_ceil(64), 1, 1);
+            }
+            list.close();
+            host.execute(&[&list]);
+            // SAFETY: as above; the list has run.
+            [0, 1, 2, 3].map(|piece| unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() })
+        };
+        // SAFETY (each): inside the mapping.
+        let set = |at: usize, value: u8| unsafe { now_ptr.add(at).write_volatile(value) };
+        assert_eq!(run(0, &[]), [7, 7, 7, 7]);
+        assert_eq!(run(1, &[]), [0, 0, 0, 0]);
+        // Pieces 1, 2 and 3 change; the list names 3 and 1: stored, flagged
+        // nowhere (the list's pass flags nothing); 2 is still flagged.
+        for piece in 1..4 {
+            set(piece * PIECE + 99, content[piece * PIECE + 99] ^ 0x21);
+        }
+        assert_eq!(run(3, &[3, 1]), [7, 7, 7, 7]);
+        assert_eq!(run(1, &[]), [0, 0, 1, 0]);
+        // An empty list stores nothing.
+        set(99, content[99] ^ 0x21);
+        assert_eq!(run(3, &[]), [7, 7, 7, 7]);
+        assert_eq!(run(1, &[]), [1, 0, 1, 0]);
     }
 
     /// The relay's fetch on a copy queue of its own (`fetch_aside`), on the
@@ -1706,6 +1777,12 @@ struct CardWork {
     taken: u32,
     /// Plans made and not done with (`Host::card_done`).
     out: u32,
+    /// With [`piece_lists`]: the lists of pieces the hash passes after
+    /// sends read (PC memory, mapped: buffer, mapping, bytes), and the
+    /// dwords of it taken by plans in the air (started again with
+    /// `taken`).
+    listed: Option<(ID3D12Resource, usize, u64)>,
+    lists_taken: u32,
 }
 
 // SAFETY: D3D12 objects (free-threaded) and persistent mappings, used only
@@ -1728,16 +1805,19 @@ static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
 /// ([`Host::make_card_work`]). The attribute stays for the WARP test,
 /// which takes the root signature from Microsoft's blob.
 pub(crate) const CARD_COMPARE: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
+#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1), SRV(t1)"
 cbuffer Span : register(b0) {
     uint first;    // the first piece
     uint skew;     // where the copy starts in its piece 0
     uint size;     // the copy's buffer, in bytes (a multiple of 64 KiB)
     uint pieces;
-    uint out_at;   // the first piece's dword in `differs`, in bytes
-    uint compare;  // 0: the hashes are stored; else compared with those stored (2: and then stored)
+    uint out_at;   // the first piece's dword in `differs`, in bytes (3: its number's in `list`)
+    uint compare;  // 0: the hashes are stored; else compared with those stored (2: and then stored;
+                   // 3: stored, of the pieces `list` names, not of `first` on)
 };
 ByteAddressBuffer now : register(t0);
+// With `compare` 3: the numbers of the pieces to hash, one dword each.
+ByteAddressBuffer list : register(t1);
 // 16 bytes (four words) per piece of the copy: the hash of its bytes when
 // they were last sent up (or hashed whole, the first time).
 RWStructuredBuffer<uint> hashes : register(u0);
@@ -1747,6 +1827,11 @@ RWByteAddressBuffer differs : register(u1);
 void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= pieces) return;
     uint piece = first + id.x;
+    // A branch, not a select: `list` is read with 3 only (every use binds
+    // it all the same).
+    [branch] if (compare == 3u) {
+        piece = list.Load(out_at + id.x * 4u);
+    }
     uint lo = piece * 65536u;
     lo = lo > skew ? lo - skew : 0u;
     uint hi = min((piece + 1u) * 65536u - skew, size);
@@ -1760,7 +1845,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
     // The piece's hash, in words.
     uint word = piece * 4u;
-    if (compare != 0u) {
+    if (compare != 0u && compare != 3u) {
         uint4 was = uint4(hashes[word], hashes[word + 1u], hashes[word + 2u], hashes[word + 3u]);
         differs.Store(out_at + id.x * 4u, any(h != was) ? 1u : 0u);
         // With the copy-back on its own thread: the next compare of the
@@ -1799,8 +1884,30 @@ fn rehash_runs() -> bool {
 
 /// Since the last frame-rate line, of our own passes over copies in the
 /// card's memory: hash passes after ranges were sent up, the pieces they
-/// hashed, and compare passes after the lists.
-static CARD_PASSES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+/// hashed, and compare passes after the lists; and the runs of pieces the
+/// hash passes over lists of pieces stood for ([`piece_lists`]).
+static CARD_PASSES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Whether the pieces of a copy in the card's memory hashed again after
+/// ranges were sent up are hashed in one pass over a list of them, not in
+/// a pass per run of pieces that touch (`VICTORY_CARD_PIECE_LISTS=0`: a
+/// pass per run, as before). On by default under Wine, off elsewhere
+/// (`=1` turns it on there).
+///
+/// A pass takes the time of one piece however few its pieces are (see
+/// [`rehash_runs`]), and the runs are mostly one piece: run 212937
+/// (Proton, gameplay) has 20,156 such passes a frame over 21,078 pieces on
+/// average over its 126 lines (median 2,897, at most 426,173), each a
+/// dispatch recorded on the submitting thread and run on the card ahead
+/// of the submission's lists. The same pieces are hashed, each once.
+fn piece_lists() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_CARD_PIECE_LISTS").as_deref().map(str::trim) {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => on_wine(),
+    })
+}
 
 /// Whether what shaders wrote to copies in the card's memory is merged
 /// into title memory on several threads (`VICTORY_WIDE_MERGE=1`; off by
@@ -3321,6 +3428,16 @@ impl Host {
         const RESULTS: u64 = 1 << 20;
         let (differs, data) = self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
         name(&differs, || "card compare results".into());
+        // The pieces to hash again after sends (`piece_lists`): four times
+        // the results' dwords, taken and started again with them.
+        let listed = if piece_lists() {
+            self.shared_buffer(4 * RESULTS).map(|(buffer, data)| {
+                name(&buffer, || "card rehash piece lists".into());
+                (buffer, data as usize, 4 * RESULTS)
+            })
+        } else {
+            None
+        };
         // As the attribute in `CARD_COMPARE` says, made here: Wine's
         // compiler puts no root signature in the blob. The bindings below:
         // the span (b0), the copy (t0), the hashes (u0), the results (u1).
@@ -3331,6 +3448,7 @@ impl Host {
                 root_view(D3D12_ROOT_PARAMETER_TYPE_SRV, 0),
                 root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 0),
                 root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 1),
+                root_view(D3D12_ROOT_PARAMETER_TYPE_SRV, 1),
             ],
             "card compare",
         )?;
@@ -3355,6 +3473,8 @@ impl Host {
                 fetched: None,
                 taken: 0,
                 out: 0,
+                listed,
+                lists_taken: 0,
             })
         }
     }
@@ -3465,6 +3585,11 @@ impl Host {
                         list.SetComputeRootSignature(&work.root);
                         list.SetPipelineState(&work.pso);
                         list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
+                        // The list of pieces (read with mode 3 only): bound
+                        // whatever the mode, never left at address 0, and to
+                        // a buffer every offset the other modes could name
+                        // lies in (the results').
+                        list.SetComputeRootShaderResourceView(4, work.differs.0.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
                         let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
@@ -3473,9 +3598,31 @@ impl Host {
                             ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
                         };
                         // The same pieces in fewer passes (`rehash_runs`).
-                        let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
+                        let runs = if rehash_runs() || work.listed.is_some() { crate::shadow::joined_piece_runs(runs) } else { runs };
+                        // Several runs: one pass over a list of their pieces
+                        // (`piece_lists`), where the list has room.
+                        let pieces: u32 = runs.iter().map(|r| r.pieces).sum();
+                        if runs.len() > 1
+                            && let Some((listed, data, bytes)) = &work.listed
+                            && (u64::from(work.lists_taken) + u64::from(pieces)) * 4 <= *bytes
+                        {
+                            let at = work.lists_taken;
+                            let out = std::slice::from_raw_parts_mut((*data as *mut u32).add(at as usize), pieces as usize);
+                            for (slot, piece) in out.iter_mut().zip(runs.iter().flat_map(|r| r.first..r.first + r.pieces)) {
+                                *slot = piece;
+                            }
+                            work.lists_taken += pieces;
+                            CARD_PASSES[0].fetch_add(1, Ordering::Relaxed);
+                            CARD_PASSES[1].fetch_add(u64::from(pieces), Ordering::Relaxed);
+                            CARD_PASSES[3].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                            let constants = [0, runs[0].skew, size as u32, pieces, at * 4, 3];
+                            list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                            list.SetComputeRootShaderResourceView(4, listed.GetGPUVirtualAddress());
+                            list.Dispatch(pieces.div_ceil(64), 1, 1);
+                            continue;
+                        }
                         CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
-                        CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
+                        CARD_PASSES[1].fetch_add(u64::from(pieces), Ordering::Relaxed);
                         for run in runs {
                             let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
                             list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
@@ -3564,6 +3711,9 @@ impl Host {
                         let constants = [r.span.first, r.span.skew, size as u32, r.span.pieces, r.at * 4, if flown { 2 } else { 1 }];
                         list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
+                        // Not read when comparing; never left at address 0
+                        // (the results hold every offset it could be read at).
+                        list.SetComputeRootShaderResourceView(4, work.differs.0.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
                         list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
@@ -3610,6 +3760,7 @@ impl Host {
         // not read yet: the area starts again only when none is out.
         if !relay() || work.out == 0 {
             work.taken = 0;
+            work.lists_taken = 0;
         }
     }
 
@@ -6299,12 +6450,14 @@ impl Meter {
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);
         {
-            let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            let [passes, pieces, compares, listed] = [0, 1, 2, 3].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if passes + compares > 0.0 {
                 tracing::info!(
                     "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
-                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes",
-                    if rehash_runs() { "on" } else { "off" }
+                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}; VICTORY_CARD_PIECE_LISTS=1 makes one pass \
+                     of a copy's runs: now {}, {listed:.0} runs so), {compares:.0} compare passes",
+                    if rehash_runs() || piece_lists() { "on" } else { "off" },
+                    if piece_lists() { "on" } else { "off" }
                 );
             }
         }
