@@ -726,6 +726,27 @@ fn unbound_root(why: &'static str) {
     drop_why(why);
 }
 
+/// Root descriptors of title draws and dispatches that came to GPU
+/// address 0 (dropped instead of bound).
+static ZERO_ROOTS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether `gpu` may be bound as a root descriptor. Ours never come to 0
+/// (a host copy's address plus an offset in it, or upload memory), but
+/// the address is the host runtime's: a shader reading a root view at 0
+/// is a page fault at address 0 and a ring reset, where a dropped draw is
+/// a missing one. Counted, and logged at the 1st, 2nd, 4th, ... time.
+fn root_address(gpu: u64, why: &'static str) -> bool {
+    if gpu != 0 {
+        return true;
+    }
+    let n = ZERO_ROOTS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::warn!(n, why, "a root descriptor at GPU address 0: the draw or dispatch is dropped");
+    }
+    drop_why(why);
+    false
+}
+
 /// Counts a dropped draw by reason (`crate::pipeline::drop_reasons`), and
 /// marks the last traced draw as not run on the host (diagnostics).
 fn dropped(pipeline: usize) {
@@ -1388,6 +1409,7 @@ impl State {
                             unbound_root("title memory by address without its directory");
                             return false;
                         };
+                        debug_assert_ne!(m.directory, 0, "our directory at GPU address 0");
                         // SAFETY: an open list; the directory lives as
                         // long as the process and the list holds it.
                         unsafe {
@@ -1406,6 +1428,7 @@ impl State {
                             // SAFETY: an open list; the table lives as long
                             // as the heap the list holds.
                             Some(gpu) => unsafe {
+                                debug_assert_ne!(gpu, 0, "our view addresses at GPU address 0");
                                 if compute {
                                     l.SetComputeRootShaderResourceView(param, gpu);
                                 } else {
@@ -1427,6 +1450,7 @@ impl State {
                             // SAFETY: an open list; the table lives as long
                             // as the heap the list holds.
                             Some(gpu) => unsafe {
+                                debug_assert_ne!(gpu, 0, "our element strides at GPU address 0");
                                 if compute {
                                     l.SetComputeRootShaderResourceView(param, gpu);
                                 } else {
@@ -1483,6 +1507,9 @@ impl State {
                             0,
                             None,
                         ));
+                    }
+                    if !root_address(gpu, "a root view at GPU address 0") {
+                        return false;
                     }
                     // SAFETY: an open list; the address is in live memory.
                     unsafe {
@@ -1586,6 +1613,9 @@ impl State {
             // SAFETY: a live buffer.
             let base = unsafe { s.buffer.GetGPUVirtualAddress() };
             let gpu = base + ((s.gpu(a) - base) & !15);
+            if !root_address(gpu, "a root unordered view at GPU address 0") {
+                return false;
+            }
             // SAFETY: an open list; the address is in a live buffer.
             unsafe {
                 if compute {
