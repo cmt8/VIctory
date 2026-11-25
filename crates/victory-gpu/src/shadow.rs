@@ -1209,6 +1209,16 @@ mod relay_tests {
 /// Snapshot memory kept for reuse (already touched, so no page faults).
 static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
+/// Since the last frame-rate line: snapshot buffers taken from [`POOL`],
+/// and made fresh ([`snapshots_kept`]).
+pub(crate) static SNAPSHOTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// The snapshot buffers kept now, and the bytes they reserve.
+pub(crate) fn snapshots_kept_now() -> (u64, u64) {
+    let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    (pool.len() as u64, pool.iter().map(|v| v.capacity() as u64).sum())
+}
+
 /// An empty buffer with room for `n` bytes, from the pool if it has one
 /// of about that size: a small copy's snapshot took the 174 MB buffer kept
 /// for the big heap's, which then got another, until eight of them were
@@ -1222,6 +1232,7 @@ fn pooled(n: usize) -> Vec<u8> {
         .filter(|(_, v)| v.capacity() >= n && v.capacity() <= most)
         .min_by_key(|(_, v)| v.capacity())
         .map(|(i, _)| i);
+    SNAPSHOTS[usize::from(fit.is_none())].fetch_add(1, Ordering::Relaxed);
     let mut v = match fit {
         Some(i) => pool.swap_remove(i),
         None => Vec::with_capacity(n),
@@ -1230,20 +1241,46 @@ fn pooled(n: usize) -> Vec<u8> {
     v
 }
 
-/// Returns a snapshot buffer to the pool: at most 8 kept, the largest, and
-/// of those the largest one and the next ones up to `KEPT` bytes in all.
+/// How many snapshot buffers are kept (`VICTORY_SNAPSHOT_POOL`, default
+/// 1024; `8`: as before), still no more than `KEPT` bytes in all.
+///
+/// With two or three frames in the air eight buffers were the eight
+/// largest, and every other snapshot was memory fresh from the kernel and
+/// given back to it, with the page faults of filling it. Under Wine both
+/// the allocation and the freeing take ntdll's process-wide virtual lock,
+/// the one every guard and fault takes. (After AvatarManz/VIctory-7900XTX
+/// 52e0c03f5, where this was 11 % of the submitting thread.)
+fn snapshots_kept() -> usize {
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_SNAPSHOT_POOL")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1024)
+            .max(1)
+    })
+}
+
+/// Returns a snapshot buffer to the pool: at most [`snapshots_kept`] kept,
+/// the largest, and of those the largest one and the next ones up to `KEPT`
+/// bytes in all.
 fn give_back(v: Vec<u8>) {
     const KEPT: usize = 512 << 20;
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-    pool.truncate(8);
-    let (mut seen, mut total) = (0, 0usize);
-    pool.retain(|v| {
-        seen += 1;
+    let (mut kept, mut total) = (0, 0usize);
+    for v in pool.iter().take(snapshots_kept()) {
         total = total.saturating_add(v.capacity());
-        seen == 1 || total <= KEPT
-    });
+        if kept > 0 && total > KEPT {
+            break;
+        }
+        kept += 1;
+    }
+    // Given back to the kernel outside the lock.
+    let gone = pool.split_off(kept);
+    drop(pool);
+    drop(gone);
 }
 
 const NOT_WATCHED: u8 = 2;

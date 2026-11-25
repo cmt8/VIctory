@@ -291,7 +291,7 @@ pub(crate) fn finished() -> u64 {
 /// if none is.
 pub(crate) fn retire<T: 'static>(object: T) {
     let started = STARTED.load(Ordering::Acquire);
-    if started <= FINISHED.load(Ordering::Acquire) {
+    if bury_lag() == 0 && started <= FINISHED.load(Ordering::Acquire) {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
         drop(object);
         return;
@@ -303,8 +303,40 @@ pub(crate) fn retire<T: 'static>(object: T) {
         .push((started, Retired(Box::new(object))));
 }
 
-/// Drops what waited for submissions up to `finished`.
+/// How many submissions later than it could (once the last one that may
+/// use it has finished) an object let go is dropped (`VICTORY_BURY_LAG`, 64
+/// unless given, about a frame and a half at the 40 to 48 submissions a
+/// frame of the world; `0`: at once, as before). An object let go while
+/// nothing runs waits as well: host lists recorded and not yet sent may
+/// name it, and nothing else holds it for them.
+///
+/// The device losses of another fork were page faults in memory nothing
+/// named any more, at no command in particular (AvatarManz/VIctory-7900XTX
+/// a0b4909df). What is held longer is memory: the host textures, copies
+/// and buffers let go in those submissions (the memory line's counts of
+/// them stay up a frame or two longer).
+fn bury_lag() -> u64 {
+    static LAG: OnceLock<u64> = OnceLock::new();
+    *LAG.get_or_init(|| std::env::var("VICTORY_BURY_LAG").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(64))
+}
+
+/// How many settled flights' host lists are kept before they are reset for
+/// reuse (`VICTORY_LAND_LAG`; `0` unless given: at once). AvatarManz/
+/// VIctory-7900XTX a0b4909df keeps 64, with the objects of [`bury_lag`].
+/// Off here: a landed list gives back its dynamic descriptor slots
+/// (`crate::list::recycle` drops its draw state), and 2^18 of them ran out
+/// under Wine once more submissions were in the air between settles
+/// (`descriptor::host::DYNAMIC_MOST`); 64 flights more would hold well over
+/// a frame of tables, and a table that finds none waits up to 250 ms and
+/// then drops its draw. The lists have run (their fence was waited for).
+fn land_lag() -> usize {
+    static LAG: OnceLock<usize> = OnceLock::new();
+    *LAG.get_or_init(|| std::env::var("VICTORY_LAND_LAG").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+/// Drops what waited for submissions up to `finished`, less [`bury_lag`].
 fn bury(finished: u64) {
+    let finished = finished.saturating_sub(bury_lag());
     let done: Vec<(u64, Retired)> = {
         let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
         if retired.is_empty() {
@@ -322,6 +354,17 @@ fn bury(finished: u64) {
 /// Objects [`retire`] dropped at once (no submission was running) and
 /// kept until a running submission finished, since the start.
 static RETIREMENTS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// For the memory line: [`RETIREMENTS`], the objects let go that wait for
+/// submissions to finish now, and [`bury_lag`].
+pub(crate) fn retirements() -> [u64; 4] {
+    [
+        RETIREMENTS[0].load(Ordering::Relaxed),
+        RETIREMENTS[1].load(Ordering::Relaxed),
+        RETIRED.lock().unwrap_or_else(|e| e.into_inner()).len() as u64,
+        bury_lag(),
+    ]
+}
 
 /// What the layer did to the host's objects lately, newest last (sweeps
 /// that let host copies go, pipeline library calls, saves and trims): said
@@ -399,12 +442,14 @@ pub(crate) fn removal_context() -> String {
         _ => "copying back what a submission wrote (nothing of ours was running on the card)",
     };
     let mut text = format!(
-        "the submitting thread was {phase}, of {} lists, for {:.1} ms; {}; objects let go at once {} and after a running submission {}; submissions started {} finished {}",
+        "the submitting thread was {phase}, of {} lists, for {:.1} ms; {}; objects let go at once {} and after a running submission {}, {} of them still held (VICTORY_BURY_LAG={}); submissions started {} finished {}",
         SUBMITTING[1].load(Ordering::Relaxed),
         ms(SUBMITTING[2].load(Ordering::Relaxed)),
         crate::pipeline::library_removal_note(),
         RETIREMENTS[0].load(Ordering::Relaxed),
         RETIREMENTS[1].load(Ordering::Relaxed),
+        RETIRED.try_lock().map_or(0, |r| r.len()),
+        bury_lag(),
         STARTED.load(Ordering::Relaxed),
         FINISHED.load(Ordering::Relaxed),
     );
@@ -2625,6 +2670,9 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// The pipelines [`HostList::bind_pipeline`] kept, by address: a kept
+    /// pipeline's address names no other until the list is reset.
+    bound: std::collections::HashSet<usize>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -4241,7 +4289,11 @@ pub(crate) fn land_soon() {
 /// Resets the host lists of settled flights and keeps them for reuse, as
 /// a queue does for the lists it ran (`crate::list::recycle`).
 fn land() {
-    let landed = std::mem::take(&mut line().landed);
+    let landed: Vec<_> = {
+        let mut line = line();
+        let n = line.landed.len().saturating_sub(land_lag());
+        line.landed.drain(..n).collect()
+    };
     for (lists, order) in landed {
         crate::list::recycle(lists, &order);
     }
@@ -8199,6 +8251,39 @@ impl HostList {
             && self.twins.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
+    /// The list binds pipeline `pso` (named `name`, of root signature
+    /// `root`): both are kept until the list is reset, as the title may
+    /// release them before it submits the list, and the name noted
+    /// ([`HostList::used_pipeline`]). With `VICTORY_PIPELINE_ONCE` (on;
+    /// `0`: at every bind, as before) the keeping and the name are done the
+    /// first time the list binds it only: two interface queries, three
+    /// locks and a name looked up at every change of pipeline. The card's
+    /// clock per pipeline (`crate::cardmeter`) still marks every bind.
+    /// (After AvatarManz/VIctory-7900XTX ab86ef7f3.)
+    pub(crate) fn bind_pipeline(&self, name: &str, pso: &ID3D12PipelineState, root: &ID3D12RootSignature) {
+        static ONCE: OnceLock<bool> = OnceLock::new();
+        if !*ONCE.get_or_init(|| std::env::var("VICTORY_PIPELINE_ONCE").map_or(true, |v| v.trim() != "0")) {
+            self.used_pipeline(name);
+            self.keep(pso);
+            self.keep(root);
+            return;
+        }
+        let first = {
+            let mut deferred = self.deferred();
+            let first = deferred.bound.insert(pso.as_raw() as usize);
+            if first {
+                deferred.kept.push(pso.clone().into());
+                deferred.kept.push(root.clone().into());
+            }
+            first
+        };
+        if first {
+            self.used_pipeline(name);
+        } else {
+            self.meter_pipeline(name);
+        }
+    }
+
     /// Notes a pipeline the list binds; called where it is bound.
     pub(crate) fn used_pipeline(&self, name: &str) {
         {
@@ -8207,6 +8292,12 @@ impl HostList {
                 pipelines.insert(name.to_owned());
             }
         }
+        self.meter_pipeline(name);
+    }
+
+    /// With the card's clock per pipeline: the span of the pipeline bound
+    /// before ends here, and `name`'s begins.
+    fn meter_pipeline(&self, name: &str) {
         if crate::cardmeter::pipelines() {
             // The pipeline before it ends here on the card's clock.
             crate::cardmeter::end(&self.list, crate::cardmeter::Span::from_raw(self.pipeline_meter.swap(u32::MAX, Ordering::Relaxed)));
@@ -9789,11 +9880,32 @@ impl Meter {
                     asked_us / 1e3,
                 );
             }
+            {
+                let [reused, fresh] =
+                    [0, 1].map(|i| crate::shadow::SNAPSHOTS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                let (kept, bytes) = crate::shadow::snapshots_kept_now();
+                if reused + fresh > 0.0 {
+                    tracing::info!(
+                        "snapshot buffers per frame: {reused:.1} taken from those kept, {fresh:.1} made fresh; {kept} kept \
+                         now, {} MB (VICTORY_SNAPSHOT_POOL: the most kept)",
+                        bytes >> 20
+                    );
+                }
+            }
+            {
+                let [at_once, held, waiting, lag] = retirements();
+                tracing::info!(
+                    "host objects let go, since the start: {at_once} dropped at once, {held} held for submissions; \
+                     {waiting} held now, each until {lag} submissions after the last that may use it have finished \
+                     (VICTORY_BURY_LAG=0: until it has)"
+                );
+            }
             let p: Vec<[f64; 3]> = crate::watch::PROTECTS
                 .iter()
                 .map(|row| [0, 1, 2].map(|i| row[i].swap(0, Ordering::Relaxed) as f64 / frames))
                 .collect();
             let faults = crate::watch::FAULTS.swap(0, Ordering::Relaxed) as f64 / frames;
+            let rested = [0, 1].map(|i| crate::watch::RESTED[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if p.iter().any(|r| r[0] > 0.0) || faults > 0.0 {
                 let f = |r: [f64; 3]| format!("{:.1} ({:.1} blocks, {:.1} ms)", r[0], r[1], r[2] / 1e3);
                 let all: f64 = p.iter().map(|r| r[2]).sum::<f64>() / 1e3;
@@ -9802,7 +9914,9 @@ impl Meter {
                      memory map under Wine (VICTORY_GUARD_RUNS=0: block by block): guarding {}, other views of the pages \
                      (VICTORY_VIEW_GUARD) {}; opening for a write fault {}, for a write through the kernel {}, for a \
                      DirectStorage write into physical pages {}, other views of the pages {}, where a view of guarded \
-                     pages was mapped {}; {all:.1} ms in all; {faults:.1} write faults taken",
+                     pages was mapped {}; {all:.1} ms in all; {faults:.1} write faults taken; {:.1} blocks just \
+                     written left open at an asking and told as written, {:.1} blocks told as written as another view \
+                     of their pages was so (VICTORY_GUARD_REST=0: none)",
                     f(p[0]),
                     f(p[1]),
                     f(p[2]),
@@ -9810,6 +9924,8 @@ impl Meter {
                     f(p[4]),
                     f(p[5]),
                     f(p[6]),
+                    rested[0],
+                    rested[1],
                 );
             }
             let [kept, made, slab] =
@@ -9904,7 +10020,8 @@ impl Meter {
                      as read through a table, {parts} uploads of textures not all mapped ({tails} of them without their first page), \
                      {same} looks that found no more mapped; {} slots made stale by a newer view of other memory there, \
                      {} ranges of memory mapped, unmapped or written under texture views ({} dropped), {} slots made due by them, \
-                     {} made slots found unmapped and made null",
+                     {} made slots found unmapped and made null; {} found unmapped and shown on for \
+                     VICTORY_TEXTURE_AWAY_MS, {} of them mapped again before the time was up",
                     crate::draw::HEAP_TEXTURES_TABLED.load(Ordering::Relaxed),
                     crate::descriptor::host::TABLED_WRITES[0].load(Ordering::Relaxed),
                     crate::descriptor::host::TABLED_WRITES[1].load(Ordering::Relaxed),
@@ -9912,7 +10029,9 @@ impl Meter {
                     crate::descriptor::host::STALE[1].load(Ordering::Relaxed),
                     crate::descriptor::host::STALE[2].load(Ordering::Relaxed),
                     crate::descriptor::host::STALE[3].load(Ordering::Relaxed),
-                    crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
+                    crate::descriptor::host::STALE[4].load(Ordering::Relaxed),
+                    crate::descriptor::host::AWAY_KEPT[0].load(Ordering::Relaxed),
+                    crate::descriptor::host::AWAY_KEPT[1].load(Ordering::Relaxed)
                 );
             }
             {

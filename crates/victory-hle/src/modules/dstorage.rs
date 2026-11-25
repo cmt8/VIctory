@@ -173,14 +173,38 @@ extern "system" fn create_status_array(
 }
 
 /// The queue's description: as in 2020 (source type, capacity, priority,
-/// name), plus a field the title sets to 1.
+/// name), plus the console's queue options (`DSTORAGE_QUEUE_DESC1`, GDK
+/// `dstorage_xs.h`): bit 0 is `AutoSubmitDisabled`, which the title sets.
 #[repr(C)]
 struct QueueDesc {
     source_type: u64,
     capacity: u16,
     priority: i8,
     name: *const c_char,
-    unknown: u64,
+    options: u64,
+}
+
+/// `DSTORAGE_QUEUE_OPTIONS::AutoSubmitDisabled`.
+const AUTO_SUBMIT_DISABLED: u64 = 1;
+
+/// Whether every queue submits itself once half of it is enqueued, as the
+/// API does by default, whatever the title asked (`VICTORY_DSTORAGE_HALF=1`:
+/// as before). Unset, a queue made with `AutoSubmitDisabled` starts its
+/// requests at the title's `Submit` only, as the GDK documents
+/// (`DSTORAGE_QUEUE_OPTIONS`: "Setting this value to 1 will disable the
+/// auto-submit feature of the DirectStorage Queue"; a thread that enqueues
+/// into a full queue then stalls until another thread submits).
+///
+/// The title makes every queue so (`options=1` in each "dstorage: queue"
+/// line), and it maps the pages of a batch and fills in their page lists in
+/// its own submit, after it has enqueued them all: its batches of up to
+/// 4,095 requests in queues of 4,159 passed the half (2,079) now and then,
+/// and those requests ran before their page lists were filled in, on page 0
+/// or on pages an earlier mapping had left (AvatarManz/VIctory-7900XTX
+/// 68e10e57d found this).
+fn half_submits_forced() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DSTORAGE_HALF").is_some_and(|v| v == "1"))
 }
 
 extern "system" fn create_queue(
@@ -199,7 +223,7 @@ extern "system" fn create_queue(
         capacity = desc.capacity,
         priority = desc.priority,
         name,
-        unknown = desc.unknown,
+        options = desc.options,
         iid = iid_text(iid),
         "dstorage: queue"
     );
@@ -209,7 +233,8 @@ extern "system" fn create_queue(
     let mut lanes = scheduler.lock();
     let id = lanes.next_id;
     lanes.next_id += 1;
-    let lane = Lane::new(desc.priority, desc.capacity);
+    let mut lane = Lane::new(desc.priority, desc.capacity);
+    lane.auto_submit = half_submits_forced() || desc.options & AUTO_SUBMIT_DISABLED == 0;
     lanes.lanes.insert(id, lane);
     drop(lanes);
     put(
@@ -364,6 +389,9 @@ struct Lanes {
 struct Lane {
     class: usize,
     capacity: usize,
+    /// Whether the queue submits itself once half of it is enqueued
+    /// ([`half_submits_forced`]).
+    auto_submit: bool,
     /// Bytes started, for round robin among the lanes of a class.
     clock: u64,
     /// Enqueued, not yet submitted.
@@ -643,6 +671,7 @@ impl Lane {
         Lane {
             class: priority.clamp(-1, 1).wrapping_add(1) as usize,
             capacity: usize::from(capacity),
+            auto_submit: true,
             clock: 0,
             unsubmitted: Vec::new(),
             reads: VecDeque::new(),
@@ -798,7 +827,8 @@ extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
 }
 
 /// Adds a command to the queue; blocks while the queue is full, and
-/// submits on its own once half of it is enqueued, as the console does.
+/// submits on its own once half of it is enqueued unless the queue was made
+/// with auto-submit disabled ([`half_submits_forced`]).
 fn queue(this: QueueRef, command: Command) {
     // SAFETY: a queue we created and the title still holds.
     let id = unsafe { &*this }.state.id;
@@ -814,16 +844,40 @@ fn queue(this: QueueRef, command: Command) {
         if lane.entries() + 1 < lane.capacity.max(2) {
             break;
         }
-        lanes = scheduler
+        // Full of commands nobody submitted: another thread's `Submit` makes
+        // room, as on the console. Past a while with nothing of it running,
+        // the queue submits itself rather than hang the thread for ever.
+        let stuck = !lane.auto_submit && lane.reads.is_empty() && lane.running.is_empty() && lane.statuses.is_empty();
+        let (guard, waited) = scheduler
             .finished
-            .wait(lanes)
+            .wait_timeout(lanes, std::time::Duration::from_secs(2))
             .unwrap_or_else(|e| e.into_inner());
+        lanes = guard;
+        let commands = lanes
+            .lanes
+            .get(&id)
+            .filter(|l| {
+                !l.closed
+                    && l.reads.is_empty()
+                    && l.running.is_empty()
+                    && l.entries() + 1 >= l.capacity.max(2)
+            })
+            .map_or(0, |l| l.unsubmitted.len());
+        if stuck && waited.timed_out() && commands > 0 {
+            tracing::warn!(
+                queue = id,
+                commands,
+                "dstorage: a queue without auto-submit stayed full of commands nobody submitted for 2 s: it submits itself"
+            );
+            lanes.submit(id);
+            scheduler.work.notify_all();
+        }
     }
     let Some(lane) = lanes.lanes.get_mut(&id) else {
         return;
     };
     lane.unsubmitted.push(command);
-    if lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
+    if lane.auto_submit && lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
         lanes.submit(id);
         scheduler.work.notify_all();
     }
@@ -1249,7 +1303,7 @@ mod tests {
             capacity: 0x80,
             priority: 0,
             name: c"test".as_ptr(),
-            unknown: 1,
+            options: AUTO_SUBMIT_DISABLED,
         };
         let mut queue = std::ptr::null_mut();
         assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
@@ -1328,7 +1382,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Request, source), 0x20);
         assert_eq!(std::mem::offset_of!(Request, source_size), 0x30);
         assert_eq!(std::mem::offset_of!(Request, name), 0x40);
-        assert_eq!(std::mem::offset_of!(QueueDesc, unknown), 0x18);
+        assert_eq!(std::mem::offset_of!(QueueDesc, options), 0x18);
     }
 
     fn compress_zlib(plain: &[u8]) -> Vec<u8> {
@@ -1425,6 +1479,7 @@ mod tests {
         assert_eq!(buffers[3], contents[..16]);
     }
 
+    /// A queue made with the API's default options.
     #[test]
     fn half_a_queue_submits_itself() {
         let (_dir, file) = file_with(&pattern(64));
@@ -1435,7 +1490,7 @@ mod tests {
             capacity: 4,
             priority: 1,
             name: c"small".as_ptr(),
-            unknown: 1,
+            options: 0,
         };
         let mut queue = std::ptr::null_mut();
         assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
@@ -1443,6 +1498,35 @@ mod tests {
         let mut out = [0u8; 16];
         enqueue(queue, &request(0, out.as_mut_ptr().cast(), 16, file, 8, 16));
         enqueue_status(queue, array, 0); // the second of four: no submit needed
+        assert_eq!(wait(array, 0), S_OK);
+        assert_eq!(out, pattern(64)[8..24]);
+    }
+
+    /// A queue made with auto-submit disabled, as the title makes its own,
+    /// starts nothing at half: only at the title's submit.
+    #[test]
+    fn half_a_queue_without_auto_submit_waits_for_the_submit() {
+        let (_dir, file) = file_with(&pattern(64));
+        let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
+            call(factory(), 0x50);
+        let desc = QueueDesc {
+            source_type: 0,
+            capacity: 4,
+            priority: 1,
+            name: c"held".as_ptr(),
+            options: AUTO_SUBMIT_DISABLED,
+        };
+        let mut queue = std::ptr::null_mut();
+        assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
+        let array = status_array(1);
+        let mut out = [0u8; 16];
+        enqueue(queue, &request(0, out.as_mut_ptr().cast(), 16, file, 8, 16));
+        enqueue_status(queue, array, 0); // half of four
+        let done: extern "system" fn(*mut c_void, u32) -> bool = call(array, 0x18);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!done(array, 0), "started before the submit");
+        assert_eq!(out, [0; 16]);
+        void(queue, 0x30);
         assert_eq!(wait(array, 0), S_OK);
         assert_eq!(out, pattern(64)[8..24]);
     }

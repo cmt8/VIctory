@@ -105,6 +105,13 @@ pub(crate) struct HostHeap {
     /// `VICTORY_DEFER_SLOT_CLEARS=2` one made from another view then. One
     /// entry a slot; the newest request wins ([`HostHeap::hold`]).
     deferred_views: Mutex<std::collections::BTreeMap<u32, Held>>,
+    /// Slots made from a placed texture whose memory was found unmapped,
+    /// with the record they were made from and when (`crate::host::now_ms`)
+    /// that was first found ([`HostHeap::texture_slot_gone`]).
+    away: Mutex<std::collections::HashMap<u32, (u64, u64)>>,
+    /// Tests: [`texture_away_ms`] for this heap.
+    #[cfg(test)]
+    away_ms: Mutex<Option<u64>>,
     /// Tests: submissions started and finished, and the
     /// `VICTORY_DEFER_SLOT_CLEARS` mode, in place of the process's
     /// ([`HostHeap::card`]).
@@ -525,6 +532,31 @@ static SPANNED: [std::sync::atomic::AtomicU64; 2] = [
 /// ranges; and made slots whose memory was found unmapped (made null).
 pub(crate) static STALE: [std::sync::atomic::AtomicU64; 5] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// Since the start: made slots whose placed texture's memory was found
+/// unmapped and that went on showing it ([`texture_away_ms`]), and of those
+/// the ones whose memory was there again before the time was up.
+pub(crate) static AWAY_KEPT: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// How long a made slot goes on showing its placed texture once the
+/// texture's memory is found unmapped, before it is made null
+/// (`VICTORY_TEXTURE_AWAY_MS`, 3,000 unless given; `0`: at the first look,
+/// as before).
+///
+/// The title moves textures in its streaming memory by unmapping them and
+/// mapping them again, and what the slot showed went black for the
+/// pictures in between: faces, books, posters and sleeves for 0.3 to 2 s
+/// (AvatarManz/VIctory-7900XTX 1f1a43367). The slot holds its host texture
+/// while it shows it (`kept`), and the texture is a copy in the card's
+/// memory, not the title's pages; when the time is up the slot goes null
+/// the usual way, held back while submissions that may read it are on the
+/// card (`VICTORY_DEFER_SLOT_CLEARS`).
+#[cfg_attr(test, allow(dead_code))]
+fn texture_away_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| std::env::var("VICTORY_TEXTURE_AWAY_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(3000))
+}
 
 /// When a view the title writes makes older views of other memory stale
 /// ([`Rule`]): where it starts in the block of their smallest levels, by
@@ -1172,6 +1204,9 @@ impl HostHeap {
                 spans
             },
             deferred_views: Mutex::default(),
+            away: Mutex::default(),
+            #[cfg(test)]
+            away_ms: Mutex::default(),
             #[cfg(test)]
             card: Mutex::default(),
         };
@@ -1686,11 +1721,14 @@ impl HostHeap {
     /// (any more): a host slot made from it becomes null again, so that
     /// the host copy can be let go (`crate::resource::let_go_idle`; a slot
     /// keeps what it views). True if the slot was made.
+    ///
+    /// Not at the first look: only once it has been found away for
+    /// [`texture_away_ms`].
     pub(crate) fn texture_slot_gone(&self, index: u32, write: u64) -> bool {
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        if made.get(index as usize).is_none_or(|&key| key == 0) {
+        let Some(key) = made.get(index as usize).copied().filter(|&key| key != 0) else {
             return false;
-        }
+        };
         // Mapping was checked outside these locks. A newer descriptor may
         // have been mirrored, or a table read may have removed the entry.
         // Mirror takes the made lock before updating the texture queue.
@@ -1698,9 +1736,38 @@ impl HostHeap {
         if textures.same(index, write).is_none() {
             return false;
         }
+        #[cfg(test)]
+        let wait = self.away_ms.lock().unwrap_or_else(|e| e.into_inner()).unwrap_or(0);
+        #[cfg(not(test))]
+        let wait = texture_away_ms();
+        if wait > 0 {
+            let now = crate::host::now_ms();
+            let mut away = self.away.lock().unwrap_or_else(|e| e.into_inner());
+            match away.get(&index) {
+                // The same record, away for less than the wait: shown on.
+                Some(&(was, since)) if was == key && now.saturating_sub(since) < wait => return false,
+                Some(&(was, _)) if was == key => {
+                    away.remove(&index);
+                }
+                _ => {
+                    away.insert(index, (key, now));
+                    AWAY_KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return false;
+                }
+            }
+        }
         self.unmake(&mut made, index);
         STALE[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         true
+    }
+
+    /// The memory of the placed texture title slot `index` views is mapped
+    /// (again): it is no longer away ([`HostHeap::texture_slot_gone`]).
+    pub(crate) fn texture_slot_here(&self, index: u32) {
+        let mut away = self.away.lock().unwrap_or_else(|e| e.into_inner());
+        if !away.is_empty() && away.remove(&index).is_some() {
+            AWAY_KEPT[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Makes host slot `index` null again, as it is before its view is
@@ -4205,6 +4272,48 @@ mod tests {
         heap.queue_texture(slot, true, false, 12);
         let (_, current) = heap.texture_slots_due(u64::MAX, 1).0[0];
         assert!(heap.texture_slot_gone(slot, current));
+        assert_eq!(heap.made.lock().unwrap()[slot as usize], 0);
+    }
+
+    /// With `VICTORY_TEXTURE_AWAY_MS`, a made slot whose texture's memory
+    /// went shows it on, holding its host texture, until the time is up;
+    /// one whose memory comes back first starts again from nothing.
+    #[test]
+    fn a_slot_shows_its_texture_on_for_a_while_after_its_memory_went() {
+        let Some(heap) = HostHeap::new(false, 8) else { return };
+        let slot = 1;
+        static BYTES: [u8; 65536] = [0; 65536];
+        let address = BYTES.as_ptr() as u64;
+        let resource = [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0];
+        let mut srv = [0; 16];
+        srv[..6].copy_from_slice(&[98, 4, 5768, 0, 0, 1]);
+        (srv[10], srv[11]) = (address as u32, (address >> 32) as u32);
+        let view = View::Placed(false, resource, srv);
+        let [entry, generation] = super::super::words_for(view.clone());
+        let title = [super::super::VIEW_TAG, entry, generation];
+        let handle = title.as_ptr() as u64;
+        assert_eq!(heap.mirror(slot, handle, false), Some(view.clone()));
+        let (_, write) = heap.texture_slots_due(u64::MAX, 1).0[0];
+        assert_eq!(heap.mirror(slot, handle, true), Some(view));
+        let key = u64::from(generation) << 32 | u64::from(entry);
+        let shown = |heap: &HostHeap| {
+            heap.made.lock().unwrap()[slot as usize] == key && heap.kept.lock().unwrap()[slot as usize].is_some()
+        };
+        assert!(shown(&heap));
+
+        *heap.away_ms.lock().unwrap() = Some(3_600_000);
+        assert!(!heap.texture_slot_gone(slot, write), "made null at the first look");
+        assert!(!heap.texture_slot_gone(slot, write));
+        assert!(shown(&heap));
+        // Back again: the next time it goes, the wait starts anew.
+        heap.texture_slot_here(slot);
+        assert!(heap.away.lock().unwrap().is_empty());
+
+        *heap.away_ms.lock().unwrap() = Some(40);
+        assert!(!heap.texture_slot_gone(slot, write));
+        assert!(shown(&heap));
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert!(heap.texture_slot_gone(slot, write));
         assert_eq!(heap.made.lock().unwrap()[slot as usize], 0);
     }
 
