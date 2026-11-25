@@ -279,6 +279,83 @@ fn a_sum_of_halves_where_lanes_have_left_is_the_consoles_tree_bit_for_bit() {
     }
 }
 
+/// As above, with the lanes that stay scattered over the wave and lane 0 among those gone:
+/// thread t stays where `((t ^ s1) & s2) < s0`. Runs of lanes with nobody left add +0, runs
+/// with somebody left are read from their first lane that is here, and the high half of the
+/// result is lane 0's term's (0xABCD here) only where lane 0 stays, 0 where it is gone.
+#[test]
+fn a_sum_of_halves_with_scattered_lanes_gone_is_the_consoles_tree_bit_for_bit() {
+    let mut words = vec![
+        0x3A10_0001, // v_xor_b32 v8, s1, v0
+        0x3610_1002, // v_and_b32 v8, s2, v8
+        0x7DA8_1000, // v_cmpx_gt_u32 exec, s0, v8: the lanes that stay
+        0,           // s_cbranch_execz to the end (filled in below)
+        0x340C_0085, // v_lshlrev_b32 v6, 5, v0
+        0x340E_0082, // v_lshlrev_b32 v7, 2, v0
+        0x4A0E_0F06, // v_add_nc_u32 v7, v6, v7
+        0x4A0E_0F00, // v_add_nc_u32 v7, v0, v7
+        0x4A0E_0EFF,
+        0x0000_3C00, // v_add_nc_u32 v7, 0x3c00, v7
+        0x380E_0EFF,
+        0xABCD_0000, // v_or_b32 v7, 0xabcd0000, v7: a high half no v_add_f16 writes
+    ];
+    words.extend(super::wave::WAVE_OR_V7_TO_S7.iter().map(|&w| if w >> 25 == 28 { w & 0x01FF_FFFF | 50 << 25 } else { w }));
+    words.extend_from_slice(&[
+        0x7E00_0207, // v_mov_b32 v0, s7
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+    ]);
+    words[3] = 0xBF88_0000 | (words.len() as u32 - 4);
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered_on(&native, &p, &HashSet::new(), 64).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    // (terms are normal numbers or +0)
+    let wide = |h: u16| {
+        if h == 0 {
+            0.0
+        } else {
+            f32::from_bits((u32::from(h >> 10) + 112) << 23 | u32::from(h & 0x3FF) << 13)
+        }
+    };
+    let narrow = |f: f32| {
+        if f == 0.0 {
+            return 0;
+        }
+        let b = f.to_bits();
+        let h = ((b >> 23) - 112) << 10 | (b >> 13 & 0x3FF);
+        let rest = b & 0x1FFF;
+        (h + u32::from(rest > 0x1000 || rest == 0x1000 && h & 1 == 1)) as u16
+    };
+    let add = |a: u16, b: u16| narrow(wide(a) + wide(b));
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = false;
+    // (s0, s1, s2): even lanes; t & 5 == 1 (lane 0 gone); lanes 54..63; lane 21 alone;
+    // t & 42 == 0; the upper half alone; every lane
+    for (s0, s1, s2) in [(1u32, 0u32, 1u32), (1, 1, 5), (10, 63, 63), (1, 21, 63), (1, 0, 42), (32, 32, 63), (64, 0, 63)] {
+        let stays = |t: u32| (t ^ s1) & s2 < s0;
+        let terms: Vec<u16> = (0..64u32)
+            .map(|t| if stays(t) { (0x3C00 + 37 * t) as u16 } else { 0 })
+            .collect();
+        let mut tree = terms.clone();
+        while tree.len() > 1 {
+            tree = tree.chunks(2).map(|c| add(c[0], c[1])).collect();
+        }
+        let want = if stays(0) { 0xABCD_0000 } else { 0 } | u32::from(tree[0]);
+        let Some(got) = on_the_card_with(&shader, &[s0, s1, s2]) else {
+            return;
+        };
+        ran = true;
+        assert_eq!(got, want, "(t ^ {s1}) & {s2} < {s0} stay: got {got:#x}, the console's {want:#x}");
+    }
+    if ran {
+        eprintln!("ran on the hardware device: the console's tree with scattered lanes gone, in every case");
+    }
+}
+
 /// One `v_add_f16` whose exact result lies between two halves: 1 + 3/1024 (0x3C03) plus 2
 /// (0x4000) is 3 + 1.5 steps of that range, which the console rounds up to 0x4202. The
 /// host's `f32tof16` may give 0x4201 (toward zero); with `VICTORY_F16_NEAREST=1` the
@@ -420,6 +497,11 @@ fn a_wave_or_inside(skip: u32, name: &str) {
 /// Runs `shader` on the hardware device with the root constants `s0`, `s1` and gives dword 0
 /// of the UAV; None (and a line) without a device that takes it.
 fn on_the_card(shader: &HostShader, constants: [u32; 2]) -> Option<u32> {
+    on_the_card_with(shader, &constants)
+}
+
+/// [`on_the_card`] with the root constants `s0`, `s1`, ... in `constants`.
+fn on_the_card_with(shader: &HostShader, constants: &[u32]) -> Option<u32> {
     let Ok(host) = Host::new(false) else {
         eprintln!("no SM 6.6 hardware device; not run");
         return None;
@@ -430,8 +512,8 @@ fn on_the_card(shader: &HostShader, constants: [u32; 2]) -> Option<u32> {
     };
     let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
     for u in &shader.user_data {
-        if let (RootType::Constants, 0, d @ 0..=1) = (u.root, u.slot, u.dword) {
-            ud[u.index as usize] = constants[d as usize];
+        if let (RootType::Constants, 0, Some(&k)) = (u.root, u.slot, constants.get(u.dword as usize)) {
+            ud[u.index as usize] = k;
         }
     }
     let out = host
