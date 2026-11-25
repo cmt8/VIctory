@@ -492,6 +492,13 @@ On by default from this merge (`=0` or the named value turns each off):
   out (a copy of a texture onto itself), and so is a draw record of 2^23
   vertices an instance or more.
 
+Two shader fixes picked on top, for the coloured grain on eyes, a forearm
+and glass (no switch; both change translations): pixel programs the
+console depth-tests before they run declare early depth (ad1e85de by
+SpaghettiMaster545: the glass prepass over characters), and a pixel's
+quad is read through quad reads, helper lanes included (2b3c339e by
+beloooo: lines on car paint, glass and skin).
+
 Diagnostics builds only: `VICTORY_FRAME_LOG` (every frame's length and
 what long frames were made of), `VICTORY_CARD_METER` (the card's time by
 kind of list), `VICTORY_PROFILE` and its `VICTORY_PROFILE_*` settings (a
