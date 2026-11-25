@@ -101,7 +101,18 @@ struct Card {
     sent: Mutex<Vec<(usize, usize, u64)>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
+    /// Title pages ([`PAGE`], by number) a merge of the copy-back wrote
+    /// since a refresh last copied them ([`ECHO`]).
+    merged: Mutex<std::collections::BTreeSet<usize>>,
 }
+
+/// Since the last frame line: bytes the refreshes of copies in the card's
+/// memory copied from title pages the copy-back had written since their
+/// last copy (the copy-back's own writes, as the write watch and the
+/// guards report them, and whatever the title wrote there too), and the
+/// bytes those refreshes copied in all. Says how much of what goes up to
+/// the card again each frame is what came down from it.
+pub(crate) static ECHO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// Whether the host copies of big title buffers are in the card's own
 /// memory (on by default since run 75 showed it holds: the BVH skinning
@@ -2563,7 +2574,31 @@ impl Shadow {
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
+        self.card_echo(from, to);
         to - from
+    }
+
+    /// For [`ECHO`]: a refresh copied title memory `[from, to)` into a
+    /// copy in the card's memory.
+    fn card_echo(&self, from: usize, to: usize) {
+        let Some(card) = &self.card else {
+            return;
+        };
+        ECHO[1].fetch_add((to - from) as u64, Ordering::Relaxed);
+        let mut merged = card.merged.lock().unwrap_or_else(|e| e.into_inner());
+        if merged.is_empty() {
+            return;
+        }
+        let pages: Vec<usize> = merged.range(from / PAGE..to.div_ceil(PAGE)).copied().collect();
+        let mut bytes = 0;
+        for page in pages {
+            let (a, b) = ((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
+            bytes += b.saturating_sub(a);
+            // Counted once (a diagnostic: a page copied in parts counts its
+            // first part).
+            merged.remove(&page);
+        }
+        ECHO[0].fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
     /// Whether shaders read and write this copy in the card's own memory
@@ -2785,6 +2820,10 @@ impl Shadow {
         }
         crate::watch::writing(start + at, n);
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        card.merged
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend((start + at) / PAGE..(start + at + n).div_ceil(PAGE));
         n
     }
 }
@@ -2949,6 +2988,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
                     size,
+                    merged: Mutex::default(),
                 };
                 (on_card, Some(card))
             }
@@ -3165,6 +3205,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 size: len,
+                merged: Mutex::default(),
             };
             (on_card, Some(card))
         }
