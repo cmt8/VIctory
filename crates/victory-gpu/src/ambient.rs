@@ -29,9 +29,30 @@ pub(crate) const PROGRAM: &[u8] = b"CS_ScreenProbes_TemporalResolve";
 /// integers): root parameter and place in its table.
 pub(crate) const LIGHT: (u8, u32) = (1, 176);
 
-/// 0.6 looked balanced in testing. `VICTORY_AMBIENT=off` leaves what the
-/// title's resolve wrote; 0 is no indirect diffuse light at all.
-const DEFAULT: f32 = 0.6;
+/// 0.35 with neutral sky-fill tint balances interior readability without
+/// blowing out sunlit hair or washing the cell orange. `VICTORY_AMBIENT=off`
+/// leaves what the title's resolve wrote; 0 is no indirect diffuse light.
+const DEFAULT: f32 = 0.35;
+const DEFAULT_TINT: [f32; 3] = [0.94, 0.97, 1.0];
+
+fn tint() -> [f32; 3] {
+    static TINT: OnceLock<[f32; 3]> = OnceLock::new();
+    *TINT.get_or_init(|| {
+        let Ok(set) = std::env::var("VICTORY_AMBIENT_TINT") else {
+            return DEFAULT_TINT;
+        };
+        let parts: Vec<f32> = set
+            .split(',')
+            .filter_map(|p| p.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .collect();
+        if parts.len() == 3 {
+            [parts[0], parts[1], parts[2]]
+        } else {
+            DEFAULT_TINT
+        }
+    })
+}
 
 /// The floor; `None` if off.
 pub(crate) fn level() -> Option<f32> {
@@ -215,7 +236,8 @@ pub(crate) fn raise(list: &HostList, light: This) -> bool {
         l.SetDescriptorHeaps(&[Some(pass.views.clone())]);
         l.SetComputeRootSignature(&pass.root);
         l.SetPipelineState(&pass.pso);
-        let constants = [level, 1.0f32, 0.98, 0.94];
+        let t = tint();
+        let constants = [level, t[0], t[1], t[2]];
         l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(
             1,
