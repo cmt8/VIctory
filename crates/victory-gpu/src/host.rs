@@ -796,10 +796,20 @@ mod tests {
     /// there is no WARP adapter (Wine).
     #[test]
     fn the_card_compare_stores_the_hash_it_made_when_told_on_the_host() {
+        the_card_compare_stores_the_hash_it_made_when_told_on_the_host_as(false);
+    }
+
+    /// The same with a group of 64 threads a piece (`VICTORY_CARD_HASH_WIDE=1`).
+    #[test]
+    fn the_wide_card_compare_stores_the_hash_it_made_when_told_on_the_host() {
+        the_card_compare_stores_the_hash_it_made_when_told_on_the_host_as(true);
+    }
+
+    fn the_card_compare_stores_the_hash_it_made_when_told_on_the_host_as(wide: bool) {
         let Some(host) = host() else {
             return; // no host GPU here
         };
-        let work = host.make_card_work().expect("the card compare must build on the host");
+        let work = host.make_card_work_as(wide).expect("the card compare must build on the host");
         const PIECE: usize = 64 << 10;
         const PIECES: u32 = 3;
         let size = PIECE * PIECES as usize;
@@ -829,7 +839,8 @@ mod tests {
                 l.SetComputeRootUnorderedAccessView(3, differs.GetGPUVirtualAddress());
                 // Not read in these modes; bound as every use binds it.
                 l.SetComputeRootShaderResourceView(4, now.GetGPUVirtualAddress());
-                l.Dispatch(PIECES.div_ceil(64), 1, 1);
+                let (x, y) = card_groups(PIECES, work.wide);
+                l.Dispatch(x, y, 1);
             }
             list.close();
             host.execute(&[&list]);
@@ -858,6 +869,16 @@ mod tests {
         set(content[at]);
         assert_eq!(run(2), [0, 1, 0]);
         assert_eq!(run(2), [0, 0, 0]);
+        // A piece's last and first bytes (the last and first threads of a
+        // wide pass's group) count as any other.
+        for at in [2 * PIECE - 1, 2 * PIECE] {
+            // SAFETY: inside the mapping.
+            unsafe { now_ptr.add(at).write_volatile(content[at] ^ 0x81) };
+            assert_eq!(run(1), if at < 2 * PIECE { [0, 1, 0] } else { [0, 0, 1] });
+            // SAFETY: as above.
+            unsafe { now_ptr.add(at).write_volatile(content[at]) };
+            assert_eq!(run(1), [0, 0, 0]);
+        }
     }
 
     /// The hash pass over a list of pieces (`piece_lists`, mode 3), on the
@@ -865,10 +886,20 @@ mod tests {
     /// no other, as mode 0 does for a run of them.
     #[test]
     fn the_card_hash_pass_over_a_list_stores_the_listed_pieces_only() {
+        the_card_hash_pass_over_a_list_stores_the_listed_pieces_only_as(false);
+    }
+
+    /// The same with a group of 64 threads a piece (`VICTORY_CARD_HASH_WIDE=1`).
+    #[test]
+    fn the_wide_card_hash_pass_over_a_list_stores_the_listed_pieces_only() {
+        the_card_hash_pass_over_a_list_stores_the_listed_pieces_only_as(true);
+    }
+
+    fn the_card_hash_pass_over_a_list_stores_the_listed_pieces_only_as(wide: bool) {
         let Some(host) = host() else {
             return; // no host GPU here
         };
-        let work = host.make_card_work().expect("the card compare must build on the host");
+        let work = host.make_card_work_as(wide).expect("the card compare must build on the host");
         const PIECE: usize = 64 << 10;
         const PIECES: u32 = 4;
         let size = PIECE * PIECES as usize;
@@ -905,7 +936,10 @@ mod tests {
                 l.SetComputeRootUnorderedAccessView(2, hashes.GetGPUVirtualAddress());
                 l.SetComputeRootUnorderedAccessView(3, differs.GetGPUVirtualAddress());
                 l.SetComputeRootShaderResourceView(4, list_buffer.GetGPUVirtualAddress());
-                l.Dispatch(PIECES.div_ceil(64), 1, 1);
+                // Groups for all the pieces, whatever the list holds: those
+                // past it must store nothing.
+                let (x, y) = card_groups(PIECES, work.wide);
+                l.Dispatch(x, y, 1);
             }
             list.close();
             host.execute(&[&list]);
@@ -1888,6 +1922,8 @@ struct CardWork {
     fetch: Prelude,
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
+    /// Whether `pso` is [`CARD_COMPARE_WIDE`] (dispatched by [`card_groups`]).
+    wide: bool,
     /// One dword per piece compared, set where the piece differs: PC
     /// memory, mapped (buffer, mapping, bytes).
     differs: (ID3D12Resource, usize, u64),
@@ -2013,6 +2049,118 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
 }
 "#;
+
+/// [`CARD_COMPARE`] with a group of 64 threads to each piece
+/// (`VICTORY_CARD_HASH_WIDE=1`, [`card_hash_wide`]): thread `t` hashes the
+/// piece's 16-byte steps `t`, `t + 64`, ... as [`CARD_COMPARE`] hashes all
+/// of them, and the first thread folds the 64 hashes in order by the same
+/// step. The modes, bindings and root signature are the same; the hash is
+/// another, so one copy's hashes are only ever made and compared by one of
+/// the two (the switch is read once). Groups are laid out by
+/// [`card_groups`]: piece `y * 32768 + x` of the pass.
+pub(crate) const CARD_COMPARE_WIDE: &str = r#"
+#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1), SRV(t1)"
+cbuffer Span : register(b0) {
+    uint first;
+    uint skew;
+    uint size;
+    uint pieces;
+    uint out_at;
+    uint compare;
+};
+ByteAddressBuffer now : register(t0);
+ByteAddressBuffer list : register(t1);
+RWStructuredBuffer<uint> hashes : register(u0);
+RWByteAddressBuffer differs : register(u1);
+// The threads' hashes, four words each.
+groupshared uint part[256];
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 gid : SV_GroupID, uint t : SV_GroupIndex) {
+    uint index = gid.y * 32768u + gid.x;
+    // No return before the group's barrier: a group past the pieces
+    // hashes nothing and stores nothing.
+    bool live = index < pieces;
+    uint piece = first + index;
+    [branch] if (live && compare == 3u) {
+        piece = list.Load(out_at + index * 4u);
+    }
+    uint lo = piece * 65536u;
+    lo = lo > skew ? lo - skew : 0u;
+    uint hi = min((piece + 1u) * 65536u - skew, size);
+    lo = lo & ~15u;
+    hi = (hi + 15u) & ~15u;
+    if (!live) {
+        hi = lo;
+    }
+    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
+    [loop]
+    for (uint at = lo + t * 16u; at < hi; at += 1024u) {
+        h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        h = h.yzwx ^ (h >> 15);
+    }
+    part[t * 4u] = h.x;
+    part[t * 4u + 1u] = h.y;
+    part[t * 4u + 2u] = h.z;
+    part[t * 4u + 3u] = h.w;
+    GroupMemoryBarrierWithGroupSync();
+    if (!live || t != 0u) {
+        return;
+    }
+    h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
+    [loop]
+    for (uint k = 0u; k < 256u; k += 4u) {
+        h = (h ^ uint4(part[k], part[k + 1u], part[k + 2u], part[k + 3u])) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        h = h.yzwx ^ (h >> 15);
+    }
+    uint word = piece * 4u;
+    if (compare != 0u && compare != 3u) {
+        uint4 was = uint4(hashes[word], hashes[word + 1u], hashes[word + 2u], hashes[word + 3u]);
+        differs.Store(out_at + index * 4u, any(h != was) ? 1u : 0u);
+        if (compare == 2u) {
+            hashes[word] = h.x;
+            hashes[word + 1u] = h.y;
+            hashes[word + 2u] = h.z;
+            hashes[word + 3u] = h.w;
+        }
+    } else {
+        hashes[word] = h.x;
+        hashes[word + 1u] = h.y;
+        hashes[word + 2u] = h.z;
+        hashes[word + 3u] = h.w;
+    }
+}
+"#;
+
+/// Whether the card's hash and compare passes over copies in the card's
+/// memory give each 64 KiB piece a group of 64 threads
+/// ([`CARD_COMPARE_WIDE`]; `VICTORY_CARD_HASH_WIDE=1`, off by default)
+/// rather than one thread.
+///
+/// With one thread a piece, a pass walks its pieces 16 bytes at a time,
+/// 4,096 loads one after the other, each waiting for the last: it takes
+/// the time of 4,096 trips to the card's memory however few its pieces
+/// are, and the send-and-hash lists' passes wait for each other at the
+/// copies' state changes. Run a8 made 45 hash passes and 106 compare
+/// passes a frame (17,164 pieces compared). With a group a piece, a pass
+/// takes 64 such steps, the group's loads side by side in one 1 KiB row.
+/// What it costs: 64 times the threads, idle where a piece ends early,
+/// and a fold of 64 hashes by one thread.
+pub(crate) fn card_hash_wide() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_HASH_WIDE").is_some_and(|v| v == "1"))
+}
+
+/// The groups of a hash or compare pass over `pieces` pieces: one thread a
+/// piece in groups of 64, or with `wide` a group a piece, rows of 32,768
+/// (a dispatch's dimension holds 65,535 groups at most).
+pub(crate) fn card_groups(pieces: u32, wide: bool) -> (u32, u32) {
+    if wide {
+        (pieces.min(32768), pieces.div_ceil(32768))
+    } else {
+        (pieces.div_ceil(64), 1)
+    }
+}
 
 /// Whether the pieces a flight's compare flags come down to the PC inside
 /// the flight itself (`VICTORY_CARD_FETCH_INFLIGHT=1`; off by default, and
@@ -3155,6 +3303,17 @@ mod read_settles {
 /// lands (the bytes going into title memory are compared with the ones
 /// there, over every fill that read ahead of them) and from then on fills
 /// wait as before. `VICTORY_FILL_WAIT=1`: they wait from the start.
+///
+/// `VICTORY_FILL_WAIT=0`: they never wait, whatever the check finds; each
+/// fill that read bytes a flight then changed is counted (the frame line's
+/// "since the start") and the first few are named. What it trades: the
+/// lists of such a submission draw with the constants from before the
+/// flight, once per such fill (every frame, if a title's shaders write a
+/// constant buffer that a later submission of the same frame reads). It
+/// is for measuring what the fills' waits cost (a run of the title in
+/// every log so far turned them back on within its first minute, after
+/// which they were two of the frame's three settles); the count says
+/// whether the bytes were ever stale.
 mod fill_ahead {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
@@ -3200,6 +3359,13 @@ mod fill_ahead {
     pub(super) fn on() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
         *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_WAIT").is_none_or(|v| v != "1")) && !WAIT.load(Relaxed)
+    }
+
+    /// `VICTORY_FILL_WAIT=0`: a fill that read ahead of a flight's change
+    /// is counted, and fills go on not waiting.
+    fn never() -> bool {
+        static NEVER: OnceLock<bool> = OnceLock::new();
+        *NEVER.get_or_init(|| std::env::var_os("VICTORY_FILL_WAIT").is_some_and(|v| v == "0"))
     }
 
     /// A fill reads `len` bytes at `src` ahead of flights that may write
@@ -3257,6 +3423,18 @@ mod fill_ahead {
             }
             let n = COUNT[2].fetch_add(1, Relaxed) + 1;
             let first = now.iter().zip(&new[a - at..b - at]).position(|(x, y)| x != y).unwrap_or(0);
+            if never() {
+                if n <= 8 {
+                    tracing::warn!(
+                        "a fill of upload memory read {} bytes at {from:#x} in frame {read_in} ahead of a flight whose shaders \
+                         changed them (first at {:#x}, landed in frame {frame}): the lists of that submission drew with the bytes \
+                         from before; fills go on not waiting (VICTORY_FILL_WAIT=0; {n} such fills so far)",
+                        to - from,
+                        a + first
+                    );
+                }
+                continue;
+            }
             if !WAIT.swap(true, Relaxed) {
                 tracing::warn!(
                     "a fill of upload memory read {} bytes at {from:#x} in frame {read_in} ahead of a flight whose shaders changed \
@@ -4479,15 +4657,25 @@ impl Host {
     }
 
     fn make_card_work(&self) -> windows::core::Result<CardWork> {
+        let wide = card_hash_wide();
+        if wide {
+            tracing::info!("the card's hash and compare passes give each piece a group of 64 threads (VICTORY_CARD_HASH_WIDE=1)");
+        }
+        self.make_card_work_as(wide)
+    }
+
+    /// [`Host::make_card_work`] with the one or the other compare shader.
+    fn make_card_work_as(&self, wide: bool) -> windows::core::Result<CardWork> {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        let source = if wide { CARD_COMPARE_WIDE } else { CARD_COMPARE };
         let mut code: Option<ID3DBlob> = None;
         // SAFETY: the source and names live through the call; the out
         // pointer is ours.
         unsafe {
             D3DCompile(
-                CARD_COMPARE.as_ptr().cast(),
-                CARD_COMPARE.len(),
+                source.as_ptr().cast(),
+                source.len(),
                 windows::core::s!("card compare"),
                 None,
                 None,
@@ -4547,6 +4735,7 @@ impl Host {
                 fetch: list()?,
                 root,
                 pso,
+                wide,
                 differs: (differs, data as usize, RESULTS),
                 fetched: None,
                 taken: 0,
@@ -4929,7 +5118,8 @@ impl Host {
                             let constants = [0, runs[0].skew, size as u32, pieces, at * 4, 3];
                             list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                             list.SetComputeRootShaderResourceView(4, listed.GetGPUVirtualAddress());
-                            list.Dispatch(pieces.div_ceil(64), 1, 1);
+                            let (x, y) = card_groups(pieces, work.wide);
+                            list.Dispatch(x, y, 1);
                             crate::cardmeter::end(list, hashing);
                             continue;
                         }
@@ -4938,7 +5128,8 @@ impl Host {
                         for run in runs {
                             let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
                             list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                            list.Dispatch(run.pieces.div_ceil(64), 1, 1);
+                            let (x, y) = card_groups(run.pieces, work.wide);
+                            list.Dispatch(x, y, 1);
                         }
                         crate::cardmeter::end(list, hashing);
                     }
@@ -5034,7 +5225,8 @@ impl Host {
                         // (the results hold every offset it could be read at).
                         list.SetComputeRootShaderResourceView(4, work.differs.0.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
+                        let (x, y) = card_groups(r.span.pieces, work.wide);
+                        list.Dispatch(x, y, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     // The fetch inside the flight (`inflight_fetch`): behind

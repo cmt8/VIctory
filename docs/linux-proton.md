@@ -594,6 +594,42 @@ On by default from this round (`=0` or the named value turns each off):
   down (0.2, 0.6).
 
 The shader cache key does not change with this round: no warm-up again.
+### The card's time (linux/fx-next9-gpu)
+
+In the world scene of run a8 (175 ms a frame) the submitting thread
+waited 80-100 ms a frame for the card, nearly all of it in the three
+settles a frame for "title memory read" (one title buffer copy, two
+fills of upload memory), and the card's clock counted it 73-75 % busy.
+Neither says what the card runs. Three switches, all off by default:
+
+- `VICTORY_GPU_TIMES=1` (any build): the card meter (`VICTORY_CARD_METER`)
+  without the frame log, and two lines with every frame-rate line. "The
+  card's own clock per frame": the time the card ran any list of ours
+  (timestamps where each list begins and ends, the spans joined), then by
+  kind: the title's lists, the indirect clamps inside them and in the
+  preludes, the preludes, our send-and-hash lists and the hash passes in
+  them, our compare lists. The card clock line's busy time less "our lists
+  ran" is time our work waited in the queue rather than ran. The table of
+  the title's lists by the pipelines they bind still comes every 256
+  frames. "Settles for title memory read per frame, by the place read":
+  which 64 KiB of title memory each such settle was for, and how long the
+  submitting thread stood in it. Cost: two timestamps and a resolve a list
+  and a clamp (the clamps' resolves wait for the list's end).
+- `VICTORY_CARD_HASH_WIDE=1`: the hash and compare passes over copies in
+  the card's memory give each 64 KiB piece a group of 64 threads instead
+  of one thread (64 steps of loads side by side instead of 4,096 one after
+  the other). The same pieces are flagged; the hashes are another kind, so
+  the switch holds for the whole run. With `VICTORY_GPU_TIMES=1` the send-
+  and-hash and compare lists' times show what it is worth.
+- `VICTORY_FILL_WAIT=0`: fills of upload memory never wait for flights;
+  a fill that read bytes a flight then changed is counted ("since the
+  start" on the fills line) and the first eight are named, and fills go on
+  not waiting. Every run so far turned the fills' waiting back on within
+  its first minute, for a 2 KiB constant buffer at the same address each
+  time. What it trades: the draws of such a submission read the constants
+  from before that flight. For measuring what the fill settles cost; the
+  count says how often the bytes were stale.
+
 ### Taking a profile (linux/fx-next6-prof)
 
 Every speed change so far was made without an in-game measurement of
