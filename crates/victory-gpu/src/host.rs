@@ -3139,6 +3139,15 @@ fn read_backs(list: &HostList) {
                 for line in 0..*rows {
                     std::ptr::copy_nonoverlapping(from.add(line * row.next_multiple_of(256)), (*at as *mut u8).add(line * pitch), *row);
                 }
+                // The water trace: every read back's destination, and
+                // whether all it brought was zeros.
+                if crate::water::water_trace() {
+                    let zero = (0..*rows).all(|line| {
+                        std::slice::from_raw_parts(from.add(line * row.next_multiple_of(256)), *row).iter().all(|&b| b == 0)
+                    });
+                    let first = std::slice::from_raw_parts(from, (*row).min(32));
+                    crate::water::read_back(*at, *row, *rows, *pitch, first, zero);
+                }
                 // The walls trace: what the title is handed (one row of at
                 // most 24 values: its 5x1 and 1x1 float targets).
                 if walls_trace() && *rows == 1 && *row <= 96 {

@@ -119,6 +119,50 @@ fn write_skip() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WRITE_SKIP").is_none_or(|v| v != "0"))
 }
 
+/// `VICTORY_HEAP_WRITES` (`crate::water::heap_writes`): per host view
+/// heap (by address), the ranges of host copies that a list running a
+/// shader which stores through buffer views it picks from the heap gives
+/// the copy-back as written ([`State::heap_writes`]). Made by each pass of
+/// [`State::heap_buffers`] (once a frame) from the slots' views: the
+/// unordered access views (with `all`, every buffer view), per copy, the
+/// fewest ranges covering them.
+type HeapWritten = Vec<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
+static HEAP_WRITTEN: std::sync::Mutex<Option<std::collections::HashMap<usize, HeapWritten>>> =
+    std::sync::Mutex::new(None);
+
+/// [`HEAP_WRITTEN`] of host heap `host` from its slots' ranges (copy,
+/// from, to, unordered access); nothing with the switch off.
+fn heap_written<'a>(
+    host: usize,
+    ranges: impl Iterator<Item = &'a (std::sync::Arc<crate::shadow::Shadow>, u64, u64, bool)>,
+) {
+    let mode = crate::water::heap_writes();
+    if *mode == crate::water::HeapWrites::Off {
+        return;
+    }
+    let all = mode.all_views();
+    let mut by_copy: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, Vec<(u64, u64)>)> =
+        std::collections::HashMap::new();
+    for (shadow, from, to, unordered) in ranges {
+        if *unordered || all {
+            by_copy
+                .entry(std::sync::Arc::as_ptr(shadow) as usize)
+                .or_insert_with(|| (shadow.clone(), Vec::new()))
+                .1
+                .push((*from, *to));
+        }
+    }
+    let written: HeapWritten = by_copy
+        .into_values()
+        .flat_map(|(shadow, r)| crate::water::coalesce(r).into_iter().map(move |(a, b)| (shadow.clone(), a, b)))
+        .collect();
+    HEAP_WRITTEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(Default::default)
+        .insert(host, written);
+}
+
 /// A run of indirect records clamped in one pass ([`windows`]): the host
 /// copy they came from (its number), their kind and stride, the offset of
 /// the first in that copy, how many, and the list's scratch buffer that
@@ -1176,6 +1220,7 @@ impl State {
                                 return false;
                             }
                         }
+                        self.heap_writes(list, &stage.shader.hash, writes, compute);
                         continue;
                     }
                     if srv && slot == victory_shader::emit::SLOT_STRIDES {
@@ -1197,6 +1242,7 @@ impl State {
                                 return false;
                             }
                         }
+                        self.heap_writes(list, &stage.shader.hash, writes, compute);
                         continue;
                     }
                     let tabled = srv && crate::pipeline::host::bounded_root_srvs();
@@ -1385,6 +1431,14 @@ impl State {
                 }
                 if shadow.is_none() {
                     host.null_raw_uav_at(index);
+                    if writes && crate::water::water_trace() {
+                        let why = if address.is_some() {
+                            "no host copy shaders can write at its address"
+                        } else {
+                            "the title set no address"
+                        };
+                        crate::water::root_uav_lost(address, why);
+                    }
                 }
                 self.root_uav_slots
                     .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
@@ -1535,7 +1589,8 @@ impl State {
         // at best); all of them every 16 passes, because a view of a
         // released resource goes stale without a write, and a slot written
         // before its memory had a host copy is only made then.
-        type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
+        // (The last field: an unordered access view, for `VICTORY_HEAP_WRITES`.)
+        type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64, bool)>;
         static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
             std::sync::Mutex::new(None);
         let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
@@ -1587,13 +1642,15 @@ impl State {
             if host.shows(index, &shadow.buffer) == Some(false) {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             }
-            ranges.insert(index, (shadow, address, address + len));
+            let unordered = matches!(view, View::Unordered(..) | View::Placed(true, ..));
+            ranges.insert(index, (shadow, address, address + len, unordered));
         }
         let views = ranges.len() as u32;
+        heap_written(std::ptr::from_ref(host) as usize, ranges.values());
         // Per host copy, the span its picked views cover.
         let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
             std::collections::HashMap::new();
-        for (shadow, from, to) in ranges.values() {
+        for (shadow, from, to, _) in ranges.values() {
             let key = std::sync::Arc::as_ptr(shadow) as usize;
             let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
             span.1 = span.1.min(*from);
@@ -1651,6 +1708,62 @@ impl State {
             );
         }
         Some(gpu)
+    }
+
+    /// `VICTORY_HEAP_WRITES` and the water trace (`crate::water`): stage
+    /// `hash` of what is being bound picks buffer views from the view heap
+    /// by an index it computes ([`State::heap_buffers`] made them ready);
+    /// `stores`: its code can store to buffers. What it stores through
+    /// those views stays in the host copies (later draws read it there)
+    /// and does not reach title memory, so the CPU never sees it. Where the
+    /// switch asks for it, the list gives the heap's unordered access
+    /// buffer views ([`HEAP_WRITTEN`]) to the copy-back as written, once
+    /// per list, as a table's unordered access view is (`readable`).
+    /// shortcut: every such view of the heap, not those the shader picks
+    /// (its index comes from data): upstream VIctory measured about 1 GB
+    /// of them in the world and seconds a frame to compare (its
+    /// `bindless.rs`), and closed the gap with shader write marks
+    /// (cd94d35388) instead.
+    fn heap_writes(&self, list: &HostList, hash: &str, stores: bool, compute: bool) {
+        if !stores {
+            return;
+        }
+        let wanted = crate::water::heap_writes().wants(hash);
+        if crate::water::water_trace() {
+            crate::water::picking_store(hash, compute, wanted);
+        }
+        if !wanted {
+            return;
+        }
+        let Some(host) = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())
+            .and_then(|h| h.host())
+        else {
+            return;
+        };
+        // Once per list, as the pass (another key than its own).
+        const ONCE: usize = usize::MAX - 0x5d;
+        if !list.first_use(ONCE) {
+            return;
+        }
+        let written = HEAP_WRITTEN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|m| m.get(&(std::ptr::from_ref(host) as usize)).cloned())
+            .unwrap_or_default();
+        let mut bytes = 0;
+        for (shadow, from, to) in &written {
+            shadow.gpu_writes(list, *from, to - from);
+            bytes += to - from;
+        }
+        if crate::water::water_trace() {
+            crate::water::heap_declared(written.len(), bytes);
+        }
     }
 
     /// [`State::heap_buffers`] for a shader that reads a descriptor's

@@ -932,6 +932,15 @@ extern "system" fn copy_texture_region(
             static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             let made = read_back(list, dst, x, y, z, src, source_box);
+            if let Err(why) = made
+                && crate::water::water_trace()
+            {
+                crate::water::read_trouble(
+                    "a texture read back not made",
+                    why,
+                    format_args!("destination {:?}+{:#x}, the title's buffer keeps what it held", dst.resource, dst.footprint.offset),
+                );
+            }
             if n <= 16 || n.is_multiple_of(4096) || made.is_err() {
                 static REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 if made.is_err() && REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 16 {
@@ -1369,7 +1378,11 @@ extern "system" fn resolve_queries(
         PIPELINE_STATISTICS => (Written::Value(0), 88),
         _ => (Written::Value(0), 16),
     };
-    if offset + u64::from(count) * bytes > size {
+    let fits = offset + u64::from(count) * bytes <= size;
+    if crate::water::water_trace() {
+        crate::water::query_resolve(kind, count, data as u64 + offset, fits);
+    }
+    if !fits {
         return;
     }
     for i in 0..u64::from(count) {

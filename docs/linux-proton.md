@@ -211,6 +211,38 @@ frames later).
   shader cache key are not in this tree (its own key and
   `translate --cache` are).
 
+### Water the title does not feel (linux/fx-next5-water)
+
+The first mission after the prologue fails at once: the boat sinks to the
+sea bed and does not move, though the water is drawn; on foot the water is
+not there for the player. Every host and fork that got that far reports it
+(fxceless/victory-fork#279, #372, #618; Windows on NVIDIA and AMD with
+`VICTORY_RELAY` 0, 1 and 2). Not yet explained. Both off by default:
+
+- `VICTORY_HEAP_WRITES` (A/B; unset or `0` as before): what shaders
+  store through buffer views they pick from the view heap by an index they
+  compute stays in the host copies and never reaches title memory, so the
+  title's CPU never sees it (upstream VIctory's `bindless.rs` names the
+  same gap; upstream closed it with shader write marks, cd94d35388). `1`:
+  every list that runs such a shader (one whose code can store) gives the
+  heap's unordered access buffer views to the copy-back as written, as a
+  table's are. `all`: every buffer view of the heap. A comma-separated list
+  of shader hashes: the unordered views, only for lists running those
+  shaders (the water trace names them). Costly: upstream measured about
+  1 GB of such views in the world and seconds a frame to compare them all.
+- `VICTORY_WATER_TRACE=1`: rate-limited `water trace:` lines (the first
+  eight of each kind, then every power of two) for every path by which the
+  GPU's work or a file reaches the title's CPU: each shader that stores
+  and picks buffer views from the heap (by hash, whether its writes were
+  declared), each list that declared them (`VICTORY_HEAP_WRITES`), every
+  texture read back as it lands (destination, size, whether all zeros),
+  every texture read back not made and why, every query resolve (all made
+  up but timestamps), a shader's root unordered view bound to a null view
+  (its writes go nowhere), a title `ReadFile` that failed (not a pending
+  overlapped one), an `fread` that came back short, and a DirectStorage
+  zlib stream that ended short of its destination. DirectStorage requests
+  that fail are logged without it (`dstorage: request failed`).
+
 ## Tests
 
 ```sh

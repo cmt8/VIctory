@@ -61,7 +61,9 @@ pub mod signature;
 mod texture;
 #[cfg(windows)]
 mod watch;
+pub mod water;
 
+pub use water::water_trace;
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]

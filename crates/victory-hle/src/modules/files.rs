@@ -546,6 +546,9 @@ pub extern "system" fn ReadFile(
     let mut tries = 0;
     loop {
         let ok = host(file, buffer, len, read, overlapped);
+        if ok == 0 && victory_gpu::water_trace() {
+            read_file_trouble(buffer, len, !overlapped.is_null(), tries);
+        }
         if ok != 0 || tries == 3 || !overlapped.is_null() {
             return ok;
         }
@@ -558,6 +561,27 @@ pub extern "system" fn ReadFile(
         }
         tries += 1;
     }
+}
+
+/// The water trace (`VICTORY_WATER_TRACE=1`): a title `ReadFile` returned
+/// failure. Pending overlapped reads are not trouble. The thread's last
+/// error is kept for the title.
+fn read_file_trouble(buffer: *mut u8, len: u32, overlapped: bool, tries: u32) {
+    use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, GetLastError, SetLastError};
+    // SAFETY: plain queries and a restore of this thread's last error.
+    let error = unsafe { GetLastError() };
+    if !(overlapped && error == ERROR_IO_PENDING) {
+        victory_gpu::water::read_trouble(
+            "ReadFile failed",
+            &format!("error {error} overlapped {overlapped}"),
+            format_args!(
+                "{len} bytes to {buffer:?}, try {tries}{}",
+                if overlapped { " (overlapped: not made again; the completion carries the failure)" } else { "" }
+            ),
+        );
+    }
+    // SAFETY: as above.
+    unsafe { SetLastError(error) };
 }
 
 /// The host CRT reads large requests straight into the caller's buffer
@@ -594,6 +618,13 @@ pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File
             done += n;
         }
         if n < want {
+            if victory_gpu::water_trace() {
+                victory_gpu::water::read_trouble(
+                    "fread came back short",
+                    "fread",
+                    format_args!("{done} of {total} bytes to {buffer:?} (the end of the file, or an error)"),
+                );
+            }
             break;
         }
     }

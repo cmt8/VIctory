@@ -947,6 +947,13 @@ fn inflate(source: &[u8], out: &mut [u8]) -> Result<usize, HRESULT> {
             }
         };
         let written = state.total_out() as usize;
+        if written < out_len && matches!(status, Ok(zlib_rs::Status::StreamEnd)) && victory_gpu::water_trace() {
+            victory_gpu::water::read_trouble(
+                "dstorage: a zlib stream ended short of its destination",
+                "zlib",
+                format_args!("{written} of {out_len} bytes; the rest of the destination keeps what it held"),
+            );
+        }
         match status {
             Ok(zlib_rs::Status::StreamEnd) if written <= out_len => Ok(written),
             other => {
