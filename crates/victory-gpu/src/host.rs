@@ -738,6 +738,74 @@ mod tests {
 
     use super::*;
 
+    /// The card compare as the runtime makes it (`make_card_work`: its
+    /// pipeline and root signature), on the host GPU: the steps and
+    /// answers of `indirect`'s WARP test of it, which does not run where
+    /// there is no WARP adapter (Wine).
+    #[test]
+    fn the_card_compare_stores_the_hash_it_made_when_told_on_the_host() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let work = host.make_card_work().expect("the card compare must build on the host");
+        const PIECE: usize = 64 << 10;
+        const PIECES: u32 = 3;
+        let size = PIECE * PIECES as usize;
+        let (now, now_ptr) = host.shared_buffer(size as u64).unwrap();
+        let (hashes, _) = host.shared_buffer(16 * u64::from(PIECES)).unwrap();
+        let (differs, differs_ptr) = host.shared_buffer(64).unwrap();
+        let content: Vec<u8> = (0..size).map(|i| (i * 31 + i / 251) as u8).collect();
+        // SAFETY: the mapping holds `size` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
+        // One pass over the three pieces; what it left in `differs` (7s
+        // where it stored nothing).
+        let run = |mode: u32| -> [u32; 3] {
+            let list = host.new_list().unwrap();
+            // SAFETY: an open list, live buffers, the compare's own root
+            // signature; the mappings hold what is read and written.
+            unsafe {
+                for piece in 0..PIECES as usize {
+                    differs_ptr.cast::<u32>().add(piece).write_volatile(7);
+                }
+                let l = &list.list;
+                l.SetComputeRootSignature(&work.root);
+                l.SetPipelineState(&work.pso);
+                let constants = [0u32, 0, size as u32, PIECES, 0, mode];
+                l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                l.SetComputeRootShaderResourceView(1, now.GetGPUVirtualAddress());
+                l.SetComputeRootUnorderedAccessView(2, hashes.GetGPUVirtualAddress());
+                l.SetComputeRootUnorderedAccessView(3, differs.GetGPUVirtualAddress());
+                l.Dispatch(PIECES.div_ceil(64), 1, 1);
+            }
+            list.close();
+            host.execute(&[&list]);
+            // SAFETY: as above; the list has run.
+            [0, 1, 2].map(|piece| unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() })
+        };
+        let at = PIECE + 1234;
+        // SAFETY (each): inside the mapping.
+        let set = |value: u8| unsafe { now_ptr.add(at).write_volatile(value) };
+        // 0: the hashes are stored, nothing is flagged.
+        assert_eq!(run(0), [7, 7, 7]);
+        assert_eq!(run(1), [0, 0, 0]);
+        // A change in the second piece: flagged, and with 1 flagged again
+        // (the hash stays the old one).
+        set(content[at] ^ 0x40);
+        assert_eq!(run(1), [0, 1, 0]);
+        assert_eq!(run(1), [0, 1, 0]);
+        // Changed back: with 1 the piece looks untouched.
+        set(content[at]);
+        assert_eq!(run(1), [0, 0, 0]);
+        // With 2 the change is flagged once, and the hash is the new one.
+        set(content[at] ^ 0x40);
+        assert_eq!(run(2), [0, 1, 0]);
+        assert_eq!(run(2), [0, 0, 0]);
+        // Changed back: flagged, where 1 saw nothing.
+        set(content[at]);
+        assert_eq!(run(2), [0, 1, 0]);
+        assert_eq!(run(2), [0, 0, 0]);
+    }
+
     #[test]
     fn warp_adapter_accepts_only_software() {
         // This probes DXGI without creating a D3D12 device or running a title.
@@ -1577,6 +1645,13 @@ static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
 /// gets a dword per piece, 1 where a byte differs. The offsets are widened
 /// to 16 bytes; buffers are multiples of 64 KiB, and a piece flagged for a
 /// byte just outside the range costs a fetch that finds nothing.
+///
+/// Written for Wine's compiler too (`D3DCompile` under Wine), which has no
+/// `Load*` on a writable buffer and ignores `[RootSignature]`: the hashes
+/// are a structured buffer of `uint` read and written four words at a
+/// time, and the runtime's root signature is made in code
+/// ([`Host::make_card_work`]). The attribute stays for the WARP test,
+/// which takes the root signature from Microsoft's blob.
 pub(crate) const CARD_COMPARE: &str = r#"
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
 cbuffer Span : register(b0) {
@@ -1588,9 +1663,9 @@ cbuffer Span : register(b0) {
     uint compare;  // 0: the hashes are stored; else compared with those stored (2: and then stored)
 };
 ByteAddressBuffer now : register(t0);
-// 16 bytes per piece of the copy: the hash of its bytes when they were
-// last sent up (or hashed whole, the first time).
-RWByteAddressBuffer hashes : register(u0);
+// 16 bytes (four words) per piece of the copy: the hash of its bytes when
+// they were last sent up (or hashed whole, the first time).
+RWStructuredBuffer<uint> hashes : register(u0);
 RWByteAddressBuffer differs : register(u1);
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
@@ -1608,13 +1683,24 @@ void main(uint3 id : SV_DispatchThreadID) {
         h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
         h = h.yzwx ^ (h >> 15);
     }
+    // The piece's hash, in words.
+    uint word = piece * 4u;
     if (compare != 0u) {
-        differs.Store(out_at + id.x * 4u, any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
+        uint4 was = uint4(hashes[word], hashes[word + 1u], hashes[word + 2u], hashes[word + 3u]);
+        differs.Store(out_at + id.x * 4u, any(h != was) ? 1u : 0u);
         // With the copy-back on its own thread: the next compare of the
         // piece finds what is written from here on.
-        if (compare == 2u) hashes.Store4(piece * 16u, h);
+        if (compare == 2u) {
+            hashes[word] = h.x;
+            hashes[word + 1u] = h.y;
+            hashes[word + 2u] = h.z;
+            hashes[word + 3u] = h.w;
+        }
     } else {
-        hashes.Store4(piece * 16u, h);
+        hashes[word] = h.x;
+        hashes[word + 1u] = h.y;
+        hashes[word + 2u] = h.z;
+        hashes[word + 3u] = h.w;
     }
 }
 "#;
@@ -3087,11 +3173,22 @@ impl Host {
         const RESULTS: u64 = 1 << 20;
         let (differs, data) = self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
         name(&differs, || "card compare results".into());
-        // SAFETY: the blob's own bytes; the root signature is inside the
-        // shader.
+        // As the attribute in `CARD_COMPARE` says, made here: Wine's
+        // compiler puts no root signature in the blob. The bindings below:
+        // the span (b0), the copy (t0), the hashes (u0), the results (u1).
+        let root = root_signature(
+            &self.device,
+            &[
+                root_constants(0, 6),
+                root_view(D3D12_ROOT_PARAMETER_TYPE_SRV, 0),
+                root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 0),
+                root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 1),
+            ],
+            "card compare",
+        )?;
+        // SAFETY: the blob's own bytes.
         unsafe {
             let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-            let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
             let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
                 CS: D3D12_SHADER_BYTECODE {
