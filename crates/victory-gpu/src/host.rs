@@ -9391,6 +9391,18 @@ impl Meter {
                 );
             }
             {
+                let [reused, fresh] =
+                    [0, 1].map(|i| crate::shadow::SNAPSHOTS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                let (kept, bytes) = crate::shadow::snapshots_kept_now();
+                if reused + fresh > 0.0 {
+                    tracing::info!(
+                        "snapshot buffers per frame: {reused:.1} taken from those kept, {fresh:.1} made fresh; {kept} kept \
+                         now, {} MB (VICTORY_SNAPSHOT_POOL: the most kept)",
+                        bytes >> 20
+                    );
+                }
+            }
+            {
                 let [at_once, held, waiting, lag] = retirements();
                 tracing::info!(
                     "host objects let go, since the start: {at_once} dropped at once, {held} held for submissions; \

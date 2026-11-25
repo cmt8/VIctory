@@ -1204,6 +1204,16 @@ mod relay_tests {
 /// Snapshot memory kept for reuse (already touched, so no page faults).
 static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
+/// Since the last frame-rate line: snapshot buffers taken from [`POOL`],
+/// and made fresh ([`snapshots_kept`]).
+pub(crate) static SNAPSHOTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// The snapshot buffers kept now, and the bytes they reserve.
+pub(crate) fn snapshots_kept_now() -> (u64, u64) {
+    let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    (pool.len() as u64, pool.iter().map(|v| v.capacity() as u64).sum())
+}
+
 /// An empty buffer with room for `n` bytes, from the pool if it has one
 /// of about that size: a small copy's snapshot took the 174 MB buffer kept
 /// for the big heap's, which then got another, until eight of them were
@@ -1217,6 +1227,7 @@ fn pooled(n: usize) -> Vec<u8> {
         .filter(|(_, v)| v.capacity() >= n && v.capacity() <= most)
         .min_by_key(|(_, v)| v.capacity())
         .map(|(i, _)| i);
+    SNAPSHOTS[usize::from(fit.is_none())].fetch_add(1, Ordering::Relaxed);
     let mut v = match fit {
         Some(i) => pool.swap_remove(i),
         None => Vec::with_capacity(n),
