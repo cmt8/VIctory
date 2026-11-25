@@ -3345,6 +3345,10 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 mod host_bench;
 
 #[cfg(test)]
+#[path = "heap_pass_bench_tests.rs"]
+mod heap_pass_bench;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
