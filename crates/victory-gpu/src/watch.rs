@@ -1005,6 +1005,12 @@ pub(crate) fn written_behind(shown: &[(usize, usize)]) {
     }
 }
 
+/// Held by the test that holds the remapping lock for long, and by tests
+/// that need it free for a while (the copy-back's writes through kept views
+/// do not wait for it).
+#[cfg(test)]
+pub(crate) static MAPPING_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// For `membench`: [`guard`] (the check a refresh makes).
 #[cfg(test)]
 pub(crate) fn check(start: usize, end: usize) -> Option<Vec<usize>> {
@@ -2185,6 +2191,7 @@ mod mapping_tests {
     /// a read in place waits for a change of mapping.
     #[test]
     fn reads_in_place_and_remappings_wait_for_each_other() {
+        let _alone = super::MAPPING_TEST.lock().unwrap_or_else(|e| e.into_inner());
         // A reader holds; the change does not begin until it lets go.
         let changed = Arc::new(AtomicBool::new(false));
         let reading = title_memory_reading();

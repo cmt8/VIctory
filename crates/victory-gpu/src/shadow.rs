@@ -3304,6 +3304,13 @@ impl Shadow {
         }
     }
 
+    /// Of a copy in the card's memory: the CPU side's mapping and its
+    /// bytes (`crate::scatter` reads the runs it sends up from there).
+    pub(crate) fn card_cpu(&self) -> Option<(*const u8, usize)> {
+        let card = self.card.as_ref()?;
+        Some((self.data.cast_const(), card.size as usize))
+    }
+
     /// Of a copy in the card's memory: the CPU's side (PC memory), the
     /// card side's bytes from before if made yet, and their size.
     pub(crate) fn card_sides(&self) -> Option<(&ID3D12Resource, Option<ID3D12Resource>, u64)> {
@@ -4394,13 +4401,107 @@ mod copy_tests {
     /// the card.
     #[test]
     fn the_card_holds_title_memory_written_back_through_the_runtimes_view() {
-        let (kept, len) = (crate::inplace::KEPT_ALL.load(Ordering::Relaxed), 2 * PAGE);
+        // Not beside the test that holds the remapping lock for long.
+        let _alone = crate::watch::MAPPING_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let all = || crate::inplace::KEPT_ALL.load(Ordering::Relaxed);
+        let (before, len) = (all(), 2 * PAGE);
         if echo_then_a_title_write(told_view(len)) {
             echoes_under_a_writing_title(told_view(len));
             if crate::inplace::back_kept_views() {
-                assert!(crate::inplace::KEPT_ALL.load(Ordering::Relaxed) > kept, "written through the section's view");
+                assert!(all() > before, "written through the section's view");
             }
         }
+    }
+
+    /// A submission sends what changed on a card copy's CPU side up to its
+    /// card side (`Host::card_before`): short runs (by records in one pass
+    /// with `VICTORY_CARD_SCATTER`, a copy each without) and long ones (a
+    /// copy each), with the hash pass after them; the card side then holds
+    /// the CPU side's bytes in the runs and its own elsewhere, byte for
+    /// byte. Run with the pass on and off.
+    #[test]
+    fn a_submission_sends_short_and_long_runs_up_to_a_card_copy() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        if !cards() || !host.card_ready() {
+            return;
+        }
+        let len = 4 * PAGE;
+        let (Some((staging, data)), Some(card), Some(hashes), Some(back)) = (
+            host.shared_buffer(len as u64),
+            host.uav_buffer(len as u64),
+            host.uav_buffer(card_hash_bytes(len as u64)),
+            host.read_back_buffer(len as u64),
+        ) else {
+            panic!("no buffers");
+        };
+        let (old, new): (Vec<u8>, Vec<u8>) =
+            ((0..len).map(|i| (i * 5 + 1) as u8).collect(), (0..len).map(|i| (i * 11 + 7) as u8 ^ 0xa5).collect());
+        // The card side's bytes, from the CPU side, by a list of its own.
+        // SAFETY: the CPU side's mapping, `len` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(old.as_ptr(), data, len) };
+        let list = host.new_list().unwrap();
+        // SAFETY: an open list, live buffers of `len` bytes.
+        unsafe { list.list.CopyBufferRegion(&card, 0, &staging, 0, len as u64) };
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: as above.
+        unsafe { std::ptr::copy_nonoverlapping(new.as_ptr(), data, len) };
+        // Runs of 1-40 bytes (some sharing a dword), and three long ones.
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        let mut at = 3;
+        let mut seed = 99u64;
+        while at + 40 < 3 * PAGE {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let n = 1 + (seed >> 40) as usize % 40;
+            ranges.push((at, at + n));
+            at += n + 1 + (seed >> 52) as usize % 300;
+        }
+        ranges.extend([(3 * PAGE + 5, 3 * PAGE + 9000), (3 * PAGE + 9100, 3 * PAGE + 9101), (3 * PAGE + 20000, 4 * PAGE)]);
+        // SAFETY: a live buffer.
+        let gpu = unsafe { card.GetGPUVirtualAddress() };
+        let mut shadow = Shadow::new(card.clone(), data, gpu, 0x7000_0000_0000, len as u64);
+        // What the copy's drop takes off again.
+        CARD_BYTES[0].fetch_add(len as u64, Ordering::Relaxed);
+        CARD_BYTES[1].fetch_add(card_hash_bytes(len as u64), Ordering::Relaxed);
+        shadow.card = Some(Card {
+            staging: staging.clone(),
+            before: Mutex::new(Some(hashes)),
+            dirty: Mutex::new(ranges.clone()),
+            sent: Mutex::default(),
+            size: len as u64,
+            merged: Mutex::default(),
+        });
+        let shadow = Arc::new(shadow);
+        CARDED.lock().unwrap().push(Arc::downgrade(&shadow));
+        // The next submission sends them; one after it reads the card side.
+        let passes = crate::scatter::DISPATCHES.load(Ordering::Relaxed);
+        let list = host.new_list().unwrap();
+        list.close();
+        host.execute(&[&list]);
+        if crate::scatter::on() {
+            assert!(crate::scatter::DISPATCHES.load(Ordering::Relaxed) > passes, "the short runs went by the pass");
+        }
+        assert!(shadow.card.as_ref().unwrap().dirty.lock().unwrap().is_empty(), "sent");
+        let list = host.new_list().unwrap();
+        // SAFETY: an open list, live buffers of `len` bytes.
+        unsafe { list.list.CopyBufferRegion(&back, 0, &card, 0, len as u64) };
+        list.close();
+        host.execute(&[&list]);
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: the copy ran (execute waits); `len` bytes.
+        let read = unsafe {
+            back.Map(0, Some(&D3D12_RANGE { Begin: 0, End: len }), Some(&mut mapped)).unwrap();
+            std::slice::from_raw_parts(mapped.cast::<u8>(), len).to_vec()
+        };
+        let mut expected = old.clone();
+        for &(a, b) in &ranges {
+            expected[a..b].copy_from_slice(&new[a..b]);
+        }
+        let wrong = read.iter().zip(&expected).position(|(r, e)| r != e);
+        assert_eq!(wrong, None, "the card side holds the runs' bytes and its own elsewhere");
+        drop(shadow);
     }
 
     #[test]

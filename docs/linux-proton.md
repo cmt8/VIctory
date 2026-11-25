@@ -310,6 +310,19 @@ frames later).
   told of, and a write while the runtime is changing a mapping, are
   written at the title's address as before. The status line "copy-back
   writes per frame through the runtime's kept views" counts both.
+- `VICTORY_CARD_SCATTER` (on under Wine, off elsewhere; `=0` as before,
+  `=1` turns it on elsewhere): runs shorter than
+  `VICTORY_CARD_SCATTER_BYTES` (256) that go up from a card copy's CPU
+  side to its card side before a submission (the title's bytes put in
+  around flights' shader writes are mostly a few bytes each) go as
+  records of one dword each (the dword, a mask of the run's bytes, the
+  CPU side's value) applied by one compute pass per copy, instead of a
+  `CopyBufferRegion` each; bytes of a dword outside the run (a shader's
+  on the card) are left as they are. The bytes are taken from the CPU
+  side when the submission is sent rather than when the card runs the
+  copy (what changes in between goes up with the next send either way).
+  The status line "runs under 256 bytes sent up ... by one pass" counts
+  them.
 
 ## Tests
 

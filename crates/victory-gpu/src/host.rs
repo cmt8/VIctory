@@ -1971,6 +1971,10 @@ struct CardPlan {
     /// order of the queue (`QUEUE_ORDER`). Its sends ran ahead of the
     /// submission's lists, and so did every send numbered before it.
     sent_as: u64,
+    /// The upload memory of the short runs' records the sends read
+    /// (`crate::scatter`), alive until the submission has run: a region of
+    /// a slab, or a buffer of its own.
+    _scatter: Option<Result<crate::slab::Region, ID3D12Resource>>,
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -3593,6 +3597,55 @@ impl Host {
             }
         }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
+        // Short runs go up by records in one pass per copy
+        // (`crate::scatter`), the rest by a copy each: the records of all
+        // copies in one piece of upload memory, made here from the CPU
+        // sides as they are now.
+        let short = if crate::scatter::on() && crate::scatter::ready(&self.device) { crate::scatter::shorter_than() } else { 0 };
+        let count: usize = dirty
+            .iter()
+            .filter(|(shadow, _)| shadow.card_cpu().is_some())
+            .flat_map(|(_, ranges)| ranges.iter())
+            .filter(|&&(a, b)| b - a < short)
+            .map(|&(a, b)| crate::scatter::records_of(a, b))
+            .sum();
+        let scatter = (count > 0 && count <= u32::MAX as usize / 3)
+            .then(|| {
+                let bytes = count as u64 * crate::scatter::RECORD;
+                match crate::slab::take(self, bytes) {
+                    Some(region) => Some((region.data(), region.gpu(), Ok(region))),
+                    None => {
+                        let (buffer, data) = self.upload_buffer(bytes)?;
+                        name(&buffer, || "card copy scatter records".into());
+                        // SAFETY: a live buffer.
+                        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+                        Some((data, gpu, Err(buffer)))
+                    }
+                }
+            })
+            .flatten();
+        // Per copy (in `dirty`'s order): its first record and how many.
+        let mut spans: Vec<(usize, usize)> = vec![(0, 0); dirty.len()];
+        if let Some((data, _, _)) = &scatter {
+            // SAFETY: the memory holds `count` records, ours alone.
+            let out = unsafe { std::slice::from_raw_parts_mut(data.cast::<u32>(), count * 3) };
+            let mut at = 0;
+            for (i, (shadow, ranges)) in dirty.iter().enumerate() {
+                let Some((cpu, len)) = shadow.card_cpu() else {
+                    continue;
+                };
+                let first = at;
+                for &(a, b) in ranges.iter().filter(|&&(a, b)| b - a < short && b <= len) {
+                    // SAFETY: the CPU side's mapping holds `len` bytes.
+                    at += unsafe { crate::scatter::write_records(cpu, len, (a, b), &mut out[at * 3..]) };
+                    crate::scatter::STATS[0].fetch_add(1, Ordering::Relaxed);
+                    crate::scatter::STATS[1].fetch_add((b - a) as u64, Ordering::Relaxed);
+                }
+                spans[i] = (first, at - first);
+            }
+            crate::scatter::STATS[2].fetch_add(at as u64, Ordering::Relaxed);
+        }
+        let short = if scatter.is_some() { short } else { 0 };
         if !dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
@@ -3605,15 +3658,37 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
-                    for (shadow, ranges) in &dirty {
+                    for (i, (shadow, ranges)) in dirty.iter().enumerate() {
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
                         };
+                        let (first, records) = spans[i];
+                        let mut copied = false;
                         for &(a, b) in ranges {
-                            list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
+                            if records > 0 && b - a < short && b as u64 <= size {
+                                // In the records.
+                            } else {
+                                list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
+                                copied = true;
+                            }
                             crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
                         }
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
+                        // The buffer is in the common state at the list's
+                        // start (a buffer's state decays to it after each
+                        // submission), and the copies took it to the copy
+                        // destination's.
+                        let mut state = if copied { D3D12_RESOURCE_STATE_COPY_DEST } else { D3D12_RESOURCE_STATE_COMMON };
+                        if records > 0
+                            && let Some((_, gpu, _)) = &scatter
+                        {
+                            list.ResourceBarrier(&[transition(&shadow.buffer, state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+                            state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                            let at = *gpu + first as u64 * crate::scatter::RECORD;
+                            if !crate::scatter::dispatch(&self.device, list, &shadow.buffer, size, at, records as u32) {
+                                fail(format_args!("the scatter pass for card copies went away"));
+                            }
+                        }
                         let Some(before) = before else {
                             continue;
                         };
@@ -3623,10 +3698,10 @@ impl Host {
                         // hashed again, all of them the first time; the
                         // compare after the lists hashes the declared
                         // pieces and flags those whose hash is another.
-                        if !ranges.is_empty() {
+                        if state != D3D12_RESOURCE_STATE_COMMON {
                             list.ResourceBarrier(&[transition(
                                 &shadow.buffer,
-                                D3D12_RESOURCE_STATE_COPY_DEST,
+                                state,
                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                             )]);
                         }
@@ -3694,6 +3769,7 @@ impl Host {
             _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
             lists: used,
             sent_as,
+            _scatter: scatter.map(|(_, _, memory)| memory),
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
@@ -6683,6 +6759,17 @@ impl Meter {
                      of a copy's runs: now {}, {listed:.0} runs so), {compares:.0} compare passes",
                     if rehash_runs() || piece_lists() { "on" } else { "off" },
                     if piece_lists() { "on" } else { "off" }
+                );
+            }
+            let [runs, bytes, records, dispatches] =
+                [0, 1, 2, 3].map(|i| crate::scatter::STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if runs > 0.0 {
+                tracing::info!(
+                    "runs under {} bytes sent up to copies in the card's memory by one pass a copy per frame \
+                     (VICTORY_CARD_SCATTER=0: a copy each): {runs:.0} runs, {:.2} MB, {records:.0} records of a dword, \
+                     {dispatches:.1} dispatches",
+                    crate::scatter::shorter_than(),
+                    bytes / 1e6
                 );
             }
         }

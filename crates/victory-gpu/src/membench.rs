@@ -1162,3 +1162,95 @@ fn back_kept_bench() {
     stop.store(true, Ordering::Relaxed);
     remapper.join().unwrap();
 }
+
+/// What sending 200,000 runs of a few bytes up to a copy in the card's
+/// memory costs both ways (`VICTORY_MEMBENCH=1`, on the host GPU the tests
+/// use): a `CopyBufferRegion` each, recorded and run, against their
+/// records made from the CPU side (`crate::scatter::write_records`) and one
+/// pass. Run 232629 put 219,176 runs of about 6 bytes in a frame.
+#[test]
+fn scatter_bench() {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::core::Interface;
+    if !on() {
+        return;
+    }
+    let Some(host) = crate::host::host() else {
+        return;
+    };
+    if !crate::scatter::ready(&host.device) {
+        println!("membench: no scatter pass here");
+        return;
+    }
+    const SIZE: usize = 16 << 20;
+    let device = &host.device;
+    let (cpu_buffer, cpu) = host.shared_buffer(SIZE as u64).unwrap();
+    // SAFETY: the mapping's `SIZE` bytes.
+    unsafe { std::ptr::write_bytes(cpu, 0x5a, SIZE) };
+    let card = host.uav_buffer(SIZE as u64).unwrap();
+    // Runs of 2-10 bytes, 2-17 bytes apart, as many as fit up to 200,000.
+    let mut runs = Vec::new();
+    let (mut at, mut seed) = (0usize, 7u64);
+    while runs.len() < 200_000 {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let n = 2 + (seed >> 40) as usize % 9;
+        if at + n > SIZE {
+            break;
+        }
+        runs.push((at, at + n));
+        at += n + 2 + (seed >> 52) as usize % 16;
+    }
+    let count: usize = runs.iter().map(|&(a, b)| crate::scatter::records_of(a, b)).sum();
+    let (records, data) = host.upload_buffer(count as u64 * crate::scatter::RECORD).unwrap();
+    // SAFETY: plain objects on the host's device.
+    unsafe {
+        let queue: ID3D12CommandQueue = device
+            .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() })
+            .unwrap();
+        let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+        let list: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).unwrap();
+        list.Close().unwrap();
+        let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+        let mut value = 0u64;
+        let mut run = |pass: bool| -> (f64, f64, f64) {
+            allocator.Reset().unwrap();
+            list.Reset(&allocator, None).unwrap();
+            let started = Instant::now();
+            let mut made = 0.0;
+            if pass {
+                let out = std::slice::from_raw_parts_mut(data.cast::<u32>(), count * 3);
+                let mut n = 0;
+                for &r in &runs {
+                    n += crate::scatter::write_records(cpu, SIZE, r, &mut out[n * 3..]);
+                }
+                made = started.elapsed().as_secs_f64() * 1e3;
+                list.ResourceBarrier(&[crate::host::transition(&card, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+                assert!(crate::scatter::dispatch(device, &list, &card, SIZE as u64, records.GetGPUVirtualAddress(), n as u32));
+            } else {
+                for &(a, b) in &runs {
+                    list.CopyBufferRegion(&card, a as u64, &cpu_buffer, a as u64, (b - a) as u64);
+                }
+            }
+            list.Close().unwrap();
+            let recorded = started.elapsed().as_secs_f64() * 1e3 - made;
+            let started = Instant::now();
+            queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+            value += 1;
+            queue.Signal(&fence, value).unwrap();
+            while fence.GetCompletedValue() < value {
+                std::thread::yield_now();
+            }
+            (made, recorded, started.elapsed().as_secs_f64() * 1e3)
+        };
+        run(false);
+        run(true);
+        for pass in [false, true, false, true] {
+            let (made, recorded, ran) = run(pass);
+            println!(
+                "membench: {} runs of 2-10 bytes ({count} dwords) into a card buffer, {}: records made in {made:.1} ms, recorded in {recorded:.2} ms, run in {ran:.2} ms",
+                runs.len(),
+                if pass { "records and one pass" } else { "a CopyBufferRegion each" }
+            );
+        }
+    }
+}
