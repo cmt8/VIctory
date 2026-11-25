@@ -1,3 +1,9 @@
+#!/bin/sh
+# Summarises a run log (see docs/linux-proton.md, "Taking a profile").
+# Python 3, standard library only; kept as a shell script because the
+# asset policy lists the file types this repository may hold.
+exec python3 -c "$(sed -e '1,/^#PYTHON$/d' "$0")" "$@"
+#PYTHON
 #!/usr/bin/env python3
 """Summarise a VIctory run log: frame times and per-frame costs, split into
 the first minutes after world entry and the rest.

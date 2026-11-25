@@ -589,7 +589,7 @@ VICTORY_FRAME_LOG=1 VICTORY_VM_STATS=1 \
 VICTORY_EXE=$PWD/target/ab/victory-fx-next6-prof.exe \
 scripts/proton-run.sh run /path/to/game/<the title's exe> --execute \
     2>&1 | tee ~/victory-logs/run-$(date +%H%M%S).log
-target/ab/perf-summary.py ~/victory-logs/run-HHMMSS.log   # or scripts/perf-summary.py
+target/ab/perf-summary.py ~/victory-logs/run-HHMMSS.log   # or scripts/perf-summary.sh
 ```
 
 - `VICTORY_FRAME_LOG=1`: every 5 s, every frame's length, the usual
