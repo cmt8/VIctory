@@ -377,6 +377,66 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 /// memory is looked at again, each counted from the look before.
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
 
+/// [`RECHECK_FRAMES`] with [`recheck_pages`]: two more looks, about 1,200
+/// and 3,600 frames later. Of 23,001 textures found changed in run-212937
+/// (Wine, 4-5 frames a second), the share found at each of the five looks
+/// fell by half only (111, 58, 27, 15, 12 of the 200 logged): changes
+/// went on past the last look, and those stayed on the card as they were.
+const RECHECK_FRAMES_LONGER: [u64; 7] = [4, 12, 40, 120, 400, 1200, 3600];
+
+/// Whether an uploaded texture picked by index is looked at again with
+/// [`recheck_print`] and [`RECHECK_FRAMES_LONGER`]: on by default under
+/// Wine, off elsewhere; `VICTORY_HEAP_RECHECK_PAGES=1` or `=0` says.
+///
+/// The look's fingerprint (`texture::fingerprint`) reads 16 KiB at the
+/// texture's start, middle and end. A texture the title fills after its
+/// first upload page by page (64 KiB, a tile of its layout) changes
+/// outside those windows in most of its pages; one changed there only
+/// kept the old contents in those tiles for the run: square patches of
+/// zero or other blocks on a surface.
+pub(crate) fn recheck_pages() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var_os("VICTORY_HEAP_RECHECK_PAGES") {
+        Some(v) => v == "1",
+        None => crate::host::on_wine(),
+    })
+}
+
+/// The frames between looks at an uploaded texture (see [`recheck_pages`]).
+fn recheck_frames() -> &'static [u64] {
+    if recheck_pages() { &RECHECK_FRAMES_LONGER } else { &RECHECK_FRAMES }
+}
+
+/// The fingerprint a look compares: `texture::fingerprint`, and with
+/// [`recheck_pages`] also the first 512 bytes of every 64 KiB page of the
+/// memory (of at most 256 pages spread over it: a page in every 64 KiB
+/// up to 16 MiB). 128 KiB at most more per look, each piece read through
+/// the kernel (a page not there reads as zeros).
+pub(crate) fn recheck_print(at: u64, len: u64) -> u64 {
+    let print = crate::texture::fingerprint(at, len);
+    if !recheck_pages() || len <= 48 << 10 {
+        return print;
+    }
+    const PAGE: u64 = 64 << 10;
+    const PIECE: usize = 512;
+    const MOST: u64 = 256;
+    let step = len.div_ceil(MOST).next_multiple_of(PAGE);
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&print.to_le_bytes());
+    let mut piece = [0u8; PIECE];
+    let mut from = 0;
+    while from < len {
+        let n = (len - from).min(PIECE as u64) as usize;
+        piece[..n].fill(0);
+        crate::host::copy_mapped(piece.as_mut_ptr(), (at + from) as *const u8, n, false);
+        hasher.update(&piece[..n]);
+        from += step;
+    }
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&hasher.finalize().as_bytes()[..8]);
+    u64::from_le_bytes(first) | 1
+}
+
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
 pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -1826,9 +1886,9 @@ impl State {
             // only a changed texture is uploaded again.
             // `VICTORY_HEAP_RECHECK=0`: uploaded once, as before.
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
-                if crate::texture::fingerprint(at, len) == print {
+                if recheck_print(at, len) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
-                    match RECHECK_FRAMES.get(usize::from(looks) + 1) {
+                    match recheck_frames().get(usize::from(looks) + 1) {
                         Some(wait) => {
                             host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
                         }
@@ -1987,8 +2047,8 @@ impl State {
             match memory {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
-                    let print = crate::texture::fingerprint(at, len);
-                    host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[0], (at, len), print, 0, frame);
+                    let print = recheck_print(at, len);
+                    host.texture_slot_recheck(index, write, frame + recheck_frames()[0], (at, len), print, 0, frame);
                 }
                 None => host.texture_slot_done(index, write, again),
             }

@@ -110,6 +110,13 @@ logo then stutters).
 In every build, a draw of depth-tested geometry whose pixel shader does
 not translate (or that the host refuses) is drawn with that debug shader
 instead of dropped; `VICTORY_PS_FALLBACK=0` turns that off.
+Under Wine, a texture picked by index that was uploaded whole is looked
+at again seven times (4 to about 3,600 frames after), and each look also
+reads the first 512 bytes of every 64 KiB page of it: a texture the title
+fills page by page after its first upload is uploaded again when any page
+changes. `VICTORY_HEAP_RECHECK_PAGES=0` looks five times at three 16 KiB
+windows, as on Windows (`=1` turns it on there).
+
 `VICTORY_DROP_REASONS=1` (any build; always on in the diagnostics build)
 follows the frame line every five seconds with up to 40 lines
 `dropped N/frame without a host pipeline: <why>`: the shaders of a pipeline

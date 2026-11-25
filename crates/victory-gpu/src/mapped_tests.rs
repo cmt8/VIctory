@@ -186,3 +186,20 @@ fn reserved_and_inaccessible_pages_are_holes() {
         VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
     }
 }
+
+#[test]
+fn a_look_at_an_uploaded_texture_sees_a_page_filled_outside_its_windows() {
+    // A 1 MiB texture: the plain fingerprint reads 16 KiB at 0, 512 KiB
+    // and the end; the title fills its sixth page afterwards.
+    let mut memory = vec![0u8; 1 << 20];
+    let (at, len) = (memory.as_ptr() as u64, memory.len() as u64);
+    let (plain, print) = (crate::texture::fingerprint(at, len), crate::draw::recheck_print(at, len));
+    memory[5 * PAGE..6 * PAGE].fill(0x33);
+    let at = memory.as_ptr() as u64;
+    assert_eq!(crate::texture::fingerprint(at, len), plain, "the windows do not cover the page");
+    if crate::draw::recheck_pages() {
+        assert_ne!(crate::draw::recheck_print(at, len), print, "a look with pages sees it");
+    } else {
+        assert_eq!(crate::draw::recheck_print(at, len), print);
+    }
+}
