@@ -81,6 +81,7 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_FIRST_HALF",
                     "VICTORY_FIRSTLANE_OWN",
                     "VICTORY_HALF_SUM_PRESENT",
+                    "VICTORY_BUFFER_GUARD",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');

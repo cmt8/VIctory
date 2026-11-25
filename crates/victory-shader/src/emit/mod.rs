@@ -49,6 +49,14 @@
 //!   title's view description says. Typed-format loads from heap
 //!   descriptors (1,024 world compute programs, ray-tracing material
 //!   resolves) read raw views this way.
+//! * **Buffer views at computed heap indices** (linux/fx-next4, after
+//!   upstream d71c3889): a buffer the program reads through a descriptor it
+//!   takes from the view heap itself (`ResourceHeap`, on every path) first
+//!   looks its slot up in the stride table (root SRV `t`[`SLOT_STRIDES`]);
+//!   where that holds 0 (no buffer view there) it reads the host's null raw
+//!   buffer SRV (UAV) at [`null_buffer_views`] instead, two slots the host
+//!   keeps right below the null slot. Only with a null slot set
+//!   ([`view_heap_limit`]) and [`buffer_guard`] on.
 //!
 //! * **Texture atomics** use a scalar integer UAV. The host binds R32_UINT
 //!   for 32-bit operations and R32G32_UINT for 64-bit operations. The latter
@@ -115,8 +123,8 @@ pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDES_COUNT, SLOT_VIEWS, SLOT_VIEWS_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
-    USER_VIEW_BIAS,
-    set_view_heap_limit, view_heap_limit,
+    USER_VIEW_BIAS, NULL_BUFFER_SLOTS,
+    null_buffer_views, set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
@@ -182,6 +190,21 @@ pub fn group_sync() -> u8 {
 ///   32 a first-lane read of two host waves without the round that asks
 ///   which half has a lane (where every lane has one).
 ///
+/// Whether a buffer the program reads from the view heap at an index it
+/// computes is read through the host's null buffer view where the heap's
+/// table of strides says the slot holds no buffer view
+/// (`VICTORY_BUFFER_GUARD`; on, `=0` off). The index comes from data; a
+/// texture view read as a buffer descriptor is a wild address (under
+/// vkd3d-proton with embedded mutable descriptors on RADV a raw buffer is
+/// the 16 bytes at the slot's raw-buffer offset, inside a sampled image
+/// descriptor's upper half, and a typed buffer its first 16 bytes). After
+/// upstream VIctory d71c3889 (Marvis) and pull requests #2068 and #2128
+/// (fuzeofficial). Part of the translation: the shader cache keys on it.
+pub fn buffer_guard() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BUFFER_GUARD").is_none_or(|v| v != "0"))
+}
+
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
 pub fn shader_opt() -> u32 {

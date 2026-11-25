@@ -142,6 +142,20 @@ pub fn view_heap_limit() -> u32 {
     VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Slots just below the null slot ([`view_heap_limit`]) the host keeps for
+/// its null raw buffer views; no title or dynamic slot lies there.
+pub const NULL_BUFFER_SLOTS: u32 = 2;
+
+/// The view heap slots of the host's null raw buffer SRV and UAV: a shader
+/// that reads a buffer from the view heap at an index it computes reads
+/// one of them instead where the slot holds no buffer view (module notes,
+/// "Buffer views at computed heap indices"). Right below the null slot;
+/// `None` without one (no limit set: such shaders read the index as it is).
+pub fn null_buffer_views() -> Option<(u32, u32)> {
+    let null = view_heap_limit();
+    (null > NULL_BUFFER_SLOTS).then(|| (null - 1, null - 2))
+}
+
 pub(crate) struct Shader {
     pub m: Module,
     pub t: Types,

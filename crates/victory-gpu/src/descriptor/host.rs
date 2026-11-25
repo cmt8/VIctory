@@ -889,6 +889,10 @@ impl HostHeap {
         } else {
             victory_shader::emit::view_heap_limit()
         };
+        // Below the null slot, two slots for the null raw buffer views
+        // (`victory_shader::emit::null_buffer_views`): no title or dynamic
+        // slot lies there.
+        let kept = if null == 0 { 0 } else { victory_shader::emit::NULL_BUFFER_SLOTS };
         let (heap, count, size) = if null == 0 {
             match make(count + extra) {
                 Ok(heap) => (heap, count, count + extra),
@@ -899,13 +903,13 @@ impl HostHeap {
             }
         } else {
             let size = null + 1;
-            let fitted = if count + extra <= null {
+            let fitted = if count + extra + kept <= null {
                 count
             } else {
                 // shortcut: descriptors past the host's limit are left out; a title that reaches
                 // them needs remapping. They read the null slot instead.
                 tracing::warn!(count, "host view heap capped at {size}; views past it read a null slot");
-                null - extra
+                null - extra - kept
             };
             match make(size) {
                 Ok(heap) => (heap, fitted, size),
@@ -997,6 +1001,14 @@ impl HostHeap {
             tracing::warn!(error = %e, "host descriptor heap not made null");
         }
         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
+        if !sampler
+            && kept != 0
+            && let Some((srv, uav)) = victory_shader::emit::null_buffer_views()
+            && uav >= count + extra
+            && srv < size
+        {
+            null_buffers(h.cpu(srv), h.cpu(uav));
+        }
         Some(h)
     }
 
@@ -2847,6 +2859,46 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 /// shortcut: slots with no view at all (kind unknown) get this null 2D
 /// view; null buffer views there did not stop the world's low-address
 /// page faults (2026-11-24, run w10), so they are not the cause.
+/// The host's null raw buffer SRV at `srv` and UAV at `uav`, read by
+/// shaders instead of a view heap slot that holds no buffer view where they
+/// read a buffer at an index they compute
+/// (`victory_shader::emit::null_buffer_views`; after upstream d71c3889).
+/// Under vkd3d-proton a null buffer view is its null template of a typed
+/// and a raw descriptor both (`vkd3d_create_buffer_srv_embedded`), so the
+/// raw ones serve typed and structured reads too.
+fn null_buffers(srv: D3D12_CPU_DESCRIPTOR_HANDLE, uav: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    let Some(host) = host() else { return };
+    let srv_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_TYPELESS,
+        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_SRV {
+                NumElements: 1,
+                Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                ..Default::default()
+            },
+        },
+    };
+    let uav_desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_TYPELESS,
+        ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_UAV {
+                NumElements: 1,
+                Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                ..Default::default()
+            },
+        },
+    };
+    // SAFETY: slots of our heap; null resources are allowed with a desc.
+    unsafe {
+        host.device.CreateShaderResourceView(None::<&ID3D12Resource>, Some(&srv_desc), srv);
+        host.device
+            .CreateUnorderedAccessView(None::<&ID3D12Resource>, None::<&ID3D12Resource>, Some(&uav_desc), uav);
+    }
+}
+
 fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
     let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {

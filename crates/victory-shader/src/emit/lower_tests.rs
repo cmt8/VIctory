@@ -605,6 +605,62 @@ fn small_floats_widen_as_halves() {
     assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
 }
 
+/// A buffer read through a descriptor the program takes from the view
+/// heap at an index it computes looks its slot up in the stride table
+/// and reads the host's null buffer view where that says no buffer
+/// view is there; one taken from a table is read as before, and so is
+/// everything while no null slot is set.
+#[test]
+fn heap_buffers_read_at_computed_indices_are_guarded() {
+    // The descriptor of slot 3 of the view heap (s0, its base address
+    // as the program sees it) into s[8:11], a scalar buffer load
+    // through it, and the result into LDS.
+    let words = [
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0060, // s_load_dwordx4 s[8:11], s[4:5], 0x60
+        0xF420_0304,
+        0xFA00_0000, // s_buffer_load_dword s12, s[8:11], 0x0
+        0x7E02_020C, // v_mov_b32 v1, s12
+        0xD834_0000,
+        0x0000_0100, // ds_write_b32 v0, v1
+        S_ENDPGM,
+    ];
+    let heap = || vec![root(RootType::ResourceHeap, 0, 0)];
+    let table = || vec![root(RootType::Table, 0, 0)];
+    let table_used = || {
+        vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }]
+    };
+    let nulls = |n: Option<(u32, u32)>| super::GUARD_NULLS.with(|c| c.set(n));
+    nulls(Some((999_999, 999_998)));
+    let guarded = lower_with(&words, heap(), vec![]).expect("a heap read lowers");
+    let tabled = lower_with(&words, table(), table_used()).expect("a table read lowers");
+    nulls(None);
+    let unset = (super::super::view_heap_limit() == 0)
+        .then(|| lower_with(&words, heap(), vec![]).expect("a heap read lowers"));
+    assert_eq!(guarded.buffer_guards, 1, "the heap read is guarded");
+    // Where the validator is found, the guarded program passes it.
+    use super::super::validator::Validator;
+    if let Ok(mut v) = Validator::load(Validator::default_path().as_deref()) {
+        v.validate(&mut guarded.dxil.clone()).expect("the guarded heap read validates");
+        eprintln!("the guarded heap read validates");
+    }
+    assert_eq!(tabled.buffer_guards, 0, "a table read is not");
+    if let Some(unset) = unset {
+        assert_eq!(unset.buffer_guards, 0, "nor anything without a null slot");
+    }
+}
+
 #[test]
 fn all_lane_mesh_gs_alloc_req_preserves_lds_barrier() {
     let lower_mesh = |words: &[u32]| -> Lowered {

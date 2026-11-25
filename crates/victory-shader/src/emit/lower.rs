@@ -77,6 +77,9 @@ pub(crate) struct Lowered {
     /// Number of raw UAV loads emitted by `smem`.
     #[cfg(test)]
     pub smem_raw_uavs: usize,
+    /// Buffer handles guarded by the stride table (`Lower::buffer_guard`).
+    #[cfg(test)]
+    pub buffer_guards: usize,
 }
 
 pub(crate) struct Parts<'a> {
@@ -229,6 +232,8 @@ struct Lower<'a> {
     scalar_wave_first: usize,
     #[cfg(test)]
     smem_raw_uavs: usize,
+    #[cfg(test)]
+    buffer_guards: usize,
     /// Per IR block: a `done` export is behind every lane entering it.
     exported: Vec<bool>,
     /// Reverse-postorder index per IR block.
@@ -1576,6 +1581,8 @@ impl<'a> Lower<'a> {
             scalar_wave_first: 0,
             #[cfg(test)]
             smem_raw_uavs: 0,
+            #[cfg(test)]
+            buffer_guards: 0,
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
@@ -2344,6 +2351,8 @@ impl<'a> Lower<'a> {
             scalar_wave_first: self.scalar_wave_first,
             #[cfg(test)]
             smem_raw_uavs: self.smem_raw_uavs,
+            #[cfg(test)]
+            buffer_guards: self.buffer_guards,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -6467,6 +6476,7 @@ impl<'a> Lower<'a> {
                     return Ok(h);
                 }
                 let index = self.heap_index(*load, *first, sampler)?;
+                let index = self.buffer_guard(src, index, sampler, props);
                 // A waterfall loop's load at the first lane's offset reads
                 // each lane's own entry (see `resource::Waterfall`).
                 let per_lane = self.x.res.waterfall.loads.contains(load);
@@ -6533,7 +6543,8 @@ impl<'a> Lower<'a> {
             Source::Phi { block, args } => {
                 let _ = site;
                 let phi = self.descriptor_phi(*block, args, sampler, 8)?;
-                Ok(self.s.heap_handle(self.cur, phi, sampler, false, props))
+                let index = self.buffer_guard(src, phi, sampler, props);
+                Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
             }
             Source::Select { scc, args } => {
                 // The heap index of each choice, picked by SCC (uniform).
@@ -6551,6 +6562,7 @@ impl<'a> Lower<'a> {
                 let set = self.heap_index(a, fa, sampler)?;
                 let clear = self.heap_index(b, fb, sampler)?;
                 let index = self.s.m.select(self.cur, cond, set, clear);
+                let index = self.buffer_guard(src, index, sampler, props);
                 Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
             }
             Source::Fetched { .. } | Source::Lanes { .. } | Source::LanePhi { .. } => {
@@ -6558,9 +6570,76 @@ impl<'a> Lower<'a> {
                 // reads it from the first active lane): each lane's heap
                 // index, non-uniform.
                 let index = self.lane_heap_index(src, sampler)?;
+                let index = self.buffer_guard(src, index, sampler, props);
                 Ok(self.s.heap_handle(self.cur, index, sampler, true, props))
             }
         }
+    }
+
+    /// Whether every descriptor `src` picks from is taken from the view
+    /// heap itself at an index the program computes (root type
+    /// `ResourceHeap`): the title's own slot numbers, all of which the
+    /// stride table covers (a table's descriptors may be ones made afresh
+    /// in the host's dynamic slots, which it does not).
+    fn from_view_heap(&self, src: &Source) -> bool {
+        let leaves = src.leaves();
+        !leaves.is_empty()
+            && leaves.iter().all(|leaf| match leaf {
+                Source::Loaded { load, .. } | Source::Fetched { load, .. } => self
+                    .scalar
+                    .get(load)
+                    .and_then(|a| self.x.native.layout.get(a.param))
+                    .is_some_and(|p| p.root == RootType::ResourceHeap),
+                _ => false,
+            })
+    }
+
+    /// The heap index to read a buffer view at, for a descriptor `src` the
+    /// program takes from the view heap at an index it computes (module
+    /// notes, "Buffer views at computed heap indices"): `index`, or the
+    /// host's null raw buffer view where the stride table says the slot
+    /// holds no buffer view. The index comes from data, and a slot holding
+    /// a texture view read as a buffer descriptor is a wild address, a GPU
+    /// page fault. After upstream VIctory d71c3889 (Marvis), with the
+    /// typed-null refinements of #2068 and #2128 (fuzeofficial) left to the
+    /// host's null template: under vkd3d-proton a null buffer view holds a
+    /// null typed and a null raw descriptor both
+    /// (`vkd3d_create_buffer_srv_embedded`), so one raw view serves typed,
+    /// raw and structured reads.
+    fn buffer_guard(&mut self, src: &Source, index: V, sampler: bool, props: (u32, u32)) -> V {
+        // Typed, raw and structured buffers (DXIL resource kinds 10 to 12).
+        if sampler || !(10..=12).contains(&(props.0 & 0xFF)) || !super::buffer_guard() {
+            return index;
+        }
+        let Some((null_srv, null_uav)) = guard_nulls() else {
+            return index;
+        };
+        if !self.from_view_heap(src) {
+            return index;
+        }
+        #[cfg(test)]
+        {
+            self.buffer_guards += 1;
+        }
+        let c = self.cur;
+        // Inside the table whatever the index, as `slot_stride` reads it.
+        let last = self.s.m.i32(super::shader::SLOT_STRIDES_COUNT - 1);
+        let i32t = self.s.t.i32;
+        let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[index, last]);
+        self.s.m.tag(slot, Tag::Clamp);
+        let two = self.s.m.i32(2);
+        let byte = self.s.m.bin(c, Bin::Shl, slot, two);
+        let h = self.s.root_srv_handle(super::shader::SLOT_STRIDES);
+        let iu = self.s.m.undef(self.s.t.i32);
+        let mask = self.s.m.i8(1);
+        let align = self.s.m.i32(4);
+        let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[h, byte, iu, mask, align]);
+        let f = self.s.m.extract(c, r, 0);
+        let stride = self.as_int(f);
+        let zero = self.s.m.i32(0);
+        let none = self.s.m.cmp(c, pred::EQ, stride, zero);
+        let null = self.s.m.i32(if props.0 & 0x1000 != 0 { null_uav } else { null_srv });
+        self.s.m.select(c, none, null, index)
     }
 
     /// The heap index a descriptor phi picks. Each predecessor computes its
@@ -11523,6 +11602,24 @@ fn interp_mode(kind: Barycentric) -> Option<u8> {
         Barycentric::LinearSample => 7,
         Barycentric::PerspectivePullModel => return None,
     })
+}
+
+/// The heap slots of the host's null raw buffer SRV and UAV
+/// (`super::null_buffer_views`); in tests, also those a test on this
+/// thread names ([`GUARD_NULLS`]), so that it need not set the process's
+/// view heap limit under the other tests.
+fn guard_nulls() -> Option<(u32, u32)> {
+    #[cfg(test)]
+    if let Some(nulls) = GUARD_NULLS.with(std::cell::Cell::get) {
+        return Some(nulls);
+    }
+    super::null_buffer_views()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// See [`guard_nulls`].
+    static GUARD_NULLS: std::cell::Cell<Option<(u32, u32)>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
