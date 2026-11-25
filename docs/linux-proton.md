@@ -678,6 +678,13 @@ before some 950 times in eight minutes of run b3.
   destination of one still in the air: N". What it does not see: work of
   ours that reads title memory outside a submission's steps finds the
   destination's bytes when the flight has landed, not at once.
+- From fxceless/victory-fork#1066 (UwUCammie): `VICTORY_WIDE_MERGE=1`
+  (off by default) now also spreads the relay thread's merges over the
+  snapshot threads (`relay_card_back`, `relay_card_inflight`,
+  `relay_hand_back`), pieces of one 64 KiB title page always in one job and
+  in order; the carded merges take a read lock of their copy and the merge
+  under shader writes the write lock. Run auto-c1 had the relay "28.2 ms
+  landing in all" a frame; the PR measured 28-33 to 17 ms on an RX 7900 XT.
 
 ### Taking a profile (linux/fx-next6-prof)
 
