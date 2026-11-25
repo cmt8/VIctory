@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// Counters since the last line.
-pub enum C {
+pub(crate) enum C {
     Submissions,
     Copies,
     CopyBytes,
@@ -37,17 +37,11 @@ pub enum C {
     TexWatched,
     TexHashed,
     TexChanged,
-    /// `XMemMapPhysicalPagesScatter` calls, the pages they name, and the
-    /// `XMemMapPhysicalPages` calls they made of them (fewer than the pages
-    /// when consecutive addresses ride one call).
-    Scatter,
-    ScatterPages,
-    ScatterMaps,
 }
-const COUNTERS: usize = 25;
+const COUNTERS: usize = 22;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
-pub fn add(c: C, n: u64) {
+pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
 }
 
@@ -108,8 +102,7 @@ pub(crate) fn log(frames: f64) {
          {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
          {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
          unchanged; {:.1} fallbacks; {:.0} guard faults; textures {:.1} MB watched and \
-         changed, {:.1} MB hashed, {:.1} MB of them changed; \
-         {:.1} page scatters {:.0} pages in {:.1} map calls",
+         changed, {:.1} MB hashed, {:.1} MB of them changed",
         c[C::Submissions as usize],
         c[C::Copies as usize],
         mb(c[C::CopyBytes as usize]),
@@ -133,9 +126,6 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexWatched as usize]),
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
-        c[C::Scatter as usize],
-        c[C::ScatterPages as usize],
-        c[C::ScatterMaps as usize],
     );
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
