@@ -2134,8 +2134,10 @@ void main(uint3 gid : SV_GroupID, uint t : SV_GroupIndex) {
 
 /// Whether the card's hash and compare passes over copies in the card's
 /// memory give each 64 KiB piece a group of 64 threads
-/// ([`CARD_COMPARE_WIDE`]; `VICTORY_CARD_HASH_WIDE=1`, off by default)
-/// rather than one thread.
+/// ([`CARD_COMPARE_WIDE`]; on by default, `VICTORY_CARD_HASH_WIDE=0` turns
+/// it off) rather than one thread. If the wide shader cannot be made, the
+/// one-thread shader is made instead ([`Host::make_card_work`]); either way
+/// one of the two holds for the whole run.
 ///
 /// With one thread a piece, a pass walks its pieces 16 bytes at a time,
 /// 4,096 loads one after the other, each waiting for the last: it takes
@@ -2145,10 +2147,12 @@ void main(uint3 gid : SV_GroupID, uint t : SV_GroupIndex) {
 /// passes a frame (17,164 pieces compared). With a group a piece, a pass
 /// takes 64 such steps, the group's loads side by side in one 1 KiB row.
 /// What it costs: 64 times the threads, idle where a piece ends early,
-/// and a fold of 64 hashes by one thread.
+/// and a fold of 64 hashes by one thread. Under Proton (runs auto-c1 to
+/// c6, RX 7900 XTX) the hash and compare lists went from 58 to about 5 ms
+/// of the card's time a frame, with the same pieces flagged and fetched.
 pub(crate) fn card_hash_wide() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_HASH_WIDE").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_HASH_WIDE").is_none_or(|v| v != "0"))
 }
 
 /// The groups of a hash or compare pass over `pieces` pieces: one thread a
@@ -4656,12 +4660,31 @@ impl Host {
         })
     }
 
+    /// The card work, made once a run ([`Host::card_ready`]): with
+    /// [`card_hash_wide`] the wide compare, and the one-thread compare if
+    /// that cannot be made (another compiler). Every hash of the run is
+    /// made and compared by the one shader `CardWork::pso` holds, so the
+    /// two kinds of hash never meet.
     fn make_card_work(&self) -> windows::core::Result<CardWork> {
-        let wide = card_hash_wide();
-        if wide {
-            tracing::info!("the card's hash and compare passes give each piece a group of 64 threads (VICTORY_CARD_HASH_WIDE=1)");
+        if !card_hash_wide() {
+            return self.make_card_work_as(false);
         }
-        self.make_card_work_as(wide)
+        match self.make_card_work_as(true) {
+            Ok(work) => {
+                tracing::info!(
+                    "the card's hash and compare passes give each piece a group of 64 threads (VICTORY_CARD_HASH_WIDE=0 \
+                     turns it off)"
+                );
+                Ok(work)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "the wide hash and compare shader could not be made: one thread a piece, as with VICTORY_CARD_HASH_WIDE=0"
+                );
+                self.make_card_work_as(false)
+            }
+        }
     }
 
     /// [`Host::make_card_work`] with the one or the other compare shader.

@@ -617,12 +617,15 @@ Neither says what the card runs. Three switches, all off by default:
   and a clamp (the clamps' resolves wait for the list's end);
   `VICTORY_GPU_TIMES=lists` leaves the clamps' pairs out (some 4,000 a
   frame), to see what the meter itself costs.
-- `VICTORY_CARD_HASH_WIDE=1`: the hash and compare passes over copies in
-  the card's memory give each 64 KiB piece a group of 64 threads instead
-  of one thread (64 steps of loads side by side instead of 4,096 one after
-  the other). The same pieces are flagged; the hashes are another kind, so
-  the switch holds for the whole run. With `VICTORY_GPU_TIMES=1` the send-
-  and-hash and compare lists' times show what it is worth.
+- `VICTORY_CARD_HASH_WIDE` (on by default from linux/fx-next10-wait; `=0`
+  turns it off): the hash and compare passes over copies in the card's
+  memory give each 64 KiB piece a group of 64 threads instead of one
+  thread (64 steps of loads side by side instead of 4,096 one after the
+  other). The same pieces are flagged; the hashes are another kind, so
+  the switch holds for the whole run, and if the wide shader cannot be
+  built (another compiler) the one-thread shader is made instead and the
+  log says so. Runs auto-c1 to c6: hash and compare 58 to about 5 ms of the
+  card's time a frame, frame 191 to 158 ms.
 - `VICTORY_FILL_WAIT=0`: fills of upload memory never wait for flights;
   a fill that read bytes a flight then changed is counted ("since the
   start" on the fills line) and the first eight are named, and fills go on
