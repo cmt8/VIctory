@@ -131,6 +131,11 @@ A compute program's wave sum of 16-bit floats where some lanes have left
 host of 64-lane waves, bit for bit as the console adds it;
 `VICTORY_HALF_SUM_PRESENT=0` refuses it as before (its dispatches are then
 dropped). Part of the shader cache key.
+A `DispatchMeshX` whose group counts are in GPU memory is dropped (counted
+with the indirect executions dropped, and named in the drop reasons);
+`VICTORY_MESH_INDIRECT=1` runs it as an indirect execution of one record,
+as upstream #1749 does: that record layout is unchecked against the title,
+and the first Linux run with it ended in a GPU page fault and reset.
 `VICTORY_PIPELINE_WAIT_MS` sets how long a frame may wait for pipelines
 being made (500 by default; 0 never waits, pipelines then appear a few
 frames later).

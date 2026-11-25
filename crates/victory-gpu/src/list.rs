@@ -1610,9 +1610,15 @@ mod state {
         super::count_draw();
         if indirect != 0 {
             let mut ran = false;
-            with_state(this, |list, s| {
-                ran = s.execute_indirect(list, (MESH_INDIRECT, MESH_RECORD, 1), indirect, None);
-            });
+            if mesh_indirect() {
+                with_state(this, |list, s| {
+                    ran = s.execute_indirect(list, (MESH_INDIRECT, MESH_RECORD, 1), indirect, None);
+                });
+            } else if crate::pipeline::drop_reasons() {
+                crate::pipeline::note_why(
+                    "an indirect DispatchMeshX (VICTORY_MESH_INDIRECT=1 runs them)".to_owned(),
+                );
+            }
             if !ran {
                 super::INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1626,6 +1632,21 @@ mod state {
             return;
         }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
+    }
+    /// `VICTORY_MESH_INDIRECT=1`: a `DispatchMeshX` whose group counts are
+    /// in GPU memory runs as an indirect execution of one record (above).
+    /// Off by default, so such dispatches are dropped (counted with the
+    /// indirect executions dropped, and named in the drop reasons) as
+    /// before upstream #1749: the record's layout is a guess not checked
+    /// against the title, and a guess that is wrong hands a mesh program
+    /// any group count up to 65,535 (the clamp's most), whose reads past the
+    /// title's meshlet data the host does not bound everywhere. The first
+    /// run with it (owner's run 220839) ended in a GPU page fault and a ring
+    /// timeout; nothing there names this path, so it is off until it is
+    /// shown safe, not because it is shown wrong.
+    fn mesh_indirect() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_MESH_INDIRECT").is_some_and(|v| v == "1"))
     }
     /// The indirect argument kind of a mesh dispatch
     /// (`State::execute_indirect`).
