@@ -60,7 +60,15 @@ pub(crate) struct HostHeap {
     /// slot, for shaders that pick a buffer by an index they compute
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
     /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
+    /// Shaders read host slot `i` as a buffer where dword `i` is not 0,
+    /// so it says what the host slot shows, not what the title wrote
+    /// ([`HostHeap::before_write`], [`HostHeap::after_write`]).
     strides: Option<(ID3D12Resource, u64, usize)>,
+    /// View heaps, per title slot (up to `SLOT_STRIDES_COUNT`): the
+    /// `strides` dword as last written (bits 0 to 30), and bit 31 while
+    /// the host slot shows a texture's descriptor ([`SHOWS_IMAGE`]). Read
+    /// here, not in the upload buffer, which is slow to read.
+    shown: Vec<std::sync::atomic::AtomicU32>,
     /// View heaps: the title address of the buffer view at each title slot,
     /// two dwords per slot, for shaders that read a descriptor's address out
     /// of a table at an index they compute
@@ -915,6 +923,88 @@ fn view_stride(view: &View) -> Option<u32> {
     })
 }
 
+/// What a host slot shows after a write, for the stride table
+/// ([`HostHeap::before_write`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shows {
+    /// A texture's descriptor (a shader or unordered view of a texture).
+    Image,
+    /// A buffer view of this many bytes per element (not 0).
+    Buffer(u32),
+    /// A null buffer view: reads give zeros, whatever the table says.
+    NullBuffer,
+    /// Anything else (a constant buffer's view, a null texture view, a
+    /// buffer view without a stride): the table says no buffer.
+    Other,
+}
+
+/// Bit of [`HostHeap::shown`]: the host slot shows a texture's descriptor.
+const SHOWS_IMAGE: u32 = 1 << 31;
+
+/// Whether the stride table follows the host slots
+/// ([`HostHeap::before_write`]). On by default; `VICTORY_STRIDE_FOLLOWS_SLOT=0`:
+/// it follows the title's writes, as before (an A/B switch: the slot then
+/// can show a texture while the table says it holds a buffer).
+fn stride_follows_slot() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STRIDE_FOLLOWS_SLOT").is_none_or(|v| v != "0"))
+}
+
+/// What `view` shows in a host slot once made: a buffer view only if it
+/// views a buffer, as [`make_checked`] decides (a shader view of a
+/// texture object is the texture's whatever its description says).
+fn shows_of(view: &View) -> Shows {
+    let buffer = match view {
+        View::Constant(..) | View::Sampler(_) | View::ConsoleSampler(_) => return Shows::Other,
+        View::Shader(r, _) | View::Unordered(r, _, _) => {
+            crate::resource::buffer_bytes(*r as crate::object::This).is_some()
+        }
+        View::Placed(_, resource, _) => resource[0] == 1,
+    };
+    match view_stride(view) {
+        Some(stride) if buffer && stride > 0 => Shows::Buffer(stride),
+        _ if buffer => Shows::Other,
+        _ => Shows::Image,
+    }
+}
+
+/// Title buffer views written over a host slot that went on showing a
+/// texture (a held clear, a held view, a view made later), since the last
+/// frame line: shaders picking buffers by index read the texture's
+/// descriptor as a buffer's there before [`HostHeap::before_write`], and
+/// read no buffer now.
+pub(crate) static BUFFERS_OVER_IMAGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Table entries whose view is not of the kind the shader reads there (a
+/// buffer view where it reads a texture's descriptor, or a texture view
+/// where it reads a buffer's), since the last frame line: `[in tables made
+/// afresh, whose dynamic slot is made null instead, read in place in the
+/// title's slot]`.
+pub(crate) static KIND_MISMATCHES: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether `view` is not of the kind a shader reads through a console
+/// descriptor of `dwords` dwords (4: a buffer's, 8: a texture's): a
+/// texture's descriptor read as a buffer's is a wild address on RADV (dwords
+/// 4 to 7 of the image descriptor: base 0, a large record count with
+/// DCC), a buffer's read as a texture's another. Constant buffer views
+/// count as buffers; samplers and other sizes are never a mismatch.
+pub(crate) fn kind_mismatch(view: &View, dwords: u8) -> bool {
+    let buffer = match view {
+        View::Constant(..) => true,
+        View::Sampler(_) | View::ConsoleSampler(_) => return false,
+        View::Shader(r, _) | View::Unordered(r, _, _) => {
+            crate::resource::buffer_bytes(*r as crate::object::This).is_some()
+        }
+        View::Placed(_, resource, _) => resource[0] == 1,
+    };
+    match dwords {
+        4 => !buffer,
+        8 => buffer,
+        _ => false,
+    }
+}
+
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
 /// device-removed reports: a shader indexing a heap past its end faults.
 static GPU_RANGES: Mutex<Vec<(u64, u64, u64, bool)>> = Mutex::new(Vec::new());
@@ -1154,6 +1244,9 @@ impl HostHeap {
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             freed: std::sync::Condvar::new(),
             strides,
+            shown: (0..if sampler { 0 } else { count.min(victory_shader::emit::SLOT_STRIDES_COUNT) })
+                .map(|_| std::sync::atomic::AtomicU32::new(0))
+                .collect(),
             views,
             buffers: Mutex::default(),
             changed: Mutex::default(),
@@ -1674,7 +1767,10 @@ impl HostHeap {
             let Some(view) = view_at(key as u32, (key >> 32) as u32) else {
                 continue;
             };
+            let shows = shows_of(&view);
+            self.before_write(slot, shows);
             if let Some(kept) = make(&view, self.cpu(slot)) {
+                self.after_write(slot, shows);
                 self.keep(slot, kept);
                 remade += 1;
             }
@@ -1731,8 +1827,104 @@ impl HostHeap {
             HELD_CLEARS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return;
         }
-        null.write(self.cpu(index));
+        self.write_null(index, null);
         self.keep(index, None);
+    }
+
+    /// Writes `null` into host slot `index`, the stride table kept to what
+    /// the slot shows.
+    fn write_null(&self, index: u32, null: Null) {
+        self.before_write(index, null.shows());
+        null.write(self.cpu(index));
+        self.after_write(index, null.shows());
+    }
+
+    /// Before host slot `index` is written with something that `shows`:
+    /// unless that is a buffer view, the slot leaves the stride table
+    /// first (its dword is 0 before the descriptor changes), so a shader
+    /// that picks buffers by an index it computes reads the null buffer
+    /// view instead (`victory_shader::emit`'s buffer guard) and never a
+    /// texture's descriptor as a buffer's.
+    ///
+    /// Under vkd3d-proton's descriptor heap on RADV (VK_EXT_descriptor_heap,
+    /// 32-byte views) a buffer's descriptor is the upper 16 bytes of the
+    /// slot, which for a texture are dwords 4 to 7 of its image descriptor:
+    /// for a single-layer 2D texture a base address of 0, and with DCC or
+    /// HTILE (render targets, depth) a record count of 2 MiB or more in
+    /// dword 6. A scalar load through that reads address 0 plus its offset:
+    /// the "never used memory" page faults at 0x0 and 0x47000 of runs b6
+    /// and d3, at the gameplay scene's teardown. The table followed the
+    /// title's writes and the slot showed the texture meanwhile: for a
+    /// clear held for the card (`VICTORY_DEFER_SLOT_CLEARS`), a view of a
+    /// new host copy held (`VICTORY_DEFER_NEW_VIEWS`), and a buffer view
+    /// made only when a draw or the pass over buffer views reads it.
+    fn before_write(&self, index: u32, shows: Shows) {
+        if !stride_follows_slot() || matches!(shows, Shows::Buffer(_) | Shows::NullBuffer) {
+            return;
+        }
+        let (Some((_, _, data)), Some(word)) = (&self.strides, self.shown.get(index as usize)) else {
+            return;
+        };
+        let was = word.load(std::sync::atomic::Ordering::Relaxed);
+        if was & !SHOWS_IMAGE == 0 {
+            return;
+        }
+        // SAFETY: inside the mapping (`shown` is no longer than the table).
+        unsafe { (*data as *mut u32).add(index as usize).write_volatile(0) };
+        word.store(was & SHOWS_IMAGE, std::sync::atomic::Ordering::Relaxed);
+        // The 0 is in memory before the runtime writes the descriptor
+        // (its stores into the mapped heap are write-combining and
+        // non-temporal ones, which a plain store does not order).
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// After host slot `index` was written with something that `shows`: a
+    /// buffer view's stride goes into the stride table once its descriptor
+    /// is in memory; [`HostHeap::shown`] notes whether a texture is shown.
+    fn after_write(&self, index: u32, shows: Shows) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (Some((_, _, data)), Some(word)) = (&self.strides, self.shown.get(index as usize)) else {
+            return;
+        };
+        match shows {
+            // (The dword is 0 since `before_write`.)
+            Shows::Image => {
+                word.fetch_or(SHOWS_IMAGE, Relaxed);
+            }
+            Shows::Other | Shows::NullBuffer => {
+                word.fetch_and(!SHOWS_IMAGE, Relaxed);
+            }
+            Shows::Buffer(_) if !stride_follows_slot() => {
+                word.fetch_and(!SHOWS_IMAGE, Relaxed);
+            }
+            Shows::Buffer(stride) => {
+                let stride = stride & !SHOWS_IMAGE;
+                if word.load(Relaxed) & !SHOWS_IMAGE != stride {
+                    // The descriptor is in memory before the stride says
+                    // it is there.
+                    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+                    // SAFETY: inside the mapping, as above.
+                    unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride) };
+                }
+                word.store(stride, Relaxed);
+            }
+        }
+    }
+
+    /// Whether host slot `index` shows a texture's descriptor (view heaps;
+    /// as far as [`HostHeap::shown`] goes).
+    fn shows_image(&self, index: u32) -> bool {
+        self.shown
+            .get(index as usize)
+            .is_some_and(|w| w.load(std::sync::atomic::Ordering::Relaxed) & SHOWS_IMAGE != 0)
+    }
+
+    /// The stride table's dword for title slot `index` (tests).
+    #[cfg(test)]
+    fn stride_shown(&self, index: u32) -> u32 {
+        let Some((_, _, data)) = &self.strides else { return 0 };
+        // SAFETY: inside the mapping.
+        unsafe { (*data as *const u32).add(index as usize).read_volatile() }
     }
 
     /// Whether host slot `index` shows a host resource (it holds one).
@@ -1941,8 +2133,15 @@ impl HostHeap {
                 textures.remove(slot);
             }
         }
+        // The stride table is written where the host slot is
+        // ([`HostHeap::after_write`]), not here: this is the title's write,
+        // and the host slot may go on showing what it showed for a while (a
+        // clear held for the card, a view of a new host copy held, a buffer
+        // view made only when a draw or the pass over buffer views reads
+        // it). Here only with `VICTORY_STRIDE_FOLLOWS_SLOT=0`, as before.
         let stride = view.and_then(view_stride);
-        if let Some((_, _, data)) = &self.strides
+        if !stride_follows_slot()
+            && let Some((_, _, data)) = &self.strides
             && index < victory_shader::emit::SLOT_STRIDES_COUNT
         {
             // SAFETY: inside the mapping; shaders read it while we write (a
@@ -2010,9 +2209,19 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
+        // (A dynamic slot has no stride: this keeps the table to what a
+        // title slot shows, should one be made here.)
+        let shows = ((index as usize) < self.shown.len()).then(|| shows_of(view));
+        if let Some(shows) = shows {
+            self.before_write(index, shows);
+        }
         let kept = make(view, self.cpu(index));
-        if kept.is_none() {
-            null_for(view, self.cpu(index));
+        if kept.is_some() {
+            if let Some(shows) = shows {
+                self.after_write(index, shows);
+            }
+        } else {
+            self.write_null(index, Null::of(view));
         }
         self.keep(index, kept.flatten());
     }
@@ -2022,7 +2231,7 @@ impl HostHeap {
         if self.sampler {
             self.null_sampler(index);
         } else {
-            null_view(self.cpu(index));
+            self.write_null(index, Null::Plain);
         }
         self.keep(index, None);
     }
@@ -2360,7 +2569,7 @@ impl HostHeap {
                     continue;
                 }
             }
-            null.write(self.cpu(index));
+            self.write_null(index, null);
             self.keep(index, None);
             HELD_CLEARS[2].fetch_add(1, Relaxed);
         }
@@ -2469,9 +2678,12 @@ impl HostHeap {
                     let mirror = Remirror { handle, for_draw, required, replace: true };
                     self.hold(index, started, Pending::Mirror(mirror));
                     HELD_CLEARS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.note_withheld(index, &view);
                     return Some(view);
                 }
                 let max_born = defer_new_views().then_some(finished);
+                let shows = shows_of(&view);
+                self.before_write(index, shows);
                 match make_checked(&view, self.cpu(index), max_born) {
                     Make::Deferred(born_after) => {
                         // Leave `made[index]`, the live descriptor slot, and
@@ -2480,9 +2692,11 @@ impl HostHeap {
                         DEFERRED_VIEWS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let mirror = Remirror { handle, for_draw, required, replace: false };
                         self.hold(index, born_after, Pending::Mirror(mirror));
+                        self.note_withheld(index, &view);
                         return Some(view);
                     }
                     Make::Made(kept) => {
+                        self.after_write(index, shows);
                         made[index as usize] = key;
                         self.keep(index, kept);
                     }
@@ -2496,8 +2710,22 @@ impl HostHeap {
                     }
                 }
             }
+            // The title wrote a buffer view where the host slot goes on
+            // showing a texture: until it is made the stride table says
+            // "no buffer" there, where it said the title's stride before and
+            // shaders read the texture's descriptor as a buffer's.
+            self.note_withheld(index, &view);
         }
         Some(view)
+    }
+
+    /// Counts title slot `index` in [`BUFFERS_OVER_IMAGES`] if the title
+    /// wrote the buffer view `view` there and the host slot still shows a
+    /// texture.
+    fn note_withheld(&self, index: u32, view: &View) {
+        if view_stride(view).is_some_and(|s| s > 0) && self.shows_image(index) {
+            BUFFERS_OVER_IMAGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Whether slot `index` is backed by a made host descriptor (tests).
@@ -3491,7 +3719,10 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
 
 /// A null view of the kind `view` is, for a slot whose view the host
 /// cannot make: unordered access (to a buffer or a 2D texture) or a shader
-/// view. Writes to it are dropped, reads give zeros.
+/// view. Writes to it are dropped, reads give zeros. (Slots of a host
+/// heap are made null through `HostHeap::write_null`, which keeps the
+/// stride table to them.)
+#[cfg(test)]
 fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     Null::of(view).write(at);
 }
@@ -3535,6 +3766,14 @@ impl Null {
             View::Placed(false, _, desc) => Null::Like(desc[..10].try_into().unwrap_or([0; 10])),
             View::Constant(..) => Null::Constant,
             _ => Null::Plain,
+        }
+    }
+
+    /// What the null shows, for the stride table.
+    fn shows(self) -> Shows {
+        match self {
+            Null::Buffer | Null::Unordered(true, _) => Shows::NullBuffer,
+            Null::Plain | Null::Constant | Null::Like(_) | Null::Unordered(false, _) => Shows::Other,
         }
     }
 
@@ -4490,6 +4729,86 @@ mod tests {
         assert!(!heap.made(1));
         assert_eq!(shown(&heap, 1), None);
         assert_eq!(super::device_removed(), None);
+    }
+
+    /// A structured view of `bytes`, 16-byte elements (a buffer the title
+    /// placed in memory).
+    fn structured_view(bytes: &'static [u8; 4096]) -> View {
+        let address = bytes.as_ptr() as u64;
+        let resource = [1, 0, 0, 0, 4096, 0, 1, 0x1_0001, 0, 1, 0, 0, 0, 0];
+        let mut srv = [0; 16];
+        // Format unknown, a buffer, the default mapping; 256 elements of 16.
+        srv[..9].copy_from_slice(&[0, 1, 5768, 0, 0, 0, 256, 16, 0]);
+        (srv[10], srv[11]) = (address as u32, (address >> 32) as u32);
+        View::Placed(false, resource, srv)
+    }
+
+    /// The stride table says a title slot holds a buffer only while its
+    /// host slot shows one. A buffer view the title writes where the host
+    /// slot goes on showing a texture (its clear held for a submission on
+    /// the card) leaves the slot's dword at 0, as for the texture; it
+    /// said 16 here before, and a shader picking buffers by index read the
+    /// texture's descriptor as a buffer's (base 0, a large size on RADV).
+    #[test]
+    fn the_stride_table_follows_the_host_slot_not_the_title() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        if heap.strides.is_none() {
+            return;
+        }
+        static TEXTURE: [u8; 65536] = [0; 65536];
+        static BUFFER: [u8; 4096] = [0; 4096];
+        let (texture, record) = placed_record(&TEXTURE);
+        let buffer = structured_view(&BUFFER);
+        assert_eq!(shows_of(&buffer), Shows::Buffer(16));
+        assert_eq!(shows_of(&texture), Shows::Image);
+        let handle = descriptor(record);
+        set_card(&heap, ON_CARD, ON_CARD, 1);
+        assert_eq!(heap.mirror(1, handle, true), Some(texture.clone()));
+        assert!(shown(&heap, 1).is_some(), "the texture is made");
+        assert!(heap.shows_image(1));
+        assert_eq!(heap.stride_shown(1), 0);
+        // The buffer view, written while a submission is on the card.
+        set_card(&heap, ON_CARD + 1, ON_CARD, 1);
+        rewrite(handle, record_of(&buffer));
+        assert_eq!(heap.mirror(1, handle, false), Some(buffer.clone()));
+        assert!(heap.shows_image(1), "the clear is held: the texture is still shown");
+        assert_eq!(heap.stride_shown(1), 0, "no buffer while the texture is shown");
+        // The clear published: a null buffer view, still no stride.
+        assert_eq!(heap.flush_deferred(ON_CARD + 1), 1);
+        assert!(!heap.shows_image(1));
+        assert_eq!(heap.stride_shown(1), 0);
+        // A draw reads it: the stride is there if (and only if) the view
+        // was made (a host copy of the test's bytes may not be made here).
+        set_card(&heap, ON_CARD + 1, ON_CARD + 1, 1);
+        assert_eq!(heap.mirror(1, handle, true), Some(buffer));
+        let made = shown(&heap, 1).is_some();
+        assert_eq!(heap.stride_shown(1), if made { 16 } else { 0 }, "made: {made}");
+        // The texture again: the stride is gone before the texture is there.
+        rewrite(handle, record);
+        assert_eq!(heap.mirror(1, handle, true), Some(texture));
+        assert!(heap.shows_image(1));
+        assert_eq!(heap.stride_shown(1), 0);
+        assert_eq!(super::device_removed(), None);
+    }
+
+    /// A buffer view read as a texture or a texture view read as a buffer
+    /// is a mismatch; constant buffers are buffers, samplers never one.
+    #[test]
+    fn kinds_by_descriptor_size() {
+        static TEXTURE: [u8; 65536] = [0; 65536];
+        static BUFFER: [u8; 4096] = [0; 4096];
+        let (texture, _) = placed_record(&TEXTURE);
+        let buffer = structured_view(&BUFFER);
+        assert!(kind_mismatch(&texture, 4));
+        assert!(!kind_mismatch(&texture, 8));
+        assert!(!kind_mismatch(&buffer, 4));
+        assert!(kind_mismatch(&buffer, 8));
+        assert!(!kind_mismatch(&View::Constant(0x1000, 256), 4));
+        assert!(!kind_mismatch(&View::Sampler([0; 13]), 4));
+        assert_eq!(Null::Buffer.shows(), Shows::NullBuffer);
+        assert_eq!(Null::Plain.shows(), Shows::Other);
     }
 }
 
