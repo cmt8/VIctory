@@ -918,9 +918,12 @@ mod tests {
             let copy_allocator: ID3D12CommandAllocator = host.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY).unwrap();
             let copy_list: ID3D12GraphicsCommandList =
                 host.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &copy_allocator, None).unwrap();
-            // In pieces, as the fetch takes them.
-            for at in (0..N).step_by(64 << 10).rev() {
-                copy_list.CopyBufferRegion(&down, at as u64, &card, at as u64, (64 << 10).min(N - at) as u64);
+            // In pieces, as the fetch takes them: cut where a copy that
+            // does not start on a piece boundary cuts them (odd offsets).
+            let mut cuts: Vec<usize> = std::iter::once(0).chain((5..N).step_by(64 << 10)).chain([N]).collect();
+            cuts.dedup();
+            for w in cuts.windows(2).rev() {
+                copy_list.CopyBufferRegion(&down, w[0] as u64, &card, w[0] as u64, (w[1] - w[0]) as u64);
             }
             copy_list.Close().unwrap();
             copy.Wait(&fence, 1).unwrap();
