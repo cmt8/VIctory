@@ -1358,6 +1358,20 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
             "frame presented (since the last line: draws and dispatches, and those run on the host)"
         );
         #[cfg(windows)]
+        {
+            static LAST: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+            let [set, kept] = crate::draw::target_sets();
+            let [set, kept] = [(0, set), (1, kept)].map(|(i, now)| now - LAST[i].swap(now, Ordering::Relaxed));
+            if set + kept > 0 {
+                tracing::info!(
+                    set,
+                    kept,
+                    "render target sets since the last line: given to the host list, and left out as it had the same \
+                     views (VICTORY_BIND_CACHE=0: none left out)"
+                );
+            }
+        }
+        #[cfg(windows)]
         if frame >= 256 {
             let (hits, misses) = crate::shader_cache::counts();
             tracing::info!(hits, misses, "shaders from the cache and translated so far");

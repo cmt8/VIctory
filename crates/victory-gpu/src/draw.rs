@@ -383,6 +383,10 @@ pub(crate) struct State {
     target_handles: Vec<u64>,
     depth_handle: u64,
     targets_set: bool,
+    /// The render target views and the depth view the host list was last
+    /// given ([`State::set_targets`]), as what each is made of: the host
+    /// texture (0: a null view) and the host's view description.
+    host_targets: Option<(Vec<TargetKey>, Option<TargetKey>)>,
     viewports: Vec<D3D12_VIEWPORT>,
     scissors: Vec<RECT>,
     blend: Option<[f32; 4]>,
@@ -764,6 +768,34 @@ fn dropped(pipeline: usize) {
 /// Dispatches run on the host so far.
 static DISPATCHED: AtomicU64 = AtomicU64::new(0);
 
+/// What a host render target or depth view is made of: the host texture
+/// (0: a typed null view) and the host's view description as words.
+type TargetKey = (usize, Option<[u32; 6]>);
+
+/// A host view description as its six words (both kinds are 24 bytes of
+/// 32-bit fields), for comparing.
+fn view_words<T>(desc: Option<&T>) -> Option<[u32; 6]> {
+    const { assert!(size_of::<T>() == size_of::<[u32; 6]>()) };
+    // SAFETY: both view descriptions are six 32-bit words, none padding.
+    desc.map(|d| unsafe { std::ptr::from_ref(d).cast::<[u32; 6]>().read_unaligned() })
+}
+
+/// Whether render targets the host list has already are left as they are
+/// (`VICTORY_BIND_CACHE`, on by default; `0`: set every time).
+fn bind_cache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_BIND_CACHE").map_or(true, |v| v.trim() != "0"))
+}
+
+/// Render target sets given to the host list, and those left out because
+/// the list had the same views already ([`State::set_targets`]).
+static TARGET_SETS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// [`TARGET_SETS`] so far.
+pub(crate) fn target_sets() -> [u64; 2] {
+    TARGET_SETS.each_ref().map(|n| n.load(Ordering::Relaxed))
+}
+
 pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
 }
@@ -913,7 +945,17 @@ impl State {
         self.index = view.copied().unwrap_or_default();
     }
 
-    /// Render targets and depth, set on the host list at once.
+    /// Render targets and depth, set on the host list at once, unless it has
+    /// the same views already (`VICTORY_BIND_CACHE=0`: every time). The
+    /// views are compared by what they are made of, the host texture and
+    /// the description, not by the title's handles (it may write other
+    /// views behind them) nor by our descriptor slots (each set takes new
+    /// ones of the thread's ring): the host list copies a view's contents
+    /// when it is set, and vkd3d-proton's view of a texture and description
+    /// is the same object each time (the texture's view map), so a list
+    /// that has these views draws into the same places whatever has since
+    /// been written into the slots. (After AvatarManz/VIctory-7900XTX
+    /// ca1d519f1.)
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
         let Some(host) = crate::host::host() else {
             return;
@@ -923,7 +965,7 @@ impl State {
         self.depth_handle = depth;
         self.targets_set = true;
         self.targets.clear();
-        let mut rtvs = Vec::new();
+        let mut views = Vec::with_capacity(handles.len());
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
@@ -943,14 +985,14 @@ impl State {
                     .desc()
                     .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
                 if let Some(desc) = null {
-                    rtvs.push(host.rtv(None, Some(&desc)));
+                    views.push((None, Some(desc)));
                 }
                 continue;
             };
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            rtvs.push(host.rtv(Some(texture), record.desc().as_ref()));
+            views.push((Some(texture), record.desc()));
         }
         self.depth = 0;
         self.depth_state = DEPTH_WRITE;
@@ -963,8 +1005,24 @@ impl State {
             }
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            Some(host.dsv(texture, record.depth_desc().as_ref()))
+            Some((texture, record.depth_desc()))
         });
+        let now = (
+            views
+                .iter()
+                .map(|(texture, desc)| (texture.map_or(0, |t| t.as_raw() as usize), view_words(desc.as_ref())))
+                .collect::<Vec<TargetKey>>(),
+            dsv.as_ref()
+                .map(|(texture, desc)| (texture.as_raw() as usize, view_words(desc.as_ref()))),
+        );
+        if bind_cache() && self.host_targets.as_ref() == Some(&now) {
+            TARGET_SETS[1].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        self.host_targets = Some(now);
+        TARGET_SETS[0].fetch_add(1, Ordering::Relaxed);
+        let rtvs: Vec<_> = views.iter().map(|(texture, desc)| host.rtv(*texture, desc.as_ref())).collect();
+        let dsv = dsv.map(|(texture, desc)| host.dsv(texture, desc.as_ref()));
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(
@@ -1043,6 +1101,8 @@ impl State {
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
+        // A new host list has no targets.
+        self.host_targets = None;
         if self.targets_set {
             let handles = std::mem::take(&mut self.target_handles);
             self.set_targets(list, &handles, self.depth_handle);
