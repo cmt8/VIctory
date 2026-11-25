@@ -4504,6 +4504,80 @@ mod copy_tests {
         drop(shadow);
     }
 
+    /// What a submission's refreshes cost one after another against
+    /// several at a time (`VICTORY_WIDE_REFRESH=1`'s way, `wide_run`), with
+    /// `VICTORY_MEMBENCH=1` and a host GPU (for the copies' buffers): 48
+    /// copies of 2 MiB of write-watched title memory and 16 of 2 MiB of
+    /// view memory (guarded), a quarter of each one's pages written by the
+    /// title before each refresh.
+    #[test]
+    fn wide_refresh_bench() {
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile};
+        if std::env::var_os("VICTORY_MEMBENCH").is_none_or(|v| v != "1") {
+            return;
+        }
+        const LEN: usize = 2 << 20;
+        let mut copies = Vec::new();
+        for i in 0..64 {
+            // SAFETY: fresh memory of the bench's, never freed.
+            let title = unsafe {
+                if i < 48 {
+                    VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) as usize
+                } else {
+                    let section = CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, LEN as u32, std::ptr::null());
+                    MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, LEN).Value as usize
+                }
+            };
+            assert_ne!(title, 0);
+            let Some((buffer, data)) = host().and_then(|h| h.shared_buffer(LEN as u64)) else {
+                return; // no host GPU here
+            };
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let shadow = Shadow::new(buffer.clone(), data, gpu, title as u64, LEN as u64);
+            copies.push((buffer, Arc::new(shadow), title));
+        }
+        let write = |round: usize| {
+            for (_, _, title) in &copies {
+                for page in (round % 4..LEN / 4096).step_by(4) {
+                    // SAFETY: the bench's own title memory.
+                    unsafe { ((title + page * 4096) as *mut u8).write_volatile(round as u8) };
+                }
+            }
+        };
+        for (_, shadow, title) in &copies {
+            shadow.update(*title, LEN);
+        }
+        for wide in [false, true, false, true] {
+            let mut ms = 0.0;
+            for round in 0..5 {
+                write(round);
+                let started = std::time::Instant::now();
+                if wide {
+                    let jobs: Vec<Box<dyn FnOnce() + Send>> = copies
+                        .iter()
+                        .map(|(_, shadow, title)| {
+                            let (shadow, title) = (shadow.clone(), *title);
+                            Box::new(move || {
+                                shadow.update(title, LEN);
+                            }) as Box<dyn FnOnce() + Send>
+                        })
+                        .collect();
+                    wide_run(jobs);
+                } else {
+                    for (_, shadow, title) in &copies {
+                        shadow.update(*title, LEN);
+                    }
+                }
+                ms += started.elapsed().as_secs_f64() * 1e3 / 5.0;
+            }
+            println!(
+                "membench: 64 refreshes of 2 MiB (48 write-watched, 16 guarded views), a quarter of their pages written, {}: {ms:.2} ms",
+                if wide { "several at a time (VICTORY_WIDE_REFRESH=1)" } else { "one after another" }
+            );
+        }
+    }
+
     #[test]
     fn close_runs_join() {
         assert_eq!(join_close(vec![], 16), vec![]);
