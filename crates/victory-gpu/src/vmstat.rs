@@ -538,6 +538,17 @@ fn lines(report: &mut Report, frames: f64, seconds: f64, keep: impl Fn(u32) -> b
     out
 }
 
+/// Tests and benchmarks: the lines [`frame`] would write now, for `frames`
+/// frames since the last ones.
+#[cfg(test)]
+pub(crate) fn lines_now(frames: f64) -> Vec<String> {
+    let mut report = REPORT.lock().unwrap_or_else(|e| e.into_inner());
+    let report = report.get_or_insert_with(|| Report { since: std::time::Instant::now(), frames: 0, seen: Vec::new() });
+    let seconds = report.since.elapsed().as_secs_f64();
+    report.since = std::time::Instant::now();
+    lines(report, frames, seconds, |_| true)
+}
+
 /// Switches timing on or off for the test process, whatever
 /// `VICTORY_VM_STATS` says (it is read once).
 #[cfg(test)]

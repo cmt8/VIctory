@@ -4675,6 +4675,10 @@ pub(crate) fn near(va: u64) -> String {
 }
 
 #[cfg(test)]
+#[path = "shadow_bench_tests.rs"]
+mod bench_tests;
+
+#[cfg(test)]
 mod copy_tests {
     use super::*;
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
