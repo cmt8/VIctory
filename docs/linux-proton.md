@@ -136,6 +136,14 @@ with the indirect executions dropped, and named in the drop reasons);
 `VICTORY_MESH_INDIRECT=1` runs it as an indirect execution of one record,
 as upstream #1749 does: that record layout is unchecked against the title,
 and the first Linux run with it ended in a GPU page fault and reset.
+An indirect mesh draw of one record that asks for more than 65,535 groups
+(the title leaves all ones in slots it has not filled) runs empty instead
+of being raised to 65,535 groups (linux/fx-next4; no switch).
+A buffer a shader reads from the view heap at an index it computes reads
+the host's null buffer view where the heap's stride table says the slot
+holds no buffer view (a texture view read as a buffer descriptor is a wild
+address); `VICTORY_BUFFER_GUARD=0` turns that off (part of the shader
+cache key).
 A draw or dispatch whose root descriptor (title memory's directory, the
 view heap's address or stride table, a root constant buffer, a root view
 outside title memory) has nothing to bind is dropped, named in the drop
