@@ -427,6 +427,17 @@ fn view_ask() -> bool {
     })
 }
 
+/// Drops what the journal holds of `[start, end)` (tests: memory that
+/// is let go, whose address another test may get).
+#[cfg(test)]
+fn forget(start: usize, end: usize) {
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let pages: Vec<usize> = j.written.range(start / PAGE..end.div_ceil(PAGE)).map(|(&p, _)| p).collect();
+    for page in pages {
+        j.written.remove(&page);
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// Kernel askings `writes` made on this thread (tests: which ones are
@@ -924,6 +935,8 @@ mod tests {
             guard(view, view + 2 * BLOCK, None),
             Some((view / PAGE..view / PAGE + 1).collect())
         );
+        // Told before it goes (see `unmapped_blocks_are_reported_once_until_mapped`).
+        title_memory_remapped(view, 2 * BLOCK);
         // SAFETY: our view.
         unsafe {
             UnmapViewOfFile(
@@ -932,7 +945,6 @@ mod tests {
                 },
             )
         };
-        title_memory_remapped(view, 2 * BLOCK);
     }
 
     #[test]
@@ -1073,6 +1085,10 @@ mod tests {
         let mut local = [0u8; 16];
         let at = local.as_mut_ptr() as usize;
         assert!(!is_view(at, at + local.len()));
+        // Told before they go: another test may get the address next, and
+        // find the blocks still noted guarded and clean (told after, the
+        // note could clear what that test has guarded there meanwhile).
+        title_memory_remapped(p, 3 * BLOCK);
         // SAFETY: our views and placeholder.
         unsafe {
             UnmapViewOfFile2(GetCurrentProcess(), first, MEM_PRESERVE_PLACEHOLDER);
@@ -1082,7 +1098,6 @@ mod tests {
             }
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
-        title_memory_remapped(p, 3 * BLOCK);
     }
 
     /// Free memory is not watched: the window a null address falls in (a
@@ -1227,6 +1242,10 @@ mod tests {
         title_memory_remapped(p + BLOCK, BLOCK);
         assert_eq!(guard(p, p + 3 * BLOCK, None), Some(pages(1).collect()));
         assert_eq!(guard(p, p + 3 * BLOCK, None), Some(Vec::new()));
+        // Told before they go: another test may get the address next, and
+        // find the blocks still noted guarded and clean (told after, the
+        // note could clear what that test has guarded there meanwhile).
+        title_memory_remapped(p, 3 * BLOCK);
         // SAFETY: our views and placeholder.
         unsafe {
             UnmapViewOfFile2(GetCurrentProcess(), first, MEM_PRESERVE_PLACEHOLDER);
@@ -1236,7 +1255,6 @@ mod tests {
             }
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
-        title_memory_remapped(p, 3 * BLOCK);
     }
 
     /// A view the guards know is not asked about again, by an unguarded or
@@ -1284,8 +1302,11 @@ mod tests {
         title_memory_remapped(view, 2 * BLOCK);
         assert!(writes(start, end, true).is_some());
         assert_eq!(asked(), before + 3, "a mapping there makes it asked about again");
-        // Told before the view goes, so no other test finds it noted.
+        // Told before the view goes, so no other test finds it noted (the
+        // journal included: a test that gets the address next asks fresh
+        // memory and finds nothing written).
         title_memory_remapped(view, 2 * BLOCK);
+        forget(start, end);
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
     }
