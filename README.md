@@ -1,3 +1,138 @@
+# VIctory on Linux under Proton (a fork)
+
+This is a fork of [Marvisak/VIctory](https://github.com/Marvisak/VIctory)
+for running the title on Linux under Proton (Wine) with vkd3d-proton, tested
+on AMD (RADV). Upstream targets Windows hosts and closed the Linux/Proton
+PR [#994](https://github.com/Marvisak/VIctory/pull/994) as out of scope
+("VIctory targets Windows hosts; ports, launchers and tooling for other
+platforms are not being taken"), so the Linux work lives here.
+
+The default branch, `main`, is upstream's code as of `ffe310e` plus this
+section. The work is on the branches below. Upstream's README follows,
+unchanged; it describes the Windows build.
+
+## Status (2026-11-24)
+
+**Not playable.** One person's observations on one machine, with
+`linux/fx-next`; other GPUs, drivers and Proton versions have not been tried.
+
+Machine: Arch Linux, kernel 7.3, AMD RX 7900 XTX (RADV, Mesa 26.3), Ryzen 7
+7800X3D, 32 GB RAM, Proton Experimental (based on wine-11.0) with its own
+vkd3d-proton.
+
+| Stage | Seen |
+|-------|------|
+| Boot screens and menus | 30 fps |
+| Boot logo video | plays cleanly |
+| Entering the world | a few minutes at under 1 fps while about 59,000 textures upload |
+| Opening scenes, first playable section | reached; visible defects: blocky texture patches, some broken or missing geometry, dark shadows; 300-800 draws a frame dropped for shaders or pipelines not handled yet |
+| The world, textures streamed in | about 4-6 fps |
+| Memory | about 14 GB of RAM and most of the card's 24 GB |
+
+## Branches
+
+| Branch | What it is |
+|--------|------------|
+| [`linux/fx-next`](https://github.com/cmt8/VIctory/tree/linux/fx-next) | Current best. [fxceless/victory-fork](https://github.com/fxceless/victory-fork)'s `main` (itself based on upstream `ffe310e`) plus the commits below |
+| [`linux/hardware-test-v4-1279-port`](https://github.com/cmt8/VIctory/tree/linux/hardware-test-v4-1279-port) | Upstream `main` at `940d32f` plus upstream's Wine-related PRs (#151, #454, part of #994, #1152, #1218, #1849, #1279). Renders much less of the world; kept for comparison |
+| other `linux/*` | Earlier test merges and drafts, kept as history |
+
+## What is ours and what is not
+
+`linux/fx-next` is fxceless/victory-fork `main` (`310c6eb`) plus 39 commits,
+all listed here. Commits taken from elsewhere were cherry-picked with `-x`
+and keep their authors.
+
+From upstream pull requests (13 commits):
+
+| Source | Author | Commits | What |
+|--------|--------|---------|------|
+| [#994](https://github.com/Marvisak/VIctory/pull/994) (closed) | slaktarn | `4adcfefd` `9cd164ba` `742e9c2c` `7de9675d` `a610e20a` `ed9855d3` | Wine fixes (empty pipeline library, missing ws2_32 exports, a DXIL hash test, one returning block per shader program); `docs/linux-proton.md`, `scripts/proton-run.sh` |
+| [#151](https://github.com/Marvisak/VIctory/pull/151) | itsyusei99 | `b6973347` | 16 MiB default thread stack |
+| [#454](https://github.com/Marvisak/VIctory/pull/454) | ruvenesh | `bb1f21e2` `c30a45ea` | opt-in `VICTORY_NO_WATCHDOG` |
+| [#1218](https://github.com/Marvisak/VIctory/pull/1218) | neonbyte1 | `2df48987` `220ee1a4` `6ab4ee38` | `cargo xtask wine-test` |
+| [#122](https://github.com/Marvisak/VIctory/pull/122) (upstream `d01b1707`) | Duff (Dufftwt) | `c27c8abd` | XAsync ends the call that finished |
+
+From other forks (8 commits):
+
+| Source | Author | Commits | What |
+|--------|--------|---------|------|
+| [fxceless #257](https://github.com/fxceless/victory-fork/pull/257) | Ortomanic | `fac4ca4a` `ff186e3a` | one latch per loop in emitted DXIL (dxil-spirv asserted on two back edges) |
+| [fxceless #670](https://github.com/fxceless/victory-fork/pull/670) | Jonirulah | `ee2a5734` | no kernel write-watch asking for known guarded view memory |
+| [fxceless #544](https://github.com/fxceless/victory-fork/pull/544) | justrealyme | `d5cf5fad` | shader cache keyed by the translator, `translate --cache` warm-up (includes upstream `c47b529` by Marvis) |
+| [fxceless #108](https://github.com/fxceless/victory-fork/pull/108) | Kamiloj9 | `67a7e9a0` | adjacent physical-page scatter unmaps batched |
+| [RecompLive/victory-fork](https://github.com/RecompLive/victory-fork) | RecompLive | `a425f208` `4e39b500` | its versions of upstream `c0228d9` (tjthebigbearcat-hub: 9-bit mesh primitive indices) and `ed0dbfd` (Kevin Pratap Sidhu: copy the title's writes under ranges shaders write) |
+| [triippywhale/victory-fork](https://github.com/triippywhale/victory-fork), via RecompLive | Vax | `6a57a8dc` | a helper lane's `v_readfirstlane` reads its own value |
+
+Written here (18 commits), by the fork's owner, with AI
+assistance (Claude; the commits carry `Co-Authored-By` trailers):
+
+- Internal shaders Wine's HLSL compiler builds (it has no Load on writable
+  byte-address buffers, Interlocked only as functions, no embedded root
+  signatures): the indirect argument clamp, the card compare, the depth
+  plane pass (`e0416558` `f06bf40d` `0c33fd76`). Modelled on upstream
+  [#1279](https://github.com/Marvisak/VIctory/pull/1279) (Mumogg).
+- Memory that begins in free space is not watched, a world-load deadlock
+  under Wine (`22afe22c`); the idea of upstream
+  [#1849](https://github.com/Marvisak/VIctory/pull/1849) (crashbashash).
+- Shader writes are copied back into title memory through the kernel read
+  path, not `NtWriteVirtualMemory`/`WriteProcessMemory`, which are
+  wineserver round trips under Wine (`38fe5065`; port of upstream `b58d198d`).
+- Under Wine only, as Wine holds one process-wide memory-map lock across
+  wineserver requests: texture reads without the remap lock (`18531a01`),
+  page probes by reading (`8ac6ab8b`), one kept view per section (`a4cbcd01`).
+- Pipeline workers get 16 MiB stacks (`2318b674`); under Wine a pipeline
+  whose compile overflows its stack is left out instead of being waited for
+  every frame, which was most of each ~600 ms frame in the run measured
+  (`43686cca`); the frame line shows that wait (`93d72d5a`).
+- Fewer write-watch and `VirtualQuery` calls for view memory the guards
+  know, on top of fxceless #670 (`003af25a`).
+- Textures changed behind the write guards (the boot logo video) are read
+  every frame for about four seconds after a change (`ae88e449`).
+- Shader-cache key: two more switches and the entry encoding (`c12f974e`).
+- `VICTORY_MEMBENCH=1`, a benchmark of the memory calls title-memory
+  tracking makes (`b4ceb62a`); a race fix in the watch tests (`afe67caa`).
+- `VICTORY_FULLSCREEN=1`, a borderless window (`69fd9d72`, not yet tried
+  with the title); `VICTORY_WINE`, a system Wine instead of Proton's
+  (`341d2850`). `docs/linux-proton.md` and `scripts/proton-run.sh`, from
+  #994, were extended here (`ae88e449` `341d2850`).
+- The hand port of #1279 onto upstream's rewritten clamp shader, on
+  `linux/hardware-test-v4-1279-port` (`e75c3ba4` `f2dba003`).
+
+## Running it
+
+Details, including running with a system Wine, are in
+[docs/linux-proton.md](https://github.com/cmt8/VIctory/blob/linux/fx-next/docs/linux-proton.md)
+on `linux/fx-next`. You need your own legally obtained copy of the title's
+files; none are hosted or linked here (see
+[docs/asset-policy.md](docs/asset-policy.md)). With Proton Experimental
+installed from Steam:
+
+```sh
+git clone -b linux/fx-next https://github.com/cmt8/VIctory.git && cd VIctory
+rustup target add x86_64-pc-windows-msvc && cargo install --locked cargo-xwin
+# cargo-xwin downloads the MSVC CRT and Windows SDK; this accepts their licence.
+export XWIN_ACCEPT_LICENSE=1
+cargo xwin build --release -p victory --target x86_64-pc-windows-msvc
+scripts/proton-run.sh config
+scripts/proton-run.sh run /path/to/game/<the title's exe> --execute
+```
+
+## Credits and upstreaming
+
+VIctory is Marvisak's project, with its contributors. `linux/fx-next`
+builds on fxceless/victory-fork and carries the work of the PR and fork
+authors named above. Fixes found here that belong elsewhere will be offered
+there. For example, a double unlock of vkd3d-proton's budget lock in
+`vkd3d_try_allocate_device_memory` was found while debugging; it has not
+been reported yet.
+
+---
+
+# Upstream README
+
+The rest of this file is upstream's README as of `ffe310e`, unchanged.
+
 # VIctory
 
 Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
