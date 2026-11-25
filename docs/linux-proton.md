@@ -158,6 +158,14 @@ and `policy::tests::repository_passes_policy` (runs `git`). Run
   again after sends to card copies are one pass per copy
   (`VICTORY_CARD_PIECE_LISTS=0`); texture staging buffers are kept by
   size class for the next texture (`VICTORY_STAGING_POOL=0`).
+  Pages of a buffer copy in the card's memory that the copy-back wrote are
+  reported written by the write watch and the guards like the title's own
+  writes; their next refresh still reads them whole from title memory, but
+  compares them with what the card holds and sends up only the bytes that
+  differ, instead of the whole pages (some 63 MB a frame in heavy scenes).
+  `VICTORY_CARD_ECHO_COMPARE=0` sends them whole as before (`=1` turns the
+  compare on outside Wine too). The line "host copies in the card's
+  memory" says how much of those pages went up.
 - **Software rendering does not work.** On lavapipe, Wine cannot handle the
   write faults of VIctory's guarded title memory when lavapipe's own
   threads take them.

@@ -6530,7 +6530,7 @@ impl Meter {
         let planes = crate::resource::PLANES[0].swap(0, Ordering::Relaxed) as f64 / frames;
         // Copies in the card's memory (`crate::shadow::cards`).
         let card = crate::shadow::card_stats();
-        let echo = [0, 1].map(|i| crate::shadow::ECHO[i].swap(0, Ordering::Relaxed));
+        let echo = [0, 1, 2].map(|i| crate::shadow::ECHO[i].swap(0, Ordering::Relaxed));
         #[cfg(feature = "diagnostics")]
         let slow = crate::watch::slow_asks();
         // Over the same frames as the counts above.
@@ -6577,7 +6577,8 @@ impl Meter {
                     "host copies in the card's memory: {} copies {} MB, their bytes from before {} MB; per frame: \
                      {:.1} MB sent up in {:.0} ranges, {:.0} pieces compared on the card, {:.0} of them fetched \
                      ({:.1} MB) with {:.1} more waits for the card ({:.1} ms); the refreshes copied {:.1} MB into them, \
-                     {:.1} MB of it from pages the copy-back had written since",
+                     {:.1} MB of it from pages the copy-back had written since, of which {:.1} MB differed from what \
+                     the card held and went up (VICTORY_CARD_ECHO_COMPARE={}: {})",
                     card[7],
                     card[8] >> 20,
                     card[9] >> 20,
@@ -6589,7 +6590,10 @@ impl Meter {
                     per_frame(5),
                     per_frame(6) / 1e3,
                     echo[1] as f64 / frames / 1e6,
-                    echo[0] as f64 / frames / 1e6
+                    echo[0] as f64 / frames / 1e6,
+                    echo[2] as f64 / frames / 1e6,
+                    u8::from(crate::shadow::echo_compare()),
+                    if crate::shadow::echo_compare() { "compared, only what differs goes up" } else { "all of it goes up" }
                 );
             }
             tracing::info!(

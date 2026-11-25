@@ -102,17 +102,66 @@ struct Card {
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
     /// Title pages ([`PAGE`], by number) a merge of the copy-back wrote
-    /// since a refresh last copied them ([`ECHO`]).
+    /// since a refresh last took them whole ([`ECHO`], [`echo_compare`]).
     merged: Mutex<std::collections::BTreeSet<usize>>,
 }
 
 /// Since the last frame line: bytes the refreshes of copies in the card's
 /// memory copied from title pages the copy-back had written since their
 /// last copy (the copy-back's own writes, as the write watch and the
-/// guards report them, and whatever the title wrote there too), and the
-/// bytes those refreshes copied in all. Says how much of what goes up to
-/// the card again each frame is what came down from it.
-pub(crate) static ECHO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// guards report them, and whatever the title wrote there too), the bytes
+/// those refreshes copied in all, and, of the first, the bytes that went
+/// up to the card (all of them without [`echo_compare`]). Says how much of
+/// what goes up to the card again each frame is what came down from it.
+pub(crate) static ECHO: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Whether a refresh of a copy in the card's memory compares the pages the
+/// copy-back wrote since their last refresh with the copy's CPU side, and
+/// sends up only the bytes that differ (`VICTORY_CARD_ECHO_COMPARE`; on by
+/// default under Wine, `=0` copies and sends those pages whole as before,
+/// `=1` turns it on elsewhere too).
+///
+/// The copy-back's writes into title memory are writes the write watch
+/// and the guards report like the title's, so the next refresh copied
+/// those pages again and sent them up to the card, which already held
+/// those bytes: run 220839 sent 79 MB a frame up to card copies, 63 MB of
+/// it from pages the copy-back had written. A page reported written is
+/// still read whole from title memory, so a write of the title's that
+/// lands there after ours, or at any time, is seen as before; what
+/// changes is what goes up. That needs the CPU side to hold what the card
+/// side holds or is about to get: outside ranges shaders may be writing
+/// (which no refresh touches), the card side changes only by sends from
+/// the CPU side and by the merges' bytes, which the merges put into the
+/// CPU side too ([`Shadow::card_merge_relay`], [`Shadow::card_merge`]).
+/// One thing differs: a shader's write outside every declared range (no
+/// copy-back sees one) stayed on the card until the title wrote anywhere
+/// in its 64 KiB page, and on such a page it now stays until the title
+/// writes its own bytes.
+pub(crate) fn echo_compare() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_CARD_ECHO_COMPARE").ok().as_deref().map(str::trim) {
+        Some("0") => false,
+        Some("1") => true,
+        _ => crate::host::on_wine(),
+    })
+}
+
+/// Differing runs closer than this go up as one (fewer, longer copies on
+/// the card; the bytes between them are the same on both sides).
+const ECHO_JOIN: usize = 4 << 10;
+
+/// `runs` (offset, bytes, in order and apart) with those less than `gap`
+/// bytes apart joined, the bytes between them included.
+fn join_close(runs: Vec<(usize, usize)>, gap: usize) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
+    for (at, n) in runs {
+        match out.last_mut() {
+            Some(last) if at <= last.0 + last.1 + gap => last.1 = (at + n).max(last.0 + last.1) - last.0,
+            _ => out.push((at, n)),
+        }
+    }
+    out
+}
 
 /// Whether the host copies of big title buffers are in the card's own
 /// memory (on by default since run 75 showed it holds: the BVH skinning
@@ -2565,26 +2614,55 @@ impl Shadow {
     }
 
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
+    /// Of a copy in the card's memory, with [`echo_compare`], the pages the
+    /// copy-back wrote since their last refresh are compared instead
+    /// ([`Shadow::copy_compared`]).
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
+        if from >= to {
+            return 0;
+        }
+        if let Some(card) = &self.card {
+            ECHO[1].fetch_add((to - from) as u64, Ordering::Relaxed);
+            if !echo_compare() {
+                self.card_echo(card, from, to);
+            } else {
+                let echoed = self.echoed(card, from, to);
+                if !echoed.is_empty() {
+                    let mut at = from;
+                    for (lo, hi) in echoed {
+                        if lo > at {
+                            self.copy_whole(at, lo);
+                        }
+                        self.copy_compared(lo, hi);
+                        at = hi;
+                    }
+                    if at < to {
+                        self.copy_whole(at, to);
+                    }
+                    return to - from;
+                }
+            }
+        }
+        self.copy_whole(from, to)
+    }
+
+    /// [`Shadow::copy`] of `[from, to)` (inside the buffer), every byte.
+    fn copy_whole(&self, from: usize, to: usize) -> usize {
+        let start = self.start as usize;
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
-        self.card_echo(from, to);
         to - from
     }
 
-    /// For [`ECHO`]: a refresh copied title memory `[from, to)` into a
-    /// copy in the card's memory.
-    fn card_echo(&self, from: usize, to: usize) {
-        let Some(card) = &self.card else {
-            return;
-        };
-        ECHO[1].fetch_add((to - from) as u64, Ordering::Relaxed);
+    /// For [`ECHO`], without [`echo_compare`]: a refresh copied title
+    /// memory `[from, to)` into a copy in the card's memory.
+    fn card_echo(&self, card: &Card, from: usize, to: usize) {
         let mut merged = card.merged.lock().unwrap_or_else(|e| e.into_inner());
         if merged.is_empty() {
             return;
@@ -2599,6 +2677,79 @@ impl Shadow {
             merged.remove(&page);
         }
         ECHO[0].fetch_add(bytes as u64, Ordering::Relaxed);
+        ECHO[2].fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// With [`echo_compare`]: the parts of title memory `[from, to)` (inside
+    /// the buffer) in pages the copy-back wrote since a refresh last took
+    /// them whole, consecutive pages as one, in order. A page this refresh
+    /// takes whole is no longer noted; one it takes in part stays noted
+    /// for the refresh of its other part.
+    fn echoed(&self, card: &Card, from: usize, to: usize) -> Vec<(usize, usize)> {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let mut merged = card.merged.lock().unwrap_or_else(|e| e.into_inner());
+        if merged.is_empty() {
+            return Vec::new();
+        }
+        let pages: Vec<usize> = merged.range(from / PAGE..to.div_ceil(PAGE)).copied().collect();
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        for page in pages {
+            let (lo, hi) = ((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
+            if lo >= hi {
+                continue;
+            }
+            if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                merged.remove(&page);
+            }
+            match out.last_mut() {
+                Some(last) if last.1 == lo => last.1 = hi,
+                _ => out.push((lo, hi)),
+            }
+        }
+        out
+    }
+
+    /// [`echo_compare`]: brings title memory `[from, to)` (inside the
+    /// buffer) into a copy in the card's memory by comparing: title memory
+    /// is read whole, as [`Shadow::copy_whole`] reads it, and only the
+    /// bytes that differ from the CPU's side are put in and go up to the
+    /// card's side (runs [`ECHO_JOIN`] apart as one). Where a page of it is
+    /// not there, it is copied as `copy_whole` copies it.
+    fn copy_compared(&self, from: usize, to: usize) {
+        // Read in pieces of this, into memory kept per thread (refreshes
+        // run on several threads with `VICTORY_WIDE_REFRESH=1`).
+        const STEP: usize = 256 << 10;
+        thread_local! {
+            static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let start = self.start as usize;
+        TITLE.with_borrow_mut(|title| {
+            let mut at = from;
+            while at < to {
+                let n = STEP.min(to - at);
+                title.resize(n, 0);
+                ECHO[0].fetch_add(n as u64, Ordering::Relaxed);
+                if !crate::host::read_into(at as *const u8, &mut title[..n]) {
+                    self.copy_whole(at, at + n);
+                    ECHO[2].fetch_add(n as u64, Ordering::Relaxed);
+                    at += n;
+                    continue;
+                }
+                let off = at - start;
+                // SAFETY: inside the mapping of the CPU's side (`[from, to)`
+                // is inside the buffer). Outside ranges shaders may be
+                // writing, which a refresh leaves alone, only the refresh of
+                // this copy writes it, as `copy_whole` does.
+                let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(off), n) };
+                for (r, m) in join_close(changed_runs(&title[..n], held), ECHO_JOIN) {
+                    held[r..r + m].copy_from_slice(&title[r..r + m]);
+                    self.changed(off + r, off + r + m);
+                    self.card_changed(off + r, off + r + m);
+                    ECHO[2].fetch_add(m as u64, Ordering::Relaxed);
+                }
+                at += n;
+            }
+        });
     }
 
     /// Whether shaders read and write this copy in the card's own memory
@@ -2746,6 +2897,13 @@ impl Shadow {
                 crate::watch::writing(start + at, n);
                 crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                 written = n;
+                // The CPU's side holds what was written, and goes up below.
+                if let Some(card) = &self.card {
+                    card.merged
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .extend((start + at) / PAGE..(start + at + n).div_ceil(PAGE));
+                }
             }
         } else {
             // Title memory is not mapped there: the copy keeps what the
@@ -3476,5 +3634,200 @@ mod copy_tests {
                 under_busy_range(plain);
             }
         }
+    }
+
+    /// `len` bytes of title memory of both kinds the refreshes ask about:
+    /// write-watched memory (the kernel's journal) and a view of a section
+    /// (the guards). Never freed, as above.
+    fn title_memory(len: usize) -> [usize; 2] {
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile};
+        // SAFETY: fresh memory of ours.
+        unsafe {
+            let watched =
+                VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) as usize;
+            let section = CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, len as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len).Value as usize;
+            assert!(watched != 0 && view != 0);
+            [watched, view]
+        }
+    }
+
+    /// A copy in the card's memory of `len` bytes of title memory at
+    /// `title`, whose card side is modelled by the caller (the CPU's side
+    /// is the mapped buffer).
+    fn card_copy(title: usize, len: usize) -> Option<(ID3D12Resource, *mut u8, Shadow)> {
+        let (buffer, data, mut shadow) = copy(title, len)?;
+        // What the copy's drop takes off again.
+        CARD_BYTES[0].fetch_add(len as u64, Ordering::Relaxed);
+        shadow.card = Some(Card {
+            staging: buffer.clone(),
+            before: Mutex::default(),
+            dirty: Mutex::default(),
+            sent: Mutex::default(),
+            size: len as u64,
+            merged: Mutex::default(),
+        });
+        Some((buffer, data, shadow))
+    }
+
+    /// What `Host::card_before` does with the CPU side's changed ranges:
+    /// they go to the card's side (`card`). The bytes sent.
+    fn send(shadow: &Shadow, data: *mut u8, card: &mut [u8]) -> usize {
+        let ranges = std::mem::take(&mut *shadow.card.as_ref().unwrap().dirty.lock().unwrap());
+        let mut sent = 0;
+        for (a, b) in ranges {
+            // SAFETY: offsets of the copy's mapping.
+            card[a..b].copy_from_slice(unsafe { std::slice::from_raw_parts(data.add(a), b - a) });
+            sent += b - a;
+        }
+        sent
+    }
+
+    /// Title memory `[title, title + len)` as it is now.
+    fn title_bytes(title: usize, len: usize) -> Vec<u8> {
+        // SAFETY: title memory of the test's, read only.
+        unsafe { std::slice::from_raw_parts(title as *const u8, len).to_vec() }
+    }
+
+    /// The copy-back writes a page of title memory and then the title
+    /// writes two bytes of the same page, before the next refresh: those
+    /// bytes reach the card, the copy-back's do not go up again (with
+    /// `echo_compare`), and the card holds title memory byte for byte.
+    fn echo_then_a_title_write(title: usize) -> bool {
+        let len = 2 * PAGE;
+        let Some((_buffer, data, shadow)) = card_copy(title, len) else {
+            return false;
+        };
+        let at = |i: usize| (title + i) as *mut u8;
+        // SAFETY: (all title writes below) bytes of the test's memory.
+        for i in 0..len {
+            unsafe { at(i).write_volatile((i * 7 + 3) as u8) };
+        }
+        let mut card = vec![0u8; len];
+        shadow.update(title, len);
+        assert_eq!(send(&shadow, data, &mut card), len, "the first refresh takes it all");
+        assert!(card == title_bytes(title, len));
+        // A submission's shaders write the first page, which it declares.
+        shadow.writing(title, PAGE);
+        for i in (100..200).chain([5000, 40000]) {
+            card[i] = 0xa5;
+        }
+        let mut scratch = Vec::new();
+        assert!(shadow.card_merge_relay(0, &card[..PAGE].to_vec(), 0, &mut scratch) > 0);
+        assert_eq!(title_bytes(title + 100, 100), [0xa5; 100], "the shaders' bytes reach title memory");
+        // The title writes the same page after the copy-back did.
+        unsafe {
+            at(300).write_volatile(0x77);
+            at(PAGE / 2 + 7).write_volatile(0x78);
+        }
+        shadow.copy_back_done(&[(title, title + PAGE)]);
+        shadow.update(title, len);
+        let sent = send(&shadow, data, &mut card);
+        assert!(card == title_bytes(title, len), "the card holds title memory");
+        // SAFETY: the copy's mapping.
+        let cpu = unsafe { std::slice::from_raw_parts(data, len) };
+        assert!(cpu == &title_bytes(title, len)[..], "and so does the CPU's side");
+        if echo_compare() {
+            assert_eq!(sent, 2, "only the title's two bytes go up");
+            assert!(shadow.card.as_ref().unwrap().merged.lock().unwrap().is_empty());
+        } else {
+            assert!(sent >= PAGE, "the page goes up whole");
+        }
+        // Nothing written since: nothing goes up.
+        shadow.update(title, len);
+        assert_eq!(send(&shadow, data, &mut card), 0);
+        true
+    }
+
+    #[test]
+    fn a_title_write_after_the_copy_backs_write_reaches_the_card() {
+        let [watched, view] = title_memory(2 * PAGE);
+        if echo_then_a_title_write(watched) {
+            echo_then_a_title_write(view);
+        }
+    }
+
+    /// Flights land, one after another, while a thread of the title's
+    /// keeps writing the pages they write (beside the shaders' bytes, and
+    /// on one of them), and the refresh after each landing compares what
+    /// the copy-back wrote. Each trial stops the title's thread just after
+    /// its last landing's merge, so that the refresh after it finds the
+    /// copy-back's writes and the title's latest ones in the same pages:
+    /// the card (modelled) and the CPU's side then hold title memory byte
+    /// for byte, whatever order the writes came in.
+    fn echoes_under_a_writing_title(title: usize) -> bool {
+        use std::sync::atomic::AtomicBool;
+        let len = 2 * PAGE;
+        let Some((_buffer, data, shadow)) = card_copy(title, len) else {
+            return false;
+        };
+        let mut card = vec![0u8; len];
+        shadow.update(title, len);
+        send(&shadow, data, &mut card);
+        // Shaders write bytes 64..96 and 4096 of the first page; the title
+        // writes 80 (the shaders' too), 1000..1004, 33000 and a byte of the
+        // second page.
+        let shader: Vec<usize> = (64..96).chain([4096]).collect();
+        let theirs: Vec<usize> = [80usize, 1000, 1001, 1002, 1003, 33000, PAGE + 9].into();
+        let mut scratch = Vec::new();
+        let mut round = 0u32;
+        for trial in 0..20u32 {
+            let stop = AtomicBool::new(false);
+            std::thread::scope(|s| {
+                let writer = s.spawn(|| {
+                    let mut n = trial.wrapping_mul(977);
+                    while !stop.load(Ordering::Relaxed) {
+                        for &i in &theirs {
+                            // SAFETY: a byte of the test's memory.
+                            unsafe { ((title + i) as *mut u8).write_volatile(n as u8 ^ i as u8) };
+                        }
+                        n = n.wrapping_add(1);
+                        std::hint::spin_loop();
+                    }
+                });
+                for last in (0..15).map(|k| k == 14) {
+                    round += 1;
+                    shadow.writing(title, PAGE);
+                    for &i in &shader {
+                        card[i] = (round * 3 + i as u32) as u8;
+                    }
+                    shadow.card_merge_relay(0, &card[..PAGE].to_vec(), 0, &mut scratch);
+                    if last {
+                        stop.store(true, Ordering::Relaxed);
+                        writer.join().unwrap();
+                        break;
+                    }
+                    shadow.copy_back_done(&[(title, title + PAGE)]);
+                    shadow.update(title, len);
+                    send(&shadow, data, &mut card);
+                }
+            });
+            shadow.copy_back_done(&[(title, title + PAGE)]);
+            shadow.update(title, len);
+            send(&shadow, data, &mut card);
+            let now = title_bytes(title, len);
+            // SAFETY: the copy's mapping.
+            let cpu = unsafe { std::slice::from_raw_parts(data, len) };
+            assert!(cpu == &now[..], "the CPU's side holds title memory (trial {trial})");
+            assert!(card == now, "the card holds title memory (trial {trial})");
+        }
+        true
+    }
+
+    #[test]
+    fn the_card_holds_title_memory_after_echoes_under_a_writing_title() {
+        let [watched, view] = title_memory(2 * PAGE);
+        if echoes_under_a_writing_title(watched) {
+            echoes_under_a_writing_title(view);
+        }
+    }
+
+    #[test]
+    fn close_runs_join() {
+        assert_eq!(join_close(vec![], 16), vec![]);
+        assert_eq!(join_close(vec![(0, 4), (10, 2), (40, 1)], 16), vec![(0, 12), (40, 1)]);
+        assert_eq!(join_close(vec![(0, 4), (21, 2)], 16), vec![(0, 4), (21, 2)]);
+        assert_eq!(join_close(vec![(0, 4), (20, 2)], 16), vec![(0, 22)]);
     }
 }
