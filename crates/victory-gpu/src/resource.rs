@@ -4472,10 +4472,12 @@ float4 lit() : SV_Target { return 1.0; }
         blend.RenderTarget[0].RenderTargetWriteMask = 0xf;
         let mut formats = [DXGI_FORMAT(0); 8];
         formats[0] = DXGI_FORMAT(61);
+        // The root signature of `RS`, made in code: Wine's compiler puts
+        // none in the blob.
+        let signature =
+            crate::host::root_signature(&host.device, &[crate::host::root_constants(0, 1)], "the test's draws").unwrap();
         // SAFETY: plain creation; the description points at live data.
         let (signature, pipeline) = unsafe {
-            let signature: ID3D12RootSignature =
-                host.device.CreateRootSignature(0, &vs[..]).unwrap();
             let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&signature),
                 VS: code(&vs[..]),
