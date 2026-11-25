@@ -11,6 +11,7 @@
 //! victory-gpu --release --lib copy_up_pieces_bench -- --nocapture`.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use windows_sys::Win32::System::Memory::{
@@ -66,7 +67,7 @@ fn written(pattern: usize) -> Vec<usize> {
         0 => (0..PAGES).collect(),
         // Every other page: 16 pieces of 64 KiB a copy (1 MiB).
         1 => (0..PAGES).step_by(2).collect(),
-        // Every other page from the second on, a fourth of each written:
+        // Every other page from the second on:
         // the same pieces as above, other pages.
         2 => (1..PAGES).step_by(2).collect(),
         // One page: one piece of 64 KiB.
@@ -218,6 +219,59 @@ fn copy_up_pieces_bench() {
             }
             crate::vmstat::force(false);
         }
+        // Beside threads that map and unmap 64 KiB views of a section, as
+        // the runtime does when the title maps pages (each a wineserver
+        // request under ntdll's lock under Wine): what the same refreshes
+        // take when the lock is not theirs alone.
+        let pages = written(1);
+        for remappers in [1usize, 2] {
+            let stop = AtomicBool::new(false);
+            let (ms, maps) = std::thread::scope(|s| {
+                let workers: Vec<_> = (0..remappers).map(|_| s.spawn(|| remap_until(&stop))).collect();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                let mut ms = 0.0;
+                for _ in 0..ROUNDS {
+                    write(&pages);
+                    let started = Instant::now();
+                    assert_eq!(refresh_all(), COPIES * pages.len() * PAGE);
+                    ms += started.elapsed().as_secs_f64() * 1e3 / ROUNDS as f64;
+                }
+                stop.store(true, Ordering::Relaxed);
+                let maps: u64 = workers.into_iter().map(|w| w.join().expect("remapper")).sum();
+                (ms, maps)
+            });
+            println!(
+                "membench: copy-up of {COPIES} copies of 2 MiB ({kind}), {} beside {remappers} thread(s) mapping and unmapping views ({maps} in all): {ms:.2} ms",
+                NAMES[1]
+            );
+        }
+    }
+}
+
+/// Maps and unmaps a 64 KiB view of a section of its own until `stop`;
+/// how many times.
+fn remap_until(stop: &AtomicBool) -> u64 {
+    use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+    // SAFETY: a section and views of the thread's own.
+    unsafe {
+        let section = CreateFileMappingW(
+            -1isize as _,
+            std::ptr::null(),
+            PAGE_READWRITE,
+            0,
+            PAGE as u32,
+            std::ptr::null(),
+        );
+        assert!(!section.is_null());
+        let mut n = 0;
+        while !stop.load(Ordering::Relaxed) {
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, PAGE);
+            assert!(!view.Value.is_null());
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view.Value });
+            n += 1;
+        }
+        windows_sys::Win32::Foundation::CloseHandle(section);
+        n
     }
 }
 

@@ -707,7 +707,13 @@ not used for them.
   (4-5 us in our handler plus Wine's path) and an opening call (4-5 us)
   on its own thread. 212 MB in 64 KiB pieces is then 5-22 ms idle beside
   7 ms of copying: a tenth of run 232629's 166 ms. The rest is waiting,
-  which the in-game lines below place.
+  which the in-game lines below place. How much waiting can do: the same
+  refreshes (67 MB in 1,024 pieces) beside one thread mapping and
+  unmapping views take 4.4 ms (write-watched) and 12.1 ms (guarded)
+  against 3.3 and 8.5 ms; beside two such threads 422 ms and 878 ms. The
+  runtime's own remapping is one at a time (`watch::MAPPING`), but
+  DirectStorage's page windows and the title's own memory calls and write
+  faults take the same lock beside it.
 - **Title memory in place through a view of ours** (beloooo's 0434b3acd,
   `VICTORY_STRETCH` on belobug): not ported. On the real card under Wine
   (`host_in_place_probe`), a section's pages opened as a host heap, from
@@ -723,7 +729,7 @@ then `scripts/perf-summary.sh` and these lines, against the frame line's
 `copies X ms Y MB`:
 
 ```sh
-grep -E "vm stats: (all our calls|site (kernel-read|watch-range|watch-ahead|protect-guard|protect-guard-other|protect-open-fault|fault-handler|remap) )" run-HHMMSS.log
+grep -E "vm stats: (all our calls|site (kernel-read|watch-range|watch-ahead|protect-guard|protect-guard-other|protect-open-fault|fault-handler|remap|disk-window) )" run-HHMMSS.log
 grep -E "vm stats: thread .*submit" run-HHMMSS.log
 grep "title memory copied by the refreshes per frame" run-HHMMSS.log
 ```
@@ -734,8 +740,10 @@ grep "title memory copied by the refreshes per frame" run-HHMMSS.log
 - `watch-range` + `watch-ahead` + `protect-guard` + `protect-guard-other`
   ms on the submitting thread (`submit ... ms`) most of the copies' ms,
   mostly in `slow taking`: the copies wait for ntdll's lock, held by
-  `remap` (the runtime) and by `fault-handler` / `protect-open-fault` (the
-  title's writes, other threads). The candidate then is fewer such calls:
+  `remap` (the runtime), `disk-window` (DirectStorage) and by
+  `fault-handler` / `protect-open-fault` (the title's writes, other
+  threads); the frame log's `remapping: N calls` and `faults: N page`
+  say how often. The candidate then is fewer such calls:
   a guarded block the title writes in every frame left open and copied
   whole at each refresh (2 us of copying against a fault, an opening and a
   guard, three takings of the lock), which touches what else reads the
