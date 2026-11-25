@@ -6801,7 +6801,13 @@ impl Meter {
                 tracing::info!(
                     "writes behind the guards, since the start: {writes} DirectStorage writes into physical pages at addresses the                      title had mapped ({} MB); {guarded} guarded 64 KiB blocks of host copies lay under them ({}); {plain} reads to                      plain addresses finished ({}); {kept} ranges under texture views kept for the texture pass ({dropped} dropped);                      {slots} slots of placed textures held their bytes, {uploaded} of them uploaded before the write ({})                      (VICTORY_PAGE_WRITES: 0 counts, 1 acts (the default under Wine), guards, slots, all)",
                     bytes >> 20,
-                    if mode & 1 != 0 { "opened, taken again" } else { "left as they were" },
+                    if mode & 1 == 0 {
+                        "left as they were"
+                    } else if std::env::var_os("VICTORY_PAGE_WRITES_OPEN").is_some_and(|v| v == "1") {
+                        "opened, taken again"
+                    } else {
+                        "noted written and left guarded, taken again"
+                    },
                     if mode & 4 != 0 { "told as well" } else { "counted only" },
                     if mode & 2 != 0 { "made due again" } else { "left as they were" }
                 );

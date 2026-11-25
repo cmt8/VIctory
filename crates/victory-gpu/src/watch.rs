@@ -1067,6 +1067,26 @@ fn page_writes_from(value: Option<&str>, wine: bool) -> u8 {
     }
 }
 
+/// Whether a DirectStorage write into physical pages
+/// ([`title_memory_written`] with `pages`) leaves the guards over the
+/// title addresses that show them armed, noting the blocks written, instead
+/// of opening them (`VICTORY_PAGE_WRITES_OPEN=1`: opened, as before).
+///
+/// The write went through the runtime's own view of the pages (`xmem`'s
+/// kept view of each section), which no guard covers, and the runtime
+/// tells of every title address that shows them, so each is told here.
+/// Opening took a `VirtualProtect` for each block, another for each other
+/// view of its pages, and one more each to guard them again at the next
+/// check, every one under ntdll's `virtual_mutex` under Wine: run 232629
+/// (linux/fx-next4) opened 57,000 such blocks while it streamed. Noted
+/// written and left read-only, a block is reported written at its next
+/// check without a call (`guard`: "written through the runtime, still
+/// read-only"), and a write of the title's after it still faults.
+fn pages_stay_guarded() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PAGE_WRITES_OPEN").is_none_or(|v| v != "1"))
+}
+
 /// Since the start: writes into physical pages through the runtime's own
 /// views that landed at addresses the title has mapped (one for each run
 /// of addresses); their bytes; guarded blocks that lay under them (host
@@ -1111,7 +1131,18 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
             WRITTEN[2].fetch_add(guarded, Relaxed);
         }
         if mode & 1 != 0 && guarded != 0 {
-            open(&mut g, at, end, if pages { OPEN_PAGES } else { OPEN_WRITE });
+            if pages && pages_stay_guarded() {
+                // Written through the runtime's own view: the guards here
+                // stay, and the next check reports the blocks written
+                // (`guard`: read-only and not clean), as the runtime's
+                // other writes are.
+                let blocks: Vec<usize> = g.protected.range(at / BLOCK..end.div_ceil(BLOCK)).copied().collect();
+                for block in blocks {
+                    g.clean.remove(&block);
+                }
+            } else {
+                open(&mut g, at, end, if pages { OPEN_PAGES } else { OPEN_WRITE });
+            }
         }
     }
     // A placed texture there changed with no descriptor written.
@@ -1990,6 +2021,31 @@ mod tests {
             VirtualFree((base + BLOCK) as *mut _, 0, MEM_RELEASE);
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
+    }
+
+    /// A DirectStorage write into the pages under a guarded view, told
+    /// at that view (`title_memory_written` with `pages`): the next check
+    /// reports the block written, and with the guards left armed
+    /// (`pages_stay_guarded`) the block is still read-only, so a write of
+    /// the title's after it still faults and is reported too.
+    #[test]
+    fn a_page_write_told_is_reported_and_the_guard_stays() {
+        const SIZE: usize = 2 * BLOCK;
+        if page_writes() & 1 == 0 {
+            return;
+        }
+        let (section, view, other) = two_views(SIZE);
+        let pages = |block: usize| (view + block * BLOCK) / PAGE;
+        assert!(guard(view, view + SIZE, None).is_some());
+        assert_eq!(guard(view, view + SIZE, None), Some(Vec::new()), "nothing written yet");
+        title_memory_written(view + BLOCK + 16, 64, true);
+        assert_eq!(writable(view + BLOCK), !pages_stay_guarded(), "left guarded unless opened");
+        assert_eq!(guard(view, view + SIZE, None), Some(vec![pages(1)]));
+        assert_eq!(guard(view, view + SIZE, None), Some(Vec::new()));
+        // SAFETY: the view, read-write once the handler has opened it.
+        unsafe { ((view + BLOCK + 8) as *mut u8).write(1) };
+        assert_eq!(guard(view, view + SIZE, None), Some(vec![pages(1)]));
+        drop_views(section, &[view, other], SIZE);
     }
 
     /// Blocks are joined into one protection change where they are

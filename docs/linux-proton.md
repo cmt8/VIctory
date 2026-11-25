@@ -253,6 +253,14 @@ frames later).
   `VICTORY_TEXTURE_STAGE_MS` (and `VICTORY_TEXTURE_CATCHUP=0`) for smoother
   frames while the world streams in, at the cost of textures that arrive
   later.
+- `VICTORY_PAGE_WRITES_OPEN` (off; `=1` as before): a DirectStorage
+  write into physical pages (`VICTORY_PAGE_WRITES`) leaves the guards over
+  the title addresses that show them armed and notes the blocks written,
+  instead of opening them (a `VirtualProtect` a block and one per other
+  view of its pages, and as many again to guard them at the next check).
+  The write went through the runtime's kept view, which no guard covers;
+  the next check reports the blocks written without a call, and a write
+  of the title's after it still faults.
 - Not a switch: a status line "title memory copied by the refreshes per
   frame" splits the frame line's "copies" by where the bytes went (copies
   in the card's memory, of it the part compared against the copy-back's
