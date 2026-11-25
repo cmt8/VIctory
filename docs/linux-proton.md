@@ -617,12 +617,15 @@ Neither says what the card runs. Three switches, all off by default:
   and a clamp (the clamps' resolves wait for the list's end);
   `VICTORY_GPU_TIMES=lists` leaves the clamps' pairs out (some 4,000 a
   frame), to see what the meter itself costs.
-- `VICTORY_CARD_HASH_WIDE=1`: the hash and compare passes over copies in
-  the card's memory give each 64 KiB piece a group of 64 threads instead
-  of one thread (64 steps of loads side by side instead of 4,096 one after
-  the other). The same pieces are flagged; the hashes are another kind, so
-  the switch holds for the whole run. With `VICTORY_GPU_TIMES=1` the send-
-  and-hash and compare lists' times show what it is worth.
+- `VICTORY_CARD_HASH_WIDE` (on by default from linux/fx-next10-wait; `=0`
+  turns it off): the hash and compare passes over copies in the card's
+  memory give each 64 KiB piece a group of 64 threads instead of one
+  thread (64 steps of loads side by side instead of 4,096 one after the
+  other). The same pieces are flagged; the hashes are another kind, so
+  the switch holds for the whole run, and if the wide shader cannot be
+  built (another compiler) the one-thread shader is made instead and the
+  log says so. Runs auto-c1 to c6: hash and compare 58 to about 5 ms of the
+  card's time a frame, frame 191 to 158 ms.
 - `VICTORY_FILL_WAIT=0`: fills of upload memory never wait for flights;
   a fill that read bytes a flight then changed is counted ("since the
   start" on the fills line) and the first eight are named, and fills go on
@@ -631,6 +634,57 @@ Neither says what the card runs. Three switches, all off by default:
   time. What it trades: the draws of such a submission read the constants
   from before that flight. For measuring what the fill settles cost; the
   count says how often the bytes were stale.
+
+### The waits for title memory read (linux/fx-next10-wait)
+
+Runs auto-b1 and b5 (boat scene, about 3,900 draws a frame) stood once a
+frame 55-78 ms for "a buffer copy at 2048 bytes in 0xe011e0000+64K" and
+several times 4-8 ms for fills of 32 and 480 bytes elsewhere. All of them
+waited because one read ahead (`VICTORY_FILL_WAIT` unset) had missed once
+during loading, which turned waiting back on for every fill and copy. The
+copy is real: a dispatch writes a 14 KiB buffer (0xe011ea300 and
+0xe011eab00, one frame and the other) and the title copies 2 KiB of it
+into a small buffer of its own; reading it ahead took the bytes from
+before some 950 times in eight minutes of run b3.
+
+- From fxceless/victory-fork#860 (turbinedogbla), on by default: a read
+  ahead keeps a fingerprint of the bytes it read, and a landing that finds
+  title memory rewritten since does not count it as a miss; a real miss
+  holds back only the 64 KiB pieces it read (fills and copies there wait)
+  for 60 frames, twice as long at each miss of the same piece after; past
+  8 pieces held at once every fill waits as before. The fills line says
+  "N pieces of 64 KiB held back now" and "fills not compared because the
+  title had rewritten their bytes since". `VICTORY_FILL_WAIT=0` stays the
+  blunt switch it was: nothing ever waits or is held, misses are counted
+  (now only real ones).
+- `VICTORY_CARD_COPY=1` (off by default): a title buffer copy whose source
+  flights in the air may write, and which is not read ahead (its piece is
+  held back, or ever was, or every fill waits), is done on the card behind
+  those flights instead of waiting: from the host copy the flights write
+  into the host copy of the destination, in a list of ours sent between
+  the submission's sends of title bytes and its lists, and the
+  destination's bytes are declared written by shaders of this submission,
+  so the landing puts them into title memory before the title is told
+  anything of the flight. Refused, and waited for as before: a source
+  written through more than one host copy or by bottom-of-pipe writes or
+  read-backs of the flights, a destination with no host copy of its own, a
+  later step of the submission that reads the destination or writes the
+  source or destination, another host copy of the destination brought up
+  to date in the submission. While the copy is in the air its destination
+  is a range flights write: a fill or copy that reads it is never read
+  ahead, and a refresh of another host copy of it waits. A line with the
+  frame-rate line: "title buffer copies done on the card behind flights
+  ... per frame: N (bytes); refused, and waited for: ...; waits for a
+  destination of one still in the air: N". What it does not see: work of
+  ours that reads title memory outside a submission's steps finds the
+  destination's bytes when the flight has landed, not at once.
+- From fxceless/victory-fork#1066 (UwUCammie): `VICTORY_WIDE_MERGE=1`
+  (off by default) now also spreads the relay thread's merges over the
+  snapshot threads (`relay_card_back`, `relay_card_inflight`,
+  `relay_hand_back`), pieces of one 64 KiB title page always in one job and
+  in order; the carded merges take a read lock of their copy and the merge
+  under shader writes the write lock. Run auto-c1 had the relay "28.2 ms
+  landing in all" a frame; the PR measured 28-33 to 17 ms on an RX 7900 XT.
 
 ### Taking a profile (linux/fx-next6-prof)
 
