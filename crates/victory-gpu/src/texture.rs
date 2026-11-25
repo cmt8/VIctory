@@ -567,7 +567,7 @@ impl Drop for Staging {
 /// 1 MiB and 618 us for 4 MiB; written again, 3, 12, 46 and 185 us.
 /// A class is the size rounded up to a quarter step between powers of two
 /// (at most a quarter more), from 64 KiB; buffers past 64 MiB are not kept,
-/// nor more than [`STAGING_SPARE_MOST`] bytes of them.
+/// nor more than [`staging_spare_most`] bytes of them.
 fn staging_pool() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| match std::env::var("VICTORY_STAGING_POOL").as_deref().map(str::trim) {
@@ -577,8 +577,26 @@ fn staging_pool() -> bool {
     })
 }
 
-/// The most bytes of staging buffers kept while no texture holds them.
-const STAGING_SPARE_MOST: u64 = 512 << 20;
+/// The most bytes of staging buffers kept while no texture holds them
+/// (`VICTORY_STAGING_SPARE_MB`, 512).
+///
+/// A buffer let go past it is freed, and the next texture of its class
+/// makes one again. Under Proton's vkd3d-proton an upload buffer made once
+/// the card's upload budget (a sixteenth of its memory) is spent falls
+/// back to system memory (libs/vkd3d/memory.c
+/// `vkd3d_allocate_device_memory`), and that path costs about 0.55 ms a
+/// buffer whatever its size (`membench` `staging_bench` with
+/// `VKD3D_CONFIG=no_upload_hvv`, which takes it for every buffer: 64 KiB
+/// 0.54 ms, 4 MiB 0.57 ms, against 0.03-0.6 ms in the card's upload
+/// memory); while the world streamed in, run 232629 made 400-550 staging
+/// buffers a frame. A larger spare keeps more for the next textures; it
+/// is memory the PC holds meanwhile. For A/B runs.
+fn staging_spare_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_STAGING_SPARE_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(512) << 20
+    })
+}
 
 /// The size class of a staging buffer of `size` bytes ([`staging_pool`]):
 /// 0 if it is not kept.
@@ -642,11 +660,11 @@ fn take_staging(host: &crate::host::Host, size: u64) -> Option<(ID3D12Resource, 
 }
 
 /// A staging buffer of class `class` no texture holds any more: kept, or
-/// freed past [`STAGING_SPARE_MOST`].
+/// freed past [`staging_spare_most`].
 fn give_staging(buffer: ID3D12Resource, data: *mut u8, class: u64) {
     let mut spare = SPARE_STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let spare = spare.get_or_insert_with(|| SpareStaging { kept: HashMap::new(), bytes: 0 });
-    if spare.bytes + class > STAGING_SPARE_MOST {
+    if spare.bytes + class > staging_spare_most() {
         return;
     }
     spare.bytes += class;

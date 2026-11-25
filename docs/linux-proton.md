@@ -261,6 +261,14 @@ frames later).
   The write went through the runtime's kept view, which no guard covers;
   the next check reports the blocks written without a call, and a write
   of the title's after it still faults.
+- `VICTORY_STAGING_SPARE_MB` (512): the most megabytes of texture
+  staging buffers the pool (`VICTORY_STAGING_POOL`) keeps while no texture
+  holds them; past it they are freed and made again. Once the card's
+  upload budget is spent, vkd3d-proton makes each new one in system memory
+  at about 0.55 ms a buffer whatever its size (`membench` `staging_bench`
+  under `VKD3D_CONFIG=no_upload_hvv`, which takes that path for all of
+  them; it is not a setting to run the game with for that reason). The
+  line "texture staging buffers per frame" says how many were made.
 - Not a switch: a status line "title memory copied by the refreshes per
   frame" splits the frame line's "copies" by where the bytes went (copies
   in the card's memory, of it the part compared against the copy-back's
