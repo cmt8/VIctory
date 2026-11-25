@@ -791,3 +791,109 @@ fn view_books_bench() {
     // The pools' views are unmapped by their drops.
     drop(churn);
 }
+
+/// What the guards' protection changes cost by block and by view
+/// (`VICTORY_MEMBENCH=1`; `crate::watch` `guard_runs`): 16 blocks of title
+/// memory in four views of four consecutive physical pages each, as the
+/// runtime maps a run of pages, guarded and opened block by block (with the
+/// call over the whole range first, which spans views and is refused) and
+/// a call per view; idle and while other threads remap.
+#[test]
+fn guard_runs_bench() {
+    if !on() {
+        return;
+    }
+    const VIEW: usize = 4;
+    const VIEWS: usize = 4;
+    const BLOCKS: usize = VIEW * VIEWS;
+    let mut pool = Pool::new(BLOCKS + 1);
+    for v in 0..VIEWS {
+        let at = pool.at(v * VIEW);
+        // SAFETY: placeholder pages of the pool's: split out as one piece of
+        // four pages and replaced by a view of four consecutive pages.
+        let view = unsafe {
+            VirtualFree(at as *mut c_void, VIEW * PAGE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+            MapViewOfFile3(
+                pool.section,
+                GetCurrentProcess(),
+                at as *const c_void,
+                (v * VIEW * PAGE) as u64,
+                VIEW * PAGE,
+                MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        assert_eq!(view.Value as usize, at, "view {v}");
+    }
+    let protect = |from: usize, blocks: usize, prot: u32| -> bool {
+        let mut old = 0;
+        // SAFETY: our views; only their protection changes.
+        unsafe { VirtualProtect(pool.at(from) as *const c_void, blocks * PAGE, prot, &mut old) != 0 }
+    };
+    assert!(!protect(0, BLOCKS, PAGE_READONLY), "a range over four views is refused (Wine; Windows likewise)");
+    let round = |label: &str, n: usize| {
+        report(&format!("{label}: guard 16 blocks in 4 views, block by block (after the refused call over all)"), ns_per(n, |_| {
+            assert!(!protect(0, BLOCKS, PAGE_READONLY));
+            for b in 0..BLOCKS {
+                assert!(protect(b, 1, PAGE_READONLY));
+            }
+        }));
+        report(&format!("{label}: open 16 blocks in 4 views, block by block"), ns_per(n, |_| {
+            for b in 0..BLOCKS {
+                assert!(protect(b, 1, PAGE_READWRITE));
+            }
+        }));
+        report(&format!("{label}: guard 16 blocks in 4 views, a call per view"), ns_per(n, |_| {
+            for v in 0..VIEWS {
+                assert!(protect(v * VIEW, VIEW, PAGE_READONLY));
+            }
+        }));
+        report(&format!("{label}: open 16 blocks in 4 views, a call per view"), ns_per(n, |_| {
+            for v in 0..VIEWS {
+                assert!(protect(v * VIEW, VIEW, PAGE_READWRITE));
+            }
+        }));
+    };
+    round("idle", 500);
+    let mut churn = Pool::new(64);
+    for page in 0..50 {
+        assert!(churn.map(page));
+        churn.mapped[page] = true;
+    }
+    let churn = Arc::new(churn);
+    for remappers in [1usize, 2] {
+        let stop = Arc::new(AtomicBool::new(false));
+        let threads: Vec<_> = (0..remappers)
+            .map(|t| {
+                let (churn, stop) = (churn.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    let mut i = 0;
+                    while !stop.load(Ordering::Relaxed) {
+                        let page = t * 25 + i % 25;
+                        assert!(churn.unmap(page));
+                        assert!(churn.remap(page));
+                        i += 1;
+                    }
+                })
+            })
+            .collect();
+        round(&format!("{remappers} thread(s) remapping"), 20);
+        stop.store(true, Ordering::Relaxed);
+        for t in threads {
+            t.join().unwrap();
+        }
+    }
+    for v in 0..VIEWS {
+        // SAFETY: the views mapped above, back to placeholders.
+        unsafe {
+            UnmapViewOfFile2(
+                GetCurrentProcess(),
+                MEMORY_MAPPED_VIEW_ADDRESS { Value: pool.at(v * VIEW) as *mut c_void },
+                MEM_PRESERVE_PLACEHOLDER,
+            );
+        }
+    }
+    pool.mapped.fill(false);
+}

@@ -233,6 +233,14 @@ frames later).
   from the books against 71 us idle, 355 us beside one thread remapping
   and 45 ms beside two). A placeholder is looked at again at most once a
   second to see it is still there.
+- `VICTORY_GUARD_RUNS` (on; `=0` as before): the guards change the
+  protection of consecutive blocks that lie in one view the runtime told
+  of with one call (guarding, opening, and the other views of the pages
+  with `VICTORY_VIEW_GUARD`), not block by block; a range over several
+  views is no longer first tried whole (Wine refuses it,
+  `NtProtectVirtualMemory` wants one view). The status line "the guards'
+  protection changes per frame" counts the calls, blocks and time by
+  what they were for, and the write faults taken.
 
 ## Tests
 

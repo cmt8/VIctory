@@ -6675,6 +6675,29 @@ impl Meter {
                      (VICTORY_TEXTURE_QUIET_FRAMES=0: none)"
                 );
             }
+            let p: Vec<[f64; 3]> = crate::watch::PROTECTS
+                .iter()
+                .map(|row| [0, 1, 2].map(|i| row[i].swap(0, Ordering::Relaxed) as f64 / frames))
+                .collect();
+            let faults = crate::watch::FAULTS.swap(0, Ordering::Relaxed) as f64 / frames;
+            if p.iter().any(|r| r[0] > 0.0) || faults > 0.0 {
+                let f = |r: [f64; 3]| format!("{:.1} ({:.1} blocks, {:.1} ms)", r[0], r[1], r[2] / 1e3);
+                let all: f64 = p.iter().map(|r| r[2]).sum::<f64>() / 1e3;
+                tracing::info!(
+                    "the guards' protection changes per frame, calls (blocks, time), each under ntdll's lock on the \
+                     memory map under Wine (VICTORY_GUARD_RUNS=0: block by block): guarding {}, other views of the pages \
+                     (VICTORY_VIEW_GUARD) {}; opening for a write fault {}, for a write through the kernel {}, for a \
+                     DirectStorage write into physical pages {}, other views of the pages {}, where a view of guarded \
+                     pages was mapped {}; {all:.1} ms in all; {faults:.1} write faults taken",
+                    f(p[0]),
+                    f(p[1]),
+                    f(p[2]),
+                    f(p[3]),
+                    f(p[4]),
+                    f(p[5]),
+                    f(p[6]),
+                );
+            }
             let [kept, made] = [0, 1].map(|i| crate::texture::STAGING_TAKEN[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if kept + made > 0.0 {
                 tracing::info!(
