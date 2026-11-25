@@ -1030,6 +1030,17 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
     let (first, last) = (at / KERNEL_PAGE, at.saturating_add(len - 1) / KERNEL_PAGE);
     let of = last - first + 1;
     let mut there = 0;
+    if by_reading() {
+        for page in first..=last {
+            let mut byte = [0u8];
+            if crate::host::read_into((page * KERNEL_PAGE) as *const u8, &mut byte) {
+                there += 1;
+            } else if all {
+                break;
+            }
+        }
+        return (there, of);
+    }
     // SAFETY: plain data.
     let mut info: [PSAPI_WORKING_SET_EX_INFORMATION; 256] = unsafe { std::mem::zeroed() };
     let mut page = first;
@@ -1060,6 +1071,31 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
         page += n;
     }
     (there, of)
+}
+
+/// Whether [`readable`] asks each page with a one-byte read through the
+/// kernel and not `QueryWorkingSetEx` first: on by default under Wine, off
+/// elsewhere; `VICTORY_PROBE_READ=1` or `=0` says.
+///
+/// The answer is the same: a page counts as there if it is in the working
+/// set or a one-byte read of it succeeds, and under Wine a page in the
+/// working set (committed, not a guard page, present) can be read. But
+/// there `QueryWorkingSetEx` takes ntdll's lock on the memory map
+/// (dlls/ntdll/unix/virtual.c get_working_set_ex), which the runtime's
+/// remapping holds across wineserver requests, while a read that succeeds
+/// is a copy in our own process that takes nothing. Measured with the
+/// membench test under Wine 11.22 at 40,000 views, 16 pages:
+/// `QueryWorkingSetEx` 2 us idle, 10-28 us with one thread remapping,
+/// 10-41 ms with two; sixteen one-byte reads 1.0-1.3 us in all three. A
+/// read that fails still takes the lock (a fault), as the fallback read
+/// after the question did. On Windows the question is one kernel call for
+/// up to 256 pages and stays.
+fn by_reading() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var_os("VICTORY_PROBE_READ") {
+        Some(v) => v == "1",
+        None => crate::host::on_wine(),
+    })
 }
 
 fn committed_by_query(at: *const u8, len: usize) -> bool {
