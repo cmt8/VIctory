@@ -48,6 +48,8 @@ mod sampler;
 pub mod shader_cache;
 #[cfg(all(windows, test))]
 mod membench;
+#[cfg(all(windows, test))]
+mod mapped_tests;
 #[cfg(windows)]
 mod memory;
 #[cfg(windows)]

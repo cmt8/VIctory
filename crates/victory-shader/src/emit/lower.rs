@@ -2701,6 +2701,54 @@ impl<'a> Lower<'a> {
         Some((lo, hi))
     }
 
+    /// [`view_address`] for a table entry chosen at run time (a computed
+    /// index into a descriptor table or the resource heap): the host's table
+    /// of the buffer views' title addresses by heap slot
+    /// ([`shader::SLOT_VIEWS`]), 16 bytes a slot. The view's address (low,
+    /// high) and its record count, as the descriptor's dwords 0, 1 and 2
+    /// would give them; the address is the view's own, wherever in the
+    /// table the descriptor sits.
+    fn view_address_indexed(&mut self, site: Site, first: u8) -> Result<Option<(V, V, V)>, Why> {
+        let a = *self
+            .scalar
+            .get(&site)
+            .ok_or("an untracked descriptor load")?;
+        let root = self
+            .x
+            .native
+            .layout
+            .get(a.param)
+            .map(|p| p.root)
+            .ok_or("a descriptor outside the tables")?;
+        if !matches!(root, RootType::Table | RootType::ResourceHeap) || a.dynamic.is_none() {
+            return Ok(None);
+        }
+        let c = self.cur;
+        let slot = self.heap_index(site, first, false)?;
+        let last = self.s.m.i32(super::shader::SLOT_VIEWS_COUNT - 1);
+        let i32t = self.s.t.i32;
+        let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
+        self.s.m.tag(slot, Tag::Clamp);
+        let four = self.s.m.i32(4);
+        let byte = self.s.m.bin(c, Bin::Shl, slot, four);
+        let h = self.s.root_srv_handle(super::shader::SLOT_VIEWS);
+        let iu = self.s.m.undef(self.s.t.i32);
+        let mask = self.s.m.i8(0x7);
+        let align = self.s.m.i32(4);
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, byte, iu, mask, align],
+        );
+        let lo = self.s.m.extract(c, r, 0);
+        let hi = self.s.m.extract(c, r, 1);
+        let records = self.s.m.extract(c, r, 2);
+        Ok(Some((self.as_int(lo), self.as_int(hi), self.as_int(records))))
+    }
+
     /// `lo`, `hi` plus the instruction's byte offset `off`, with the carry.
     fn address_plus(&mut self, lo: V, hi: V, off: i32) -> (V, V) {
         if off == 0 {
@@ -5680,7 +5728,9 @@ impl<'a> Lower<'a> {
             }
             // A buffer view the code only takes the address of, to walk
             // the memory behind it (a ray-tracing structure): the address
-            // from the host, the other dwords have no value.
+            // from the host, the other dwords have no value. A table entry
+            // chosen at run time asks the host's table of view addresses;
+            // one load may carry two descriptors (8 dwords).
             if count <= 4
                 && let Some((lo, hi)) = self.view_address(site)
             {
@@ -5698,6 +5748,32 @@ impl<'a> Lower<'a> {
                     }
                 }
                 return Ok(());
+            }
+            if count <= 8 && count % 4 == 0 {
+                let groups: Vec<_> = (0..count / 4)
+                    .map(|group| self.view_address_indexed(site, (4 * group) as u8).ok().flatten())
+                    .collect();
+                if groups.iter().any(Option::is_some) {
+                    for (group, words) in groups.into_iter().enumerate() {
+                        for k in 0..4u32 {
+                            let reg = Reg::S(code + (4 * group as u32 + k) as u8);
+                            match (words, k) {
+                                (Some((lo, _, _)), 0) => self.write(inst, reg, lo, None),
+                                (Some((_, hi, _)), 1) => self.write(inst, reg, hi, None),
+                                (Some((_, _, records)), 2) => self.write(inst, reg, records, None),
+                                // The format dword, or a group with no
+                                // view: no host value.
+                                _ => {
+                                    if let Some(v) = inst.write(reg) {
+                                        self.vals.insert(v, Val::Missing(OTHER));
+                                        self.stale.insert(v);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
             }
             if std::env::var_os("VICTORY_DESC_WHY").is_some() {
                 eprintln!(
@@ -5829,7 +5905,12 @@ impl<'a> Lower<'a> {
                 });
                 if first == 0
                     && computed
-                    && let Some((lo, hi)) = self.view_address(site)
+                    && let Some((lo, hi)) = self.view_address(site).or_else(|| {
+                        self.view_address_indexed(site, 0)
+                            .ok()
+                            .flatten()
+                            .map(|(lo, hi, _)| (lo, hi))
+                    })
                 {
                     words.extend([(0, lo), (1, hi)]);
                 }
@@ -9592,7 +9673,15 @@ impl<'a> Lower<'a> {
                 }
             }
             if op == 81 {
-                // The clamped then the unclamped level of detail.
+                // The clamped then the unclamped level of detail. An array's
+                // slice is not part of the coordinates here: the host's
+                // `calculateLOD` wants it undef (a 2D array's third
+                // coordinate, a 1D array's second and third).
+                let (x0, x1, x2) = match kind {
+                    6 => (cs[0], fu, fu),
+                    7 => (cs[0], cs[1], fu),
+                    _ => (cs[0], cs[1], cs[2]),
+                };
                 let Operand::Vector { reg, .. } = *data else {
                     return Err("an image result");
                 };
@@ -9605,7 +9694,7 @@ impl<'a> Lower<'a> {
                         Attr::ReadOnly,
                         f32t,
                         81,
-                        &[h, sh, cs[0], cs[1], cs[2], clamped],
+                        &[h, sh, x0, x1, x2, clamped],
                     );
                     let x = self.as_int(lod);
                     self.write(inst, Reg::V(reg + k as u8), x, guard);

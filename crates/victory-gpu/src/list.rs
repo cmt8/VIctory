@@ -1591,9 +1591,15 @@ mod state {
         }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
     }
-    /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
-    /// shortcut: dispatches whose group count is in GPU memory (indirect)
-    /// are dropped; make them ExecuteIndirect when the title uses them.
+    /// `DispatchMeshX(x, flags, indirect arguments, payload)`. With
+    /// `indirect` set, the group counts are in GPU memory at that title
+    /// address (console GPU addresses are title addresses): one mesh
+    /// dispatch record, `x, y, z` (12 bytes), run as an indirect execution
+    /// of one record like ExecuteIndirect's mesh signature, so earlier GPU
+    /// work that wrote the counts is seen.
+    /// shortcut: the record layout is assumed to be the mesh dispatch
+    /// arguments the title's ExecuteIndirect signatures use, and `x` is
+    /// ignored then; not yet checked against the title.
     pub(super) extern "system" fn dispatch_mesh_x(
         this: This,
         x: u32,
@@ -1603,12 +1609,29 @@ mod state {
     ) {
         super::count_draw();
         if indirect != 0 {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
+            let mut ran = false;
+            with_state(this, |list, s| {
+                ran = s.execute_indirect(list, (MESH_INDIRECT, MESH_RECORD, 1), indirect, None);
+            });
+            if !ran {
+                super::INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::info!(
+                        address = format!("{indirect:#x}"),
+                        "an indirect mesh dispatch dropped (first time)"
+                    )
+                });
+            }
             return;
         }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
     }
+    /// The indirect argument kind of a mesh dispatch
+    /// (`State::execute_indirect`).
+    const MESH_INDIRECT: u32 = 10;
+    /// Bytes of one mesh dispatch record: three u32 group counts.
+    const MESH_RECORD: u32 = 12;
     pub(super) extern "system" fn draw_indexed(
         this: This,
         indices: u32,
@@ -1700,12 +1723,14 @@ extern "system" fn execute_indirect(
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
     } else {
-        #[cfg(all(windows, feature = "diagnostics"))]
-        crate::pipeline::note_why(format!(
-            "indirect signature {args:?}: arguments in a buffer {}, count in a buffer {}",
-            address.is_some(),
-            count.is_null() || counter.is_some()
-        ));
+        #[cfg(windows)]
+        if crate::pipeline::drop_reasons() {
+            crate::pipeline::note_why(format!(
+                "indirect signature {args:?}: arguments in a buffer {}, count in a buffer {}",
+                address.is_some(),
+                count.is_null() || counter.is_some()
+            ));
+        }
     }
     if ran {
         return;

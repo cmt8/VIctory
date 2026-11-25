@@ -377,6 +377,66 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 /// memory is looked at again, each counted from the look before.
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
 
+/// [`RECHECK_FRAMES`] with [`recheck_pages`]: two more looks, about 1,200
+/// and 3,600 frames later. Of 23,001 textures found changed in run-212937
+/// (Wine, 4-5 frames a second), the share found at each of the five looks
+/// fell by half only (111, 58, 27, 15, 12 of the 200 logged): changes
+/// went on past the last look, and those stayed on the card as they were.
+const RECHECK_FRAMES_LONGER: [u64; 7] = [4, 12, 40, 120, 400, 1200, 3600];
+
+/// Whether an uploaded texture picked by index is looked at again with
+/// [`recheck_print`] and [`RECHECK_FRAMES_LONGER`]: on by default under
+/// Wine, off elsewhere; `VICTORY_HEAP_RECHECK_PAGES=1` or `=0` says.
+///
+/// The look's fingerprint (`texture::fingerprint`) reads 16 KiB at the
+/// texture's start, middle and end. A texture the title fills after its
+/// first upload page by page (64 KiB, a tile of its layout) changes
+/// outside those windows in most of its pages; one changed there only
+/// kept the old contents in those tiles for the run: square patches of
+/// zero or other blocks on a surface.
+pub(crate) fn recheck_pages() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var_os("VICTORY_HEAP_RECHECK_PAGES") {
+        Some(v) => v == "1",
+        None => crate::host::on_wine(),
+    })
+}
+
+/// The frames between looks at an uploaded texture (see [`recheck_pages`]).
+fn recheck_frames() -> &'static [u64] {
+    if recheck_pages() { &RECHECK_FRAMES_LONGER } else { &RECHECK_FRAMES }
+}
+
+/// The fingerprint a look compares: `texture::fingerprint`, and with
+/// [`recheck_pages`] also the first 512 bytes of every 64 KiB page of the
+/// memory (of at most 256 pages spread over it: a page in every 64 KiB
+/// up to 16 MiB). 128 KiB at most more per look, each piece read through
+/// the kernel (a page not there reads as zeros).
+pub(crate) fn recheck_print(at: u64, len: u64) -> u64 {
+    let print = crate::texture::fingerprint(at, len);
+    if !recheck_pages() || len <= 48 << 10 {
+        return print;
+    }
+    const PAGE: u64 = 64 << 10;
+    const PIECE: usize = 512;
+    const MOST: u64 = 256;
+    let step = len.div_ceil(MOST).next_multiple_of(PAGE);
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&print.to_le_bytes());
+    let mut piece = [0u8; PIECE];
+    let mut from = 0;
+    while from < len {
+        let n = (len - from).min(PIECE as u64) as usize;
+        piece[..n].fill(0);
+        crate::host::copy_mapped(piece.as_mut_ptr(), (at + from) as *const u8, n, false);
+        hasher.update(&piece[..n]);
+        from += step;
+    }
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&hasher.finalize().as_bytes()[..8]);
+    u64::from_le_bytes(first) | 1
+}
+
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
 pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -416,10 +476,23 @@ pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(
 pub(crate) static HEAP_TEXTURES_PARTLY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
-/// Marks the last traced draw as not run on the host.
-#[cfg(feature = "diagnostics")]
+thread_local! {
+    /// Why the last draw this thread prepared was dropped though its
+    /// pipeline has a host pipeline (`State::prepare_for`, `State::bind`),
+    /// for the reasons line (`crate::pipeline::drop_reasons`).
+    static DROP_WHY: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+/// Notes why the draw being prepared is dropped (see [`DROP_WHY`]).
+fn drop_why(why: &'static str) {
+    DROP_WHY.set(Some(why));
+}
+
+/// Counts a dropped draw by reason (`crate::pipeline::drop_reasons`), and
+/// marks the last traced draw as not run on the host (diagnostics).
 fn dropped(pipeline: usize) {
-    crate::pipeline::note_drop(pipeline as This);
+    crate::pipeline::note_drop_or(pipeline as This, DROP_WHY.take());
+    #[cfg(feature = "diagnostics")]
     if let Some(last) = FRAME.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
         last.push_str(" DROPPED");
     }
@@ -827,6 +900,7 @@ impl State {
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
+        DROP_WHY.set(None);
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
@@ -836,6 +910,7 @@ impl State {
         };
         if p.compute || p.mesh != mesh {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
+            drop_why("a draw or mesh dispatch with another kind of pipeline");
             return false;
         }
         if p.rects && self.topology != RECTANGLES {
@@ -876,6 +951,7 @@ impl State {
         if indexed {
             let v = self.index;
             let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
+                drop_why("an index buffer outside title buffers");
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
@@ -982,6 +1058,7 @@ impl State {
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
+                drop_why("a descriptor table found no free slots");
                 return false;
             }
             // What the shader stores through root views and raw addresses is
@@ -992,6 +1069,7 @@ impl State {
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
                 let Some(ready) = self.memory_ready(list, compute, writes) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
+                    drop_why("title memory by address without a view heap");
                     return false;
                 };
                 Some(ready)
@@ -1040,6 +1118,23 @@ impl State {
                         }
                         continue;
                     }
+                    if srv && slot == victory_shader::emit::SLOT_VIEWS {
+                        // Ours: the title addresses of the heap's buffer
+                        // views, for a descriptor read as data.
+                        match self.heap_views(list) {
+                            // SAFETY: an open list; the table lives as long
+                            // as the heap the list holds.
+                            Some(gpu) => unsafe {
+                                if compute {
+                                    l.SetComputeRootShaderResourceView(param, gpu);
+                                } else {
+                                    l.SetGraphicsRootShaderResourceView(param, gpu);
+                                }
+                            },
+                            None => once!("a shader reads view addresses of a heap that is not set"),
+                        }
+                        continue;
+                    }
                     if srv && slot == victory_shader::emit::SLOT_STRIDES {
                         // Ours, not the title's: the shader picks buffers
                         // from the view heap by an index it computes.
@@ -1063,6 +1158,7 @@ impl State {
                         once!(slot, "a shader reads a root view the title did not set");
                         // A table left unset is undefined: a null view.
                         if tabled && !self.root_srv_table(list, None, param, compute, false) {
+                            drop_why("a root view table the host could not make");
                             return false;
                         }
                         continue;
@@ -1075,6 +1171,7 @@ impl State {
                         });
                     if tabled {
                         if !self.root_srv_table(list, Some(address), param, compute, biased) {
+                            drop_why("a root view table the host could not make");
                             return false;
                         }
                         continue;
@@ -1126,6 +1223,7 @@ impl State {
                     }
                 };
                 if !self.root_uav(list, address, param, compute, writes) {
+                    drop_why("a root unordered view the host could not make");
                     return false;
                 }
             }
@@ -1499,6 +1597,26 @@ impl State {
         Some(gpu)
     }
 
+    /// [`State::heap_buffers`] for a shader that reads a descriptor's
+    /// address as data: the GPU address of the host's table of the buffer
+    /// views' title addresses by heap slot. The pass that readies the
+    /// buffer views also fills the table.
+    fn heap_views(&self, list: &HostList) -> Option<u64> {
+        let heap = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())?;
+        let host = heap.host()?;
+        let gpu = host.views_gpu()?;
+        self.heap_buffers(list)?;
+        if let Some(buffer) = host.views_buffer() {
+            list.keep(buffer);
+        }
+        Some(gpu)
+    }
+
     /// Runs the pass that uploads textures picked by index
     /// ([`State::heap_textures`]) where nothing has asked for it yet
     /// ([`early_budgets`]): once a frame for a few milliseconds, at the
@@ -1768,9 +1886,9 @@ impl State {
             // only a changed texture is uploaded again.
             // `VICTORY_HEAP_RECHECK=0`: uploaded once, as before.
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
-                if crate::texture::fingerprint(at, len) == print {
+                if recheck_print(at, len) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
-                    match RECHECK_FRAMES.get(usize::from(looks) + 1) {
+                    match recheck_frames().get(usize::from(looks) + 1) {
                         Some(wait) => {
                             host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
                         }
@@ -1929,8 +2047,8 @@ impl State {
             match memory {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
-                    let print = crate::texture::fingerprint(at, len);
-                    host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[0], (at, len), print, 0, frame);
+                    let print = recheck_print(at, len);
+                    host.texture_slot_recheck(index, write, frame + recheck_frames()[0], (at, len), print, 0, frame);
                 }
                 None => host.texture_slot_done(index, write, again),
             }
@@ -1986,11 +2104,9 @@ impl State {
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
             #[cfg(feature = "diagnostics")]
-            {
-                crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
-                self.list_dropped_roots([x, y, z]);
-            }
+            self.list_dropped_roots([x, y, z]);
             return;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
@@ -1999,19 +2115,19 @@ impl State {
                 "a dispatch without a host pipeline dropped"
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::pipeline::note_drop(self.pipeline as This);
             #[cfg(feature = "diagnostics")]
-            {
-                crate::pipeline::note_drop(self.pipeline as This);
-                self.list_dropped_roots([x, y, z]);
-            }
+            self.list_dropped_roots([x, y, z]);
             return;
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        DROP_WHY.set(None);
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::pipeline::note_drop_or(self.pipeline as This, DROP_WHY.take());
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
             if crate::pipeline::is_builder(self.pipeline as This) {
@@ -2301,7 +2417,6 @@ impl State {
             };
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
     }
@@ -2679,6 +2794,9 @@ impl State {
         // vertices as they are; any other gets its rectangles expanded.
         let rects = self.topology == RECTANGLES && !self.completes_rects();
         let ran = ready && (!rects || self.rectangles(list, vertices, first));
+        if ready && !ran {
+            drop_why("rectangles not drawn");
+        }
         if ran {
             // Rectangles were expanded into their own vertex buffers.
             let (count, from) = if rects {
@@ -2697,7 +2815,6 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
     }
@@ -2784,6 +2901,7 @@ impl State {
         let lost = self.topology == RECTANGLES && !self.completes_rects();
         if lost {
             once!("indexed rectangles not drawn");
+            drop_why("indexed rectangles");
         }
         let ran = !lost && self.prepare(list, true);
         if ran {
@@ -2798,7 +2916,6 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
     }
@@ -2831,12 +2948,12 @@ impl State {
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
-        #[cfg(feature = "diagnostics")]
-        let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
-        #[cfg(not(feature = "diagnostics"))]
-        let why = |_: &str| {};
+        let why = |what: &str| {
+            if crate::pipeline::drop_reasons() {
+                crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
+            }
+        };
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
-            #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         };
