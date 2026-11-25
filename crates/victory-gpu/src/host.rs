@@ -1058,6 +1058,9 @@ pub(crate) struct HostList {
     /// With `crate::cardmeter::pipelines`: the pair of the pipeline bound
     /// last, open until the next one is bound or the list closes.
     pipeline_meter: AtomicU32,
+    /// With `crate::cardmeter::times`: the pairs of its indirect clamps,
+    /// written and resolved together when the list closes.
+    clamp_meter: Mutex<Vec<crate::cardmeter::Span>>,
     /// The records its draws read from slots that its prelude fills
     /// (`crate::indirect::gather`).
     gather: Mutex<Gather>,
@@ -2992,6 +2995,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         }
                         if count {
                             LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
+                            read_settles::note(0, if touches(written, dst, dst + len) { dst } else { src }, len);
                             #[cfg(feature = "diagnostics")]
                             fill_check::blocked_copy(written, dst, src, len);
                         }
@@ -3010,6 +3014,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         }
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
+                            read_settles::note(1, src, len);
                             #[cfg(feature = "diagnostics")]
                             fill_check::blocked(written, src, len);
                         }
@@ -3021,6 +3026,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, at, at + len) {
                         if count {
                             LATE_STATS[17].fetch_add(1, Ordering::Relaxed);
+                            read_settles::note(2, at, len);
                         }
                         return Some(WHY_READ);
                     }
@@ -3031,6 +3037,100 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
         }
     }
     None
+}
+
+/// With `VICTORY_GPU_TIMES=1` (`crate::cardmeter::times`): which title
+/// memory the settles for "title memory read" were for, and how long the
+/// submitting thread stood in each, by the 64 KiB piece the read starts
+/// in. Says whether the frame's few such settles are for one constant
+/// buffer the title's shaders write every frame (the fill that turned the
+/// fills' waiting back on, `fill_ahead`) or for many places.
+mod read_settles {
+    use std::sync::Mutex;
+
+    /// What read: a buffer copy (where it touches what flights may write:
+    /// its destination, else its source), a fill of upload memory, a
+    /// texture.
+    const KINDS: [&str; 3] = ["a buffer copy at", "a fill of upload memory from", "a texture at"];
+    /// Places kept at most; more are counted as others.
+    const MOST: usize = 64;
+
+    struct Seen {
+        /// Kind, piece, the last read's length, settles, microseconds.
+        places: Vec<(usize, usize, usize, u64, u64)>,
+        /// The place of the settle in progress.
+        last: Option<usize>,
+        others: u64,
+    }
+
+    static SEEN: Mutex<Seen> = Mutex::new(Seen { places: Vec::new(), last: None, others: 0 });
+
+    /// A submission waits for flights because it reads `len` bytes at `at`.
+    pub(super) fn note(kind: usize, at: usize, len: usize) {
+        if !crate::cardmeter::times() {
+            return;
+        }
+        let piece = at & !0xffff;
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let found = seen.places.iter().position(|p| p.0 == kind && p.1 == piece);
+        let found = match found {
+            Some(i) => Some(i),
+            None if seen.places.len() < MOST => {
+                seen.places.push((kind, piece, len, 0, 0));
+                Some(seen.places.len() - 1)
+            }
+            None => None,
+        };
+        match found {
+            Some(i) => {
+                seen.places[i].2 = len;
+                seen.places[i].3 += 1;
+            }
+            None => seen.others += 1,
+        }
+        seen.last = found;
+    }
+
+    /// The settle [`note`] told of ended after `took`.
+    pub(super) fn waited(took: std::time::Duration) {
+        if !crate::cardmeter::times() {
+            return;
+        }
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = seen.last.take()
+            && let Some(p) = seen.places.get_mut(i)
+        {
+            p.4 += took.as_micros() as u64;
+        }
+    }
+
+    /// With the frame line: the places, the longest waited first.
+    pub(super) fn line(frames: f64) {
+        if !crate::cardmeter::times() {
+            return;
+        }
+        let (mut places, others) = {
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            seen.last = None;
+            (std::mem::take(&mut seen.places), std::mem::take(&mut seen.others))
+        };
+        if places.is_empty() && others == 0 {
+            return;
+        }
+        places.sort_by_key(|p| std::cmp::Reverse(p.4));
+        let listed: Vec<String> = places
+            .iter()
+            .take(8)
+            .map(|&(kind, piece, len, n, us)| {
+                format!("{} {len} bytes in {piece:#x}+64K {:.2}/frame {:.1} ms", KINDS[kind], n as f64 / frames, us as f64 / 1e3 / frames)
+            })
+            .collect();
+        tracing::info!(
+            "settles for title memory read per frame, by the place read (VICTORY_GPU_TIMES=1), the longest waited first: {}{}",
+            listed.join("; "),
+            if others > 0 { format!("; {:.2}/frame at other places", others as f64 / frames) } else { String::new() }
+        );
+    }
 }
 
 /// Fills of upload memory (a constant buffer a table names, copied into
@@ -3848,6 +3948,7 @@ fn late_line(frames: f64) {
     #[cfg(feature = "diagnostics")]
     fill_check::line();
     fill_ahead::line(frames);
+    read_settles::line(frames);
     let s: Vec<f64> = LATE_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "submissions sent ahead per frame: {:.1} in {:.1} settles ({:.1} flights each time), {:.1} ms waiting for the card in them; \
@@ -4308,6 +4409,7 @@ impl Host {
                 _alive: Counted::new(),
                 meter: AtomicU32::new(u32::MAX),
                 pipeline_meter: AtomicU32::new(u32::MAX),
+                clamp_meter: Mutex::default(),
                 gather: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -4784,6 +4886,13 @@ impl Host {
                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                             )]);
                         }
+                        // The card's time of the copy's hash passes
+                        // (`VICTORY_GPU_TIMES=1`).
+                        let hashing = if crate::cardmeter::times() {
+                            crate::cardmeter::begin(list, crate::cardmeter::Kind::Hash)
+                        } else {
+                            crate::cardmeter::Span::NONE
+                        };
                         list.SetComputeRootSignature(&work.root);
                         list.SetPipelineState(&work.pso);
                         list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
@@ -4821,6 +4930,7 @@ impl Host {
                             list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                             list.SetComputeRootShaderResourceView(4, listed.GetGPUVirtualAddress());
                             list.Dispatch(pieces.div_ceil(64), 1, 1);
+                            crate::cardmeter::end(list, hashing);
                             continue;
                         }
                         CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
@@ -4830,6 +4940,7 @@ impl Host {
                             list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                             list.Dispatch(run.pieces.div_ceil(64), 1, 1);
                         }
+                        crate::cardmeter::end(list, hashing);
                     }
                     crate::cardmeter::end(list, timed);
                     list.Close()?;
@@ -6036,12 +6147,16 @@ impl Host {
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
         } else if let Some(why) = late_blocked(runs) {
+            let waiting = std::time::Instant::now();
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
                 relay_wait(why, |line| blocked_by(&line.written, runs, false).is_none());
             } else {
                 self.settle(&mut submitted, why);
+            }
+            if why == WHY_READ {
+                read_settles::waited(waiting.elapsed());
             }
         }
         let behind = late && flying();
@@ -6645,6 +6760,15 @@ impl HostList {
         times
     }
 
+    /// The clamp timed by `span` ended here (`crate::cardmeter::times`):
+    /// its pair is resolved when the list closes, all together, so that no
+    /// resolve between draws waits for the card.
+    pub(crate) fn clamp_timed(&self, span: crate::cardmeter::Span) {
+        if crate::cardmeter::end_unresolved(&self.list, span) {
+            self.clamp_meter.lock().unwrap_or_else(|e| e.into_inner()).push(span);
+        }
+    }
+
     pub(crate) fn close(&self) {
         self.twins_to_depth();
         self.textures_back();
@@ -6666,6 +6790,9 @@ impl HostList {
             }
         }
         crate::cardmeter::end(&self.list, crate::cardmeter::Span::from_raw(self.pipeline_meter.swap(u32::MAX, Ordering::Relaxed)));
+        for span in std::mem::take(&mut *self.clamp_meter.lock().unwrap_or_else(|e| e.into_inner())) {
+            crate::cardmeter::resolve(&self.list, span);
+        }
         crate::cardmeter::end_named(
             &self.list,
             crate::cardmeter::Span::from_raw(self.meter.swap(u32::MAX, Ordering::Relaxed)),
@@ -6695,6 +6822,7 @@ impl HostList {
         let started = std::time::Instant::now();
         self._alive.used();
         *self.deferred() = Deferred::default();
+        self.clamp_meter.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -7066,6 +7194,7 @@ impl HostList {
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
+                let timed = crate::cardmeter::begin(list, crate::cardmeter::Kind::Prelude);
                 if !to_copy.is_empty() {
                     list.ResourceBarrier(&to_copy);
                 }
@@ -7079,14 +7208,21 @@ impl HostList {
                     // The slots must hold clamped records before a draw
                     // reads them: a prelude that cannot record the passes
                     // is no prelude.
+                    let clamp = if crate::cardmeter::times() {
+                        crate::cardmeter::begin(list, crate::cardmeter::Kind::Clamp)
+                    } else {
+                        crate::cardmeter::Span::NONE
+                    };
                     let filled = match &gather.budget {
                         Some(budget) => crate::indirect::record_gathers(list, &gather.sets, budget),
                         None => false,
                     };
+                    crate::cardmeter::end(list, clamp);
                     if !filled {
                         fail(format_args!("a list's gathered indirect records could not be clamped in its prelude"));
                     }
                 }
+                crate::cardmeter::end(list, timed);
                 list.Close()
             })
         };
@@ -8705,6 +8841,7 @@ impl Meter {
         crate::descriptor::sync_line(frames);
         late_line(frames);
         card_clock_line(frames, ms);
+        crate::cardmeter::line();
         crate::queue2::line(frames);
         crate::plaincopy::line(frames);
         if let Some(host) = host() {

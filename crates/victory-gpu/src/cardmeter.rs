@@ -21,6 +21,15 @@
 //!
 //! On by default in diagnostics builds; `VICTORY_CARD_METER=0` or `1` says
 //! otherwise. Two queries and a resolve a list.
+//!
+//! `VICTORY_GPU_TIMES=1` turns it on in any build, without the frame log,
+//! and adds a line to every frame-rate line ([`line`]): the card's own time
+//! per frame by kind, the indirect clamps, the preludes and the hash
+//! passes of the send-and-hash lists timed on their own, and the time the
+//! card ran any list of ours at all (the spans joined), which beside the
+//! card's clock line ("nothing of ours queued") tells running from waiting
+//! in the queue. A clamp's pair costs what its own barriers cost already:
+//! the card has drained for it.
 
 use std::sync::Mutex;
 
@@ -41,10 +50,33 @@ pub(crate) enum Kind {
     /// Inside one of those: from where a pipeline is bound to where the
     /// next one is, or the list ends ([`begin_named`]).
     Pipeline,
+    /// A title list's prelude (texture states, twin copies, the gathered
+    /// indirect records' clamp), run just ahead of it.
+    Prelude,
+    /// Inside a title list or a prelude: an indirect clamp, from its first
+    /// barrier to its last ([`times`] only).
+    Clamp,
+    /// Inside a send-and-hash list: a copy's hash passes ([`times`] only).
+    Hash,
 }
 
-/// Pairs of timestamps in the ring.
-const PAIRS: u32 = 32768;
+/// The kinds in [`Meter::period`]'s order.
+const KINDS: usize = 7;
+
+impl Kind {
+    fn index(self) -> usize {
+        self as usize
+    }
+    /// A kind whose pairs lie inside another's.
+    fn nested(self) -> bool {
+        matches!(self, Kind::Pipeline | Kind::Clamp | Kind::Hash)
+    }
+}
+
+/// Pairs of timestamps in the ring: a second and a half of lists at most,
+/// with an indirect clamp's pair for each of some 4,000 draws a frame
+/// ([`times`]).
+const PAIRS: u32 = 1 << 17;
 /// A pair is read this long after it was recorded.
 const AFTER: std::time::Duration = std::time::Duration::from_millis(1000);
 
@@ -87,6 +119,13 @@ struct Meter {
     /// not written since (its list never ran) still holds that, and is
     /// not counted again.
     seen: Vec<(u64, u64)>,
+    /// Since the last [`line`]: by kind ([`Kind::index`]), microseconds
+    /// and pairs; the outer pairs' spans in ticks; frames; pairs not
+    /// recorded because the ring was full.
+    period: [(u64, u64); KINDS],
+    spans: Vec<(u64, u64)>,
+    period_frames: u64,
+    full: u64,
 }
 
 // SAFETY: host objects (free-threaded) and a mapping only read, behind a lock.
@@ -97,10 +136,20 @@ static METER: Mutex<Option<Option<Meter>>> = Mutex::new(None);
 /// Whether lists are timed.
 pub(crate) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| match std::env::var_os("VICTORY_CARD_METER") {
-        Some(v) => v != "0",
-        None => cfg!(feature = "diagnostics"),
+    *ON.get_or_init(|| {
+        times()
+            || match std::env::var_os("VICTORY_CARD_METER") {
+                Some(v) => v != "0",
+                None => cfg!(feature = "diagnostics"),
+            }
     })
+}
+
+/// `VICTORY_GPU_TIMES=1`: lists are timed in any build, the clamps and hash
+/// passes inside them too, and [`line`] goes with every frame-rate line.
+pub(crate) fn times() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMES").is_some_and(|v| v == "1"))
 }
 
 fn make() -> Option<Meter> {
@@ -152,6 +201,10 @@ fn make() -> Option<Meter> {
             by_pipeline: Default::default(),
             frames: 0,
             seen: vec![(0, 0); PAIRS as usize],
+            period: [(0, 0); KINDS],
+            spans: Vec::new(),
+            period_frames: 0,
+            full: 0,
         })
     }
 }
@@ -167,6 +220,7 @@ pub(crate) fn begin(list: &ID3D12GraphicsCommandList, kind: Kind) -> Span {
     };
     // The ring must not come round to pairs that were not read yet.
     if m.pending.len() as u32 >= PAIRS - 64 {
+        m.full += 1;
         return Span::NONE;
     }
     let pair = m.next;
@@ -175,6 +229,36 @@ pub(crate) fn begin(list: &ID3D12GraphicsCommandList, kind: Kind) -> Span {
     // SAFETY: an open list and our query heap.
     unsafe { list.EndQuery(&m.heap, D3D12_QUERY_TYPE_TIMESTAMP, pair * 2) };
     Span(pair)
+}
+
+/// [`end`] without the resolve: the pair's second timestamp only; true if
+/// there was a pair, which [`resolve`] must then be given in the same list.
+pub(crate) fn end_unresolved(list: &ID3D12GraphicsCommandList, span: Span) -> bool {
+    if span.0 == u32::MAX {
+        return false;
+    }
+    let meter = METER.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(Some(m)) = meter.as_ref() else {
+        return false;
+    };
+    // SAFETY: an open list and our heap.
+    unsafe { list.EndQuery(&m.heap, D3D12_QUERY_TYPE_TIMESTAMP, span.0 * 2 + 1) };
+    true
+}
+
+/// The pair of `span`, both written in this list ([`end_unresolved`]), goes
+/// to the read-back buffer when the card has run the list.
+pub(crate) fn resolve(list: &ID3D12GraphicsCommandList, span: Span) {
+    if span.0 == u32::MAX {
+        return;
+    }
+    let meter = METER.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(Some(m)) = meter.as_ref() else {
+        return;
+    };
+    // SAFETY: an open list, our heap and our read-back buffer, the pair's
+    // own sixteen bytes of it.
+    unsafe { list.ResolveQueryData(&m.heap, D3D12_QUERY_TYPE_TIMESTAMP, span.0 * 2, 2, &m.back, u64::from(span.0) * 16) };
 }
 
 /// The list ends here: the pair's second timestamp, and both go to the
@@ -286,6 +370,12 @@ pub(crate) fn collect() {
             continue;
         }
         let us = micros(begin, end, m.frequency);
+        let p = &mut m.period[kind.index()];
+        p.0 += us;
+        p.1 += 1;
+        if !kind.nested() && us > 0 && times() {
+            m.spans.push((begin, end));
+        }
         use crate::framelog::{T, add};
         match kind {
             Kind::Sync => {
@@ -312,9 +402,11 @@ pub(crate) fn collect() {
                     e.1 += us;
                 }
             }
+            Kind::Prelude | Kind::Clamp | Kind::Hash => {}
         }
     }
     m.frames += 1;
+    m.period_frames += 1;
     if m.frames >= 256 {
         let frames = m.frames as f64;
         let mut table: Vec<(String, (u64, u64))> = m.by_name.drain().collect();
@@ -354,6 +446,69 @@ pub(crate) fn collect() {
     }
 }
 
+/// The length of the union of `spans` (in any order), in their units.
+fn joined(spans: &mut [(u64, u64)]) -> u64 {
+    spans.sort_unstable();
+    let mut all = 0;
+    let mut open: Option<(u64, u64)> = None;
+    for &(from, to) in spans.iter() {
+        match open {
+            Some((a, b)) if from <= b => open = Some((a, b.max(to))),
+            _ => {
+                if let Some((a, b)) = open {
+                    all += b - a;
+                }
+                open = Some((from, to));
+            }
+        }
+    }
+    all + open.map_or(0, |(a, b)| b - a)
+}
+
+/// With the frame-rate line ([`times`]): the card's own time per frame
+/// since the last one, of the lists read meanwhile (recorded a second
+/// before), by kind.
+pub(crate) fn line() {
+    if !times() {
+        return;
+    }
+    let mut meter = METER.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(Some(m)) = meter.as_mut() else {
+        return;
+    };
+    let frames = std::mem::take(&mut m.period_frames);
+    let period = std::mem::take(&mut m.period);
+    let mut spans = std::mem::take(&mut m.spans);
+    let full = std::mem::take(&mut m.full);
+    if frames == 0 {
+        return;
+    }
+    let f = frames as f64;
+    let ran = joined(&mut spans) as f64 * 1e3 / m.frequency.max(1) as f64 / f;
+    let ms = |k: Kind| period[k.index()].0 as f64 / 1e3 / f;
+    let n = |k: Kind| period[k.index()].1 as f64 / f;
+    tracing::info!(
+        "the card's own clock per frame (VICTORY_GPU_TIMES=1; {frames} frames, lists recorded a second before): our lists ran \
+         {ran:.1} ms (their spans joined: the card's clock line's busy time less this is time our work waited in the queue); \
+         the title's lists (with ours recorded as such: presents, uploads, clears) {:.1} ms in {:.1}, of it indirect clamps (in \
+         those and in preludes) {:.1} ms in {:.1}; the lists' preludes {:.1} ms in {:.1}; our send-and-hash lists {:.1} ms in {:.1}, of it hash passes {:.1} ms in {:.1}; our compare \
+         lists {:.1} ms in {:.1}{}",
+        ms(Kind::Lists),
+        n(Kind::Lists),
+        ms(Kind::Clamp),
+        n(Kind::Clamp),
+        ms(Kind::Prelude),
+        n(Kind::Prelude),
+        ms(Kind::Sync),
+        n(Kind::Sync),
+        ms(Kind::Hash),
+        n(Kind::Hash),
+        ms(Kind::Check),
+        n(Kind::Check),
+        if full > 0 { format!("; {full} lists left untimed with the ring of pairs full") } else { String::new() }
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,6 +522,14 @@ mod tests {
         names.insert("mesh VS_A, pixel PS_B".to_string());
         names.insert("a".repeat(100));
         assert_eq!(name_of(&names), format!("3 pipelines: {} / compute CS_Blur", "a".repeat(60)));
+    }
+
+    #[test]
+    fn spans_that_overlap_or_touch_are_counted_once() {
+        assert_eq!(joined(&mut []), 0);
+        assert_eq!(joined(&mut [(10, 20)]), 10);
+        // Nested, overlapping, touching, apart; in any order.
+        assert_eq!(joined(&mut [(30, 40), (10, 20), (12, 15), (18, 25), (25, 27), (50, 51)]), 17 + 10 + 1);
     }
 
     #[test]

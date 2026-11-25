@@ -548,7 +548,16 @@ fn clamp_into(
     ahead: bool,
 ) -> bool {
     let before = list.indirect_state(dst);
+    // The card's time of the clamp (`VICTORY_GPU_TIMES=1`; the pair is
+    // resolved when the list closes); one with no records dispatches
+    // nothing and is not timed.
+    let timed = if crate::cardmeter::times() && spec.2 > 0 {
+        crate::cardmeter::begin(&list.list, crate::cardmeter::Kind::Clamp)
+    } else {
+        crate::cardmeter::Span::NONE
+    };
     let recorded = record_clamp_as(c, &list.list, (dst, before), budget, src, count, spec, ahead);
+    list.clamp_timed(timed);
     if recorded {
         list.indirect_readable(dst);
     }

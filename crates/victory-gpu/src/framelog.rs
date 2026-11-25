@@ -541,6 +541,11 @@ const LONG_MOST: usize = 8;
 /// thread that made it.
 pub fn frame() {
     if !on() {
+        // The card meter's pairs are read once a frame all the same
+        // (`VICTORY_GPU_TIMES=1` without the frame log).
+        if crate::cardmeter::times() {
+            crate::cardmeter::collect();
+        }
         return;
     }
     crate::cardmeter::collect();
