@@ -6486,6 +6486,13 @@ impl Meter {
                      mapped while the runtime remapped instead of waiting for it (VICTORY_TEXTURE_PARTLY_WAIT=1 waits)"
                 );
             }
+            let [kept, made] = [0, 1].map(|i| crate::texture::STAGING_TAKEN[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if kept + made > 0.0 {
+                tracing::info!(
+                    "texture staging buffers per frame: {kept:.1} taken from those kept, {made:.1} made \
+                     (VICTORY_STAGING_POOL=0 makes each)"
+                );
+            }
             let blind = crate::texture::BLIND.swap(0, Ordering::Relaxed);
             if blind > 0 {
                 tracing::info!(

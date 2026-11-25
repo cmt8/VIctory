@@ -500,3 +500,100 @@ fn membench() {
     );
     drop(Arc::try_unwrap(pool).ok());
 }
+
+/// What a texture's staging memory costs on the host at hand
+/// (`VICTORY_MEMBENCH=1`, on the first hardware adapter): a buffer made,
+/// mapped, written and let go per upload, as `crate::texture::staging`
+/// does, in the upload heap and in the PC's cached memory, against one
+/// buffer written again. Written sequentially and in 64-byte runs a row
+/// pitch apart (a detile's pattern).
+#[test]
+fn staging_bench() {
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4};
+    if !on() {
+        return;
+    }
+    // SAFETY: plain D3D12 setup.
+    let device: ID3D12Device = unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+        let adapter: IDXGIAdapter1 = factory.EnumAdapters1(0).unwrap();
+        let mut device: Option<ID3D12Device> = None;
+        D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).unwrap();
+        device.unwrap()
+    };
+    let make = |size: usize, upload: bool| -> (ID3D12Resource, *mut u8) {
+        let heap = if upload {
+            D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() }
+        } else {
+            D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_CUSTOM,
+                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                ..Default::default()
+            }
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size as u64,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let state = if upload { D3D12_RESOURCE_STATE_GENERIC_READ } else { D3D12_RESOURCE_STATE_COMMON };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: plain creation and mapping.
+        unsafe {
+            device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut buffer).unwrap();
+            buffer.as_ref().unwrap().Map(0, None, Some(&mut data)).unwrap();
+        }
+        (buffer.unwrap(), data.cast())
+    };
+    let source = vec![7u8; 16 << 20];
+    // Sequential, or 64-byte runs: a 256-byte-pitch tile's rows, tile after tile.
+    let write = |to: *mut u8, size: usize, runs: bool| {
+        if !runs {
+            // SAFETY: `size` bytes of the mapping.
+            unsafe { std::ptr::copy_nonoverlapping(source.as_ptr(), to, size) };
+            return;
+        }
+        let pitch = 4096;
+        let rows = size / pitch;
+        let mut from = 0;
+        for tile_row in (0..rows).step_by(8) {
+            for tile_col in (0..pitch).step_by(64) {
+                for row in tile_row..(tile_row + 8).min(rows) {
+                    // SAFETY: inside the mapping and the source.
+                    unsafe { std::ptr::copy_nonoverlapping(source.as_ptr().add(from), to.add(row * pitch + tile_col), 64) };
+                    from = (from + 64) % (8 << 20);
+                }
+            }
+        }
+    };
+    for size in [64usize << 10, 256 << 10, 1 << 20, 4 << 20] {
+        let n = ((64usize << 20) / size).clamp(8, 512);
+        let mb = |ns: f64| size as f64 / ns * 1e3;
+        for upload in [true, false] {
+            let heap = if upload { "upload heap" } else { "cached PC memory" };
+            for runs in [false, true] {
+                let how = if runs { "64-byte runs" } else { "sequential" };
+                let ns = ns_per(n, |_| {
+                    let (buffer, data) = make(size, upload);
+                    write(data, size, runs);
+                    drop(buffer);
+                });
+                println!("membench: staging {} KiB, made per upload, {heap}, {how}: {ns:.0} ns ({:.0} MB/s)", size >> 10, mb(ns));
+                let (_buffer, data) = make(size, upload);
+                write(data, size, runs);
+                let ns = ns_per(n, |_| write(data, size, runs));
+                println!("membench: staging {} KiB, one buffer written again, {heap}, {how}: {ns:.0} ns ({:.0} MB/s)", size >> 10, mb(ns));
+            }
+        }
+    }
+}

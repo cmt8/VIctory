@@ -34,6 +34,9 @@ macro_rules! once {
 /// texture's subresources, and what was last detiled.
 pub(crate) struct Staging {
     buffer: ID3D12Resource,
+    /// The size class it was taken for from the kept buffers
+    /// ([`staging_pool`]), to which it goes back; 0: made for it alone.
+    class: u64,
     /// Its bytes.
     #[cfg(feature = "diagnostics")]
     size: u64,
@@ -525,7 +528,114 @@ impl Drop for Staging {
         use std::sync::atomic::Ordering::Relaxed;
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
+        if self.class != 0 {
+            // Nothing uses it any more (lists that uploaded from it held it
+            // until they had run): kept for the next texture of its class.
+            give_staging(self.buffer.clone(), self.data, self.class);
+        }
     }
+}
+
+/// Whether texture staging buffers are kept when their texture lets go of
+/// them, by size class, for the next texture that needs one of that class
+/// (`VICTORY_STAGING_POOL=0`: each made and freed with its texture, as
+/// before). On by default under Wine, off elsewhere (`=1` turns it on).
+///
+/// Textures picked by index let go of their staging buffer right after
+/// the upload, so each upload made an upload-heap buffer, mapped it and
+/// wrote its fresh pages: run 212937 (Proton) uploaded 108,659 such
+/// textures, 42 GB, and vkd3d-proton logged 388 times that the card's
+/// upload memory was full ("falling back to system memory"), with 12,292
+/// lock errors on that path. `membench`'s `staging_bench` on Proton's
+/// vkd3d-proton (RX 7900 XTX): a buffer made, mapped, written and freed
+/// per upload costs 33 us for 64 KiB, 74 us for 256 KiB, 223 us for
+/// 1 MiB and 618 us for 4 MiB; written again, 3, 12, 46 and 185 us.
+/// A class is the size rounded up to a quarter step between powers of two
+/// (at most a quarter more), from 64 KiB; buffers past 64 MiB are not kept,
+/// nor more than [`STAGING_SPARE_MOST`] bytes of them.
+fn staging_pool() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_STAGING_POOL").as_deref().map(str::trim) {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => crate::host::on_wine(),
+    })
+}
+
+/// The most bytes of staging buffers kept while no texture holds them.
+const STAGING_SPARE_MOST: u64 = 512 << 20;
+
+/// The size class of a staging buffer of `size` bytes ([`staging_pool`]):
+/// 0 if it is not kept.
+fn staging_class(size: u64) -> u64 {
+    const LEAST: u64 = 64 << 10;
+    const MOST: u64 = 64 << 20;
+    if size > MOST {
+        return 0;
+    }
+    if size <= LEAST {
+        return LEAST;
+    }
+    // Quarter steps between powers of two: 64, 80, 96, 112, 128, 160, ... KiB.
+    let step = (1u64 << (63 - (size - 1).leading_zeros())) / 4;
+    size.div_ceil(step) * step
+}
+
+/// Staging buffers no texture holds, by class, and their bytes in all.
+struct SpareStaging {
+    kept: HashMap<u64, Vec<(ID3D12Resource, usize)>>,
+    bytes: u64,
+}
+
+// SAFETY: D3D12 resources are free-threaded; the mappings are plain
+// addresses of persistently mapped buffers.
+unsafe impl Send for SpareStaging {}
+
+static SPARE_STAGING: Mutex<Option<SpareStaging>> = Mutex::new(None);
+
+/// Since the start: staging buffers taken from those kept, and made.
+pub(crate) static STAGING_TAKEN: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// A staging buffer of at least `size` bytes, mapped: a kept one of its
+/// class, or a new one. With the class it goes back to (0: none).
+fn take_staging(host: &crate::host::Host, size: u64) -> Option<(ID3D12Resource, *mut u8, u64)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let class = if staging_pool() { staging_class(size) } else { 0 };
+    if class != 0 {
+        let kept = {
+            let mut spare = SPARE_STAGING.lock().unwrap_or_else(|e| e.into_inner());
+            spare.as_mut().and_then(|spare| {
+                let kept = spare.kept.get_mut(&class).and_then(Vec::pop)?;
+                spare.bytes -= class;
+                Some(kept)
+            })
+        };
+        if let Some((buffer, data)) = kept {
+            STAGING_TAKEN[0].fetch_add(1, Relaxed);
+            // As a new buffer is: zeros. A refresh may upload it without
+            // detiling into it (nothing of the texture mapped, a read that
+            // failed), and it holds another texture's bytes.
+            // SAFETY: the mapping holds `class` >= `size` bytes, and no
+            // texture or list holds the buffer any more.
+            unsafe { (data as *mut u8).write_bytes(0, size as usize) };
+            return Some((buffer, data as *mut u8, class));
+        }
+    }
+    STAGING_TAKEN[1].fetch_add(1, Relaxed);
+    let (buffer, data) = host.upload_buffer(if class != 0 { class } else { size })?;
+    Some((buffer, data, class))
+}
+
+/// A staging buffer of class `class` no texture holds any more: kept, or
+/// freed past [`STAGING_SPARE_MOST`].
+fn give_staging(buffer: ID3D12Resource, data: *mut u8, class: u64) {
+    let mut spare = SPARE_STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let spare = spare.get_or_insert_with(|| SpareStaging { kept: HashMap::new(), bytes: 0 });
+    if spare.bytes + class > STAGING_SPARE_MOST {
+        return;
+    }
+    spare.bytes += class;
+    spare.kept.entry(class).or_default().push((buffer, data as usize));
 }
 
 /// For the memory line: staging buffers alive, their bytes, and how many
@@ -1363,7 +1473,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
-    let (buffer, data) = host.upload_buffer(total)?;
+    let (buffer, data, class) = take_staging(host, total)?;
     crate::host::name(&buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
@@ -1375,6 +1485,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
     let s = Arc::new(Staging {
         buffer,
+        class,
         #[cfg(feature = "diagnostics")]
         size: total,
         data,
@@ -1629,5 +1740,34 @@ mod guard_tests {
             .unwrap();
         write_from_another_thread(texture, 0xaa);
         assert_eq!(refresh(&mut last, frame), (false, Some(0xaa)));
+    }
+}
+
+#[cfg(test)]
+mod staging_pool_tests {
+    use super::staging_class;
+
+    /// A class holds its size, wastes at most a quarter of it (past the
+    /// smallest class), grows with it, and is 0 (not kept) past 64 MiB.
+    #[test]
+    fn staging_classes_hold_their_sizes_within_a_quarter() {
+        let mut last = 0;
+        for size in (1..=(64u64 << 20)).step_by(4093).chain([64 << 10, (64 << 10) + 1, 1 << 20, (1 << 20) + 1, 64 << 20]) {
+            let class = staging_class(size);
+            assert!(class >= size, "{size}: {class}");
+            if size > 64 << 10 {
+                assert!(class * 4 <= size * 5 + 4, "{size}: {class}");
+            }
+            assert_eq!(class % 512, 0, "{size}: {class}");
+            assert!(size < last || class >= staging_class(last), "{size}: {class}");
+            last = last.max(size);
+        }
+        assert_eq!(staging_class(64 << 10), 64 << 10);
+        assert_eq!(staging_class((64 << 10) + 1), 80 << 10);
+        assert_eq!(staging_class(1 << 20), 1 << 20);
+        assert_eq!(staging_class((1 << 20) + 1), 1280 << 10);
+        assert_eq!(staging_class((64 << 20) + 1), 0);
+        let classes: Vec<u64> = (1..1600u64).map(|i| staging_class(i * 40_000)).collect();
+        assert!(classes.windows(2).all(|w| w[0] <= w[1]));
     }
 }
