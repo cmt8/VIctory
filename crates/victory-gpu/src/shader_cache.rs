@@ -82,6 +82,10 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_FIRSTLANE_OWN",
                     "VICTORY_HALF_SUM_PRESENT",
                     "VICTORY_BUFFER_GUARD",
+                    // The node tests miss unless the structure builder runs
+                    // (`victory_shader::emit::bvh_miss`).
+                    "VICTORY_BVH_MISS",
+                    "VICTORY_BVH_BUILDER",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');

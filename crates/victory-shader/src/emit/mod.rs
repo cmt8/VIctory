@@ -205,6 +205,54 @@ pub fn buffer_guard() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_BUFFER_GUARD").is_none_or(|v| v != "0"))
 }
 
+/// Whether the ray-tracing node tests (`image_bvh_intersect_ray`,
+/// `image_bvh64_intersect_ray`) answer "nothing here" without reading the
+/// node: a box node has no child the ray enters, any other node is a
+/// triangle the ray misses ([`crate::bvh::MISS`]).
+///
+/// The structures are built by the console's structure builder, whose
+/// dispatches the host drops unless `VICTORY_BVH_BUILDER=1` (`victory-gpu`,
+/// `pipeline::builder_runs`); the programs that walk them run all the same,
+/// over title memory nothing built, and hit whatever that memory holds.
+/// The eyes, a glass and a patch of a forearm, the reflective surfaces of
+/// one scene, showed the same coloured grain (Linux run of linux/fx-next4);
+/// a walk that misses gives the title's own answer for a ray that leaves
+/// the scene (its reflection probes or sky; nothing in the way of a shadow
+/// or occlusion ray).
+///
+/// `VICTORY_BVH_MISS`: `0` tests nodes as before, `1` always misses; unset,
+/// misses unless `VICTORY_BVH_BUILDER=1`. Part of the translation: the
+/// shader cache keys on both.
+pub fn bvh_miss() -> bool {
+    #[cfg(test)]
+    if let Some(on) = BVH_MISS_TEST.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        bvh_miss_from(
+            std::env::var("VICTORY_BVH_MISS").ok().as_deref(),
+            std::env::var("VICTORY_BVH_BUILDER").ok().as_deref(),
+        )
+    })
+}
+
+/// [`bvh_miss`] from the two switches' values. Tests see the node test
+/// itself unless they ask for this ([`BVH_MISS_TEST`]).
+fn bvh_miss_from(miss: Option<&str>, builder: Option<&str>) -> bool {
+    match miss.map(str::trim) {
+        Some("0") => false,
+        Some("1") => true,
+        _ => !cfg!(test) && builder.map(str::trim) != Some("1"),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`bvh_miss`] on its thread (`None`: the switches').
+    pub(crate) static BVH_MISS_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
 pub fn shader_opt() -> u32 {

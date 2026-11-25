@@ -133,6 +133,22 @@ impl<'a> Lower<'a> {
             direction: [f[4], f[5], f[6]],
             inverse: [f[7], f[8], f[9]],
         };
+        if crate::emit::bvh_miss() {
+            // Nothing was built (`crate::emit::bvh_miss`): the node's kind alone
+            // says the answer, and no byte of title memory is read.
+            let _ = ray;
+            let c = self.cur;
+            let (k6, k4) = (self.s.m.i32(6), self.s.m.i32(4));
+            let pair = self.s.m.bin(c, Bin::And, pointer, k6);
+            let is_box = self.s.m.cmp(c, pred::EQ, pair, k4);
+            let none = self.s.m.i32(bvh::NONE);
+            for (k, miss) in bvh::MISS.iter().enumerate() {
+                let miss = self.s.m.i32(miss.to_bits());
+                let r = self.s.m.select(c, is_box, none, miss);
+                self.write(inst, Reg::V(dst + k as u8), r, guard);
+            }
+            return Ok(());
+        }
         let c = self.cur;
         let at = match nodes {
             BvhNodes::Resource => {

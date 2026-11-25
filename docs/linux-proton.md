@@ -222,6 +222,20 @@ frames later).
   views off their copy's elements" counts them; the once-only warnings
   "buffer view not on an element of its host copy" no longer appear with
   it on.
+- `VICTORY_BVH_MISS` (unset: on unless `VICTORY_BVH_BUILDER=1`; `=0` as
+  before; `=1` on even with the builder): the ray-tracing node tests
+  (`image_bvh_intersect_ray`, `image_bvh64_intersect_ray`) answer "nothing
+  here" without reading the node: a box node has no child the ray enters,
+  any other node is a triangle the ray misses. The structure builder's
+  dispatches are dropped unless `VICTORY_BVH_BUILDER=1`, but the programs
+  that walk the structures ran all the same over title memory nothing
+  built, and hit whatever it held: the coloured grain on eyes, glass and a
+  forearm patch in the linux/fx-next4 run is the suspected result. With
+  the switch every ray leaves the scene, so the title shows what it shows
+  for a miss (reflection probes or sky; nothing in the way of a shadow or
+  occlusion ray). Part of the shader cache key, as is
+  `VICTORY_BVH_BUILDER` now: changing either translates every shader
+  again.
 
 ## Tests
 
