@@ -664,6 +664,86 @@ sudo perf report -i ~/victory-logs/perf-off.data --stdio --no-children --sort sy
 top -H -p $(pgrep -x wineserver)   # is the wineserver one busy core?
 ```
 
+### Processor-side measurements (linux/fx-next8-cpu)
+
+Four candidates for the frame's processor time were measured on their own
+under Wine before any was built; none showed a gain there, so this branch
+adds benchmarks and no switch. Its exe behaves as linux/fx-next7's (same
+shader cache key, no warm-up). The benchmarks run under system Wine 11.22
+with Proton Experimental's vkd3d-proton on the real card
+(`VICTORY_MEMBENCH=1 cargo xtask wine-test --vkd3d-proton <dir> -- -p
+victory-gpu --release --lib <name> -- --nocapture`); Proton's own Wine was
+not used for them.
+
+- **The views table** (beloooo's ff920f22e on belobug makes it a
+  read-write lock): ours has been one since fxceless's merges. Under Wine
+  it pays (`views_lock_bench`: five threads 88 ns a lookup against 293 ns
+  under a mutex, one thread 15 ns either way). The locks still taken per
+  descriptor or per draw by the recording threads, left as they are:
+  `HostHeap::made` (descriptor/host.rs; `mirror` for every slot a draw
+  reads through a table, held across the views lookup and the host's
+  `Create*View`: 35 ns alone, 405 ns a slot under five threads,
+  `made_lock_bench`), the copies' tables in shadow.rs (`BUFFERS`,
+  `LOOSE`, `EXACT`; `buffer_copy` and `find` for every buffer view, vertex
+  and index buffer a draw reads: 200 ns alone, 1.3 us under five threads;
+  `BUFFERS` is also held while a new copy's host buffer is made), and per
+  slot written or made: `HostHeap::kept`, `buffers`, `changed`,
+  `textures`, `placed`, the title heap's `pending`, and per table made for
+  a draw `HostHeap::next`.
+- **The heap pass's buffer part several at a time** (`VICTORY_WIDE_BUFFERS`
+  was the plan): slower, not made (`heap_buffers_bench`, 4,096 slots: 2.8
+  ms one after another, 4.4 ms several at a time; made already 0.9 against
+  1.4 ms), because of the first two locks above. In the game, the status
+  line `the pass over the heap per frame` says how much of the frame
+  line's `heap buffers ... ms` is its texture part, the rest being the
+  buffer part.
+- **Copy-up besides the copying** (`copy_up_pieces_bench`): the kernel's
+  copy runs at memcpy speed (2.2 us a 64 KiB piece; no lock under Wine for
+  our own process: `NtReadVirtualMemory` is a guarded `memmove` in
+  Proton's `ntdll.so`). Besides it, idle: 1.3-1.7 us a written 64 KiB page
+  of write-watched memory (the write watch's reset) and 4.5-6.7 us a
+  written 64 KiB block of guarded view memory (the guard set again, one
+  call a block), on top of which the title's write there cost a fault
+  (4-5 us in our handler plus Wine's path) and an opening call (4-5 us)
+  on its own thread. 212 MB in 64 KiB pieces is then 5-22 ms idle beside
+  7 ms of copying: a tenth of run 232629's 166 ms. The rest is waiting,
+  which the in-game lines below place.
+- **Title memory in place through a view of ours** (beloooo's 0434b3acd,
+  `VICTORY_STRETCH` on belobug): not ported. On the real card under Wine
+  (`host_in_place_probe`), a section's pages opened as a host heap, from
+  the mapping or as a stretch mapped again at an address of ours, open
+  without an error but the card reads other bytes than the view shows and
+  its writes do not show there: the card would silently use memory that
+  is not the title's. Private memory in place does work (reads, and a
+  copy's writes).
+
+What decides the next step for the copies is one run of linux/fx-next7 or
+this branch with `VICTORY_FRAME_LOG=1 VICTORY_VM_STATS=1`, in the world,
+then `scripts/perf-summary.sh` and these lines, against the frame line's
+`copies X ms Y MB`:
+
+```sh
+grep -E "vm stats: (all our calls|site (kernel-read|watch-range|watch-ahead|protect-guard|protect-guard-other|protect-open-fault|fault-handler|remap) )" run-HHMMSS.log
+grep -E "vm stats: thread .*submit" run-HHMMSS.log
+grep "title memory copied by the refreshes per frame" run-HHMMSS.log
+```
+
+- `site kernel-read` ms near the copies' ms: the copying itself is slow
+  (memory, not calls); idle it takes about 35 us a MiB copied (2.2 us a
+  64 KiB piece).
+- `watch-range` + `watch-ahead` + `protect-guard` + `protect-guard-other`
+  ms on the submitting thread (`submit ... ms`) most of the copies' ms,
+  mostly in `slow taking`: the copies wait for ntdll's lock, held by
+  `remap` (the runtime) and by `fault-handler` / `protect-open-fault` (the
+  title's writes, other threads). The candidate then is fewer such calls:
+  a guarded block the title writes in every frame left open and copied
+  whole at each refresh (2 us of copying against a fault, an opening and a
+  guard, three takings of the lock), which touches what else reads the
+  guards' news (texture checks, the other views of the pages, the
+  copy-back's merge) and is not built yet.
+- Neither: the time is ours between the calls (the write journal's lock
+  is held across its kernel calls and the guards'); a profile is next.
+
 ## Tests
 
 ```sh
