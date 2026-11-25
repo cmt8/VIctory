@@ -118,6 +118,18 @@ fn wait_budget() -> Duration {
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
 
+/// Microseconds the title's threads waited for pipelines being made, since
+/// the last [`take_waited`]. A release build had no word of it: run 14's
+/// frames were 600 ms, 500 of them a recording thread waiting the whole
+/// budget for pipelines whose workers had died, and the frame line showed
+/// only "(3 being made)".
+static WAITED_US: AtomicU64 = AtomicU64::new(0);
+
+/// [`WAITED_US`], taken (for the frame line).
+pub(crate) fn take_waited() -> u64 {
+    WAITED_US.swap(0, Ordering::Relaxed)
+}
+
 /// Pipelines queued and not made yet (for the frame line).
 pub(crate) fn waiting() -> u64 {
     WAITING.load(Ordering::Relaxed)
@@ -203,6 +215,7 @@ fn wait(p: &Pending, frame: u64) {
     }
     drop(held);
     let waited = started.elapsed().min(left);
+    WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
     {
         let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
         // A frame that began meanwhile has its own budget.

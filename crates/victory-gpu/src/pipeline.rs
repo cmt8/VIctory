@@ -400,6 +400,14 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
+/// Microseconds the title's threads waited for pipelines being made since
+/// the last call, and the pipelines whose making ended their thread since
+/// the start (under Wine, `apart`).
+#[cfg(windows)]
+pub(crate) fn waited() -> (u64, u64) {
+    (make::take_waited(), apart::ENDED.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
 /// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
