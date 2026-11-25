@@ -3325,7 +3325,7 @@ mod read_settles {
 /// same frame reads). It is for measuring what the fills' waits cost; the
 /// count says whether the bytes were ever stale.
 mod fill_ahead {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
     use std::sync::{Mutex, OnceLock};
 
@@ -3335,16 +3335,23 @@ mod fill_ahead {
     /// it at most (flights are settled at 256 lists in the air, and by
     /// every present that waits).
     const KEEP: u64 = 16;
-    /// Pieces held back (fills reading them wait) before all fills wait.
+    /// Pieces held back at once (fills reading them wait) before all fills
+    /// wait.
     const HELD_MAX: usize = 8;
+    /// Frames a piece is held back after its first miss.
+    const HOLD_FRAMES: u64 = 60;
 
     /// More than `HELD_MAX` pieces had a miss: every fill waits.
     static WAIT: AtomicBool = AtomicBool::new(false);
     /// Whether `HELD` has any piece (a cheap look before the lock).
     static ANY_HELD: AtomicBool = AtomicBool::new(false);
     /// The pieces where a flight changed bytes a fill had read ahead of
-    /// it: fills that read them wait.
-    static HELD: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+    /// it: until which frame fills that read them wait, and how many times
+    /// the piece had such a miss. A miss holds the piece back for
+    /// `HOLD_FRAMES` frames, twice as long at each miss after (one held for
+    /// good made a buffer copy reading it settle the flights about every
+    /// other frame for the rest of the run, after a single miss).
+    static HELD: Mutex<Option<HashMap<usize, (u64, u32)>>> = Mutex::new(None);
     /// Since the last frame line: fills that read ahead; landings' writes
     /// that touched one's piece. Since the start: fills that read bytes a
     /// flight then changed; fills not compared because the title had
@@ -3391,22 +3398,35 @@ mod fill_ahead {
         }
         let held = HELD.lock().unwrap_or_else(|e| e.into_inner());
         let Some(held) = held.as_ref() else { return true };
-        !(src / PIECE..=(src + len - 1) / PIECE).any(|piece| held.contains(&piece))
+        let frame = crate::frame::current();
+        !(src / PIECE..=(src + len - 1) / PIECE).any(|piece| held.get(&piece).is_some_and(|h| h.0 > frame))
     }
 
-    /// Fills that read `[from, to)` wait from now on (or every fill, past
-    /// `HELD_MAX` pieces). True the first time anything is held.
+    /// The pieces held back now.
+    fn held_now(held: &HashMap<usize, (u64, u32)>) -> usize {
+        let frame = crate::frame::current();
+        held.values().filter(|h| h.0 > frame).count()
+    }
+
+    /// Fills that read `[from, to)` wait for a while ([`HELD`]), or every
+    /// fill from now on, past `HELD_MAX` pieces held at once. True the first
+    /// time anything is held.
     fn hold(from: usize, to: usize) -> bool {
         let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
-        let held = held.get_or_insert_with(HashSet::new);
+        let held = held.get_or_insert_with(HashMap::new);
         let first = held.is_empty();
-        held.extend(from / PIECE..=(to - 1) / PIECE);
+        let frame = crate::frame::current();
+        for piece in from / PIECE..=(to - 1) / PIECE {
+            let h = held.entry(piece).or_insert((0, 0));
+            h.1 += 1;
+            h.0 = frame + (HOLD_FRAMES << (h.1 - 1).min(10));
+        }
         ANY_HELD.store(true, Relaxed);
-        if held.len() > HELD_MAX && !WAIT.swap(true, Relaxed) {
+        let now = held_now(held);
+        if now > HELD_MAX && !WAIT.swap(true, Relaxed) {
             tracing::warn!(
-                "fills of upload memory read ahead of flights that changed their bytes in {} pieces of 64 KiB: every fill \
-                 waits for flights again from here on, as with VICTORY_FILL_WAIT=1",
-                held.len()
+                "fills of upload memory read ahead of flights that changed their bytes in {now} pieces of 64 KiB at once: \
+                 every fill waits for flights again from here on, as with VICTORY_FILL_WAIT=1"
             );
         }
         first
@@ -3501,7 +3521,7 @@ mod fill_ahead {
                 tracing::warn!(
                     "a fill of upload memory read {} bytes at {from:#x} in frame {read_in} ahead of a flight whose shaders changed \
                      them (first at {:#x}, landed in frame {frame}): the lists of that submission drew with the bytes from before. \
-                     Fills that read its 64 KiB wait for flights from here on; past {HELD_MAX} such pieces, every fill does \
+                     Fills that read its 64 KiB wait for flights for a while, longer at each miss; past {HELD_MAX} such pieces at once, every fill does \
                      ({n} such fills)",
                     to - from,
                     a + first
@@ -3530,12 +3550,12 @@ mod fill_ahead {
         tracing::info!(
             "fills of upload memory that read title memory flights may write, not waited for (VICTORY_FILL_WAIT=1 waits): {:.1} per \
              frame; {:.1} landings' writes per frame fell in the same 64 KiB as one and were compared with it; fills that read \
-             bytes a flight then changed, since the start: {} ({} pieces of 64 KiB held back{}); fills not compared because the \
+             bytes a flight then changed, since the start: {} ({} pieces of 64 KiB held back now{}); fills not compared because the \
              title had rewritten their bytes since: {}; {kept} fills kept to check",
             ahead as f64 / frames,
             looked as f64 / frames,
             COUNT[2].load(Relaxed),
-            HELD.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, HashSet::len),
+            HELD.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, held_now),
             if WAIT.load(Relaxed) { ", every fill waits again" } else { "" },
             COUNT[3].load(Relaxed)
         );
@@ -3546,7 +3566,8 @@ mod fill_ahead {
         use super::*;
 
         fn held(at: usize) -> bool {
-            HELD.lock().unwrap().as_ref().is_some_and(|h| h.contains(&(at / PIECE)))
+            let frame = crate::frame::current();
+            HELD.lock().unwrap().as_ref().is_some_and(|h| h.get(&(at / PIECE)).is_some_and(|h| h.0 > frame))
         }
 
         /// One test: the module's state is shared by the whole process.
