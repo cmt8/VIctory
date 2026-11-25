@@ -1563,6 +1563,13 @@ pub(crate) fn dred_on() -> bool {
 /// budget buffers, a run late).
 static MESH_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// What the argument clamp noted about the lists that ran since the last
+/// frame line (`crate::indirect`): indirect records that asked for work and
+/// ran empty because their list's budget was spent; records that asked for
+/// nothing; draw records cut by the vertex or instance bounds; lists whose
+/// budget ran out.
+static CLAMP_NOTES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
 /// Whether each list of a submission runs and is timed on its own, slow
 /// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
 /// builds; the commands are noted with `VICTORY_D3D12_DRED` on).
@@ -5622,13 +5629,21 @@ impl HostList {
             // SAFETY: the list's own mapped words, written before it runs.
             // The words after the budget hold what the clamp noted about the
             // list's last run (mesh dispatches: the largest group count
-            // asked for, the groups asked in all): taken, then zeroed.
+            // asked for, the groups asked in all; records run empty with the
+            // budget spent, records asking for nothing, draw records cut by
+            // the bounds): taken, then zeroed. (A list that never ran left
+            // zeros.)
             deferred.copies.push(Step::Host(Box::new(move || unsafe {
                 let words = at as *mut u32;
                 let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
                 MESH_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
                 MESH_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
-                for k in 0..3 {
+                let emptied = words.add(3).read_volatile();
+                CLAMP_NOTES[0].fetch_add(u64::from(emptied), Ordering::Relaxed);
+                CLAMP_NOTES[1].fetch_add(u64::from(words.add(4).read_volatile()), Ordering::Relaxed);
+                CLAMP_NOTES[2].fetch_add(u64::from(words.add(5).read_volatile()), Ordering::Relaxed);
+                CLAMP_NOTES[3].fetch_add(u64::from(emptied > 0), Ordering::Relaxed);
+                for k in 0..6 {
                     words.add(k).write_volatile(0);
                 }
             })));
@@ -6449,6 +6464,12 @@ impl Meter {
         tracing::info!(
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
         );
+        let [emptied, nothing, cut, spent] = [0, 1, 2, 3].map(|i| CLAMP_NOTES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        if crate::pipeline::drop_reasons() {
+            tracing::info!(
+                "indirect records per frame: {emptied:.1} run empty with their list's budget spent ({spent:.1} lists ran out; VICTORY_INDIRECT_BUDGET_LOG2 sets it), {nothing:.1} asked for nothing (or past what one execution runs), {cut:.1} draws cut to the vertex or instance bounds"
+            );
+        }
         late_line(frames);
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);

@@ -140,6 +140,15 @@ A draw or dispatch whose root descriptor (title memory's directory, the
 view heap's address or stride table, a root constant buffer, a root view
 outside title memory) has nothing to bind is dropped, named in the drop
 reasons, instead of running with the parameter unbound.
+With `VICTORY_DROP_REASONS=1` a line `indirect records per frame` also
+says what the argument clamp did to the indirect records it bounded: how
+many asked for work and ran empty because their list's budget (2^27 vertex
+instances or threads) was spent, how many lists ran out, how many records
+asked for nothing, and how many draws were cut to the bounds. Records
+emptied by the budget draw nothing and are counted nowhere else.
+`VICTORY_INDIRECT_BUDGET_LOG2=<20..31>` sets the budget for A/B runs; a
+larger one lets garbage records (left by passes that do not run) run
+longer before they are cut, which on a slow card can mean a reset.
 `VICTORY_PIPELINE_WAIT_MS` sets how long a frame may wait for pipelines
 being made (500 by default; 0 never waits, pipelines then appear a few
 frames later).
