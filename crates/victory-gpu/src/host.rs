@@ -6134,6 +6134,14 @@ impl Meter {
                      {first:.1} read whole that way, {on:.1} read under the lock as before (a page was not there)"
                 );
             }
+            let blind = crate::texture::BLIND.swap(0, Ordering::Relaxed);
+            if blind > 0 {
+                tracing::info!(
+                    textures = blind,
+                    "textures found changed with no write the guards saw (through another view of their pages, say): read at every \
+                     refresh for a while (VICTORY_BLIND_TEXTURES=0: on their turn, one frame in eight)"
+                );
+            }
         }
         {
             let [copies, joined] = [0, 1].map(|i| COPIES_JOINED[i].swap(0, Ordering::Relaxed) as f64 / frames);

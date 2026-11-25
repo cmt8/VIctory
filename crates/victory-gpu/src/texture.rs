@@ -66,6 +66,88 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// Until this frame the texture is read at every refresh although the
+    /// guards saw no write to it ([`Last::passes_over`]).
+    blind_until: u64,
+}
+
+/// A texture in view memory the guards saw no write to is read only every
+/// this many frames, by its address, so that the textures take turns.
+const HASH_EVERY: u64 = 8;
+
+/// How long a texture found changed behind the guards is read at every
+/// refresh: about four seconds at the title's 30 frames a second, and
+/// again from each change found.
+const BLIND_FRAMES: u64 = 120;
+
+/// Textures found changed behind the guards since the last frame-rate line
+/// ([`Last::read_behind_guards`]).
+pub(crate) static BLIND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether a texture found changed behind the guards is read at every
+/// refresh for a while (`VICTORY_BLIND_TEXTURES=0`: only on its turn, as
+/// before).
+fn blind_textures() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BLIND_TEXTURES").is_none_or(|v| v != "0"))
+}
+
+impl Last {
+    /// Whether a refresh of the texture at `start` in frame `frame`, whose
+    /// memory the guards saw no write to, is passed over.
+    ///
+    /// The guards see the title's writes through the view the texture is
+    /// in, not writes to the same pages through another view of them (the
+    /// title maps physical pages where it likes, more than once if it
+    /// likes), nor any other write that takes no fault of ours. Those were
+    /// found only by the hash taken on the texture's turn, one frame in
+    /// [`HASH_EVERY`]: the boot logo's video, decoded into one of its three
+    /// sets of planes every frame, then changed one frame in eight and
+    /// showed its sets as they were at their last hash, out of order
+    /// (runs under Proton: 1.6 MB of texture reads a frame while it
+    /// played, an eighth of a set's 12.7 MB, where VIctory main read a set
+    /// every frame and the video was smooth). A texture whose hash changed
+    /// with no write seen is read at every refresh for [`BLIND_FRAMES`]
+    /// after.
+    fn passes_over(&self, frame: u64, start: usize) -> bool {
+        let turn = frame.wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
+        !turn && frame >= self.blind_until
+    }
+
+    /// A refresh of guarded view memory in frame `frame`: `read` reads the
+    /// texture at `start` (and sets its hash) unless the guards saw no
+    /// write (`unwritten`) and [`Last::passes_over`] it. Returns what
+    /// `read` returns, or 0.
+    fn refresh_guarded(
+        &mut self,
+        frame: u64,
+        start: usize,
+        unwritten: bool,
+        read: impl FnOnce(&mut Last) -> usize,
+    ) -> usize {
+        if !unwritten {
+            return read(self);
+        }
+        if self.passes_over(frame, start) {
+            return 0;
+        }
+        let before = self.hash;
+        let n = read(self);
+        self.read_behind_guards(frame, before);
+        n
+    }
+
+    /// After a read that [`Last::passes_over`] let through though the
+    /// guards saw no write: the texture's hash was `before`; if the read
+    /// found it changed, it is read at every refresh for a while.
+    fn read_behind_guards(&mut self, frame: u64, before: Option<blake3::Hash>) {
+        if before.is_some() && self.hash != before && blind_textures() {
+            if frame >= self.blind_until {
+                BLIND.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.blind_until = frame + BLIND_FRAMES;
+        }
+    }
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -739,20 +821,24 @@ impl Staging {
         // happened the texture is as it was. What the guard cannot see (a
         // write to the same pages through another view) is still found by
         // the hash, which is taken every eighth frame only, by the
-        // texture's address, so the textures take turns.
+        // texture's address, so the textures take turns; and at every
+        // refresh for a while once it found one (`Last::passes_over`).
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
-            const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
-            let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
-            if unwritten && !turn {
-                return 0;
-            }
+            let frame = crate::frame::current();
+            return last.refresh_guarded(frame, start, unwritten, |last| self.read_now(last, size));
         }
+        self.read_now(last, size)
+    }
+
+    /// Reads the texture's memory, and detiles it if its hash changed (or
+    /// if it is watched no other way). Returns the bytes read.
+    fn read_now(&self, last: &mut Last, size: usize) -> usize {
         // Read through the kernel's copy, which needs no lock: whole, or on
         // to the read under the lock below (`copy_first`).
         if copy_first() {
@@ -1358,5 +1444,133 @@ mod title_memory_tests {
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::{BLIND_FRAMES, HASH_EVERY, Last};
+    use crate::watch::PAGE;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Memory::{
+        CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+        PAGE_READWRITE, UnmapViewOfFile,
+    };
+
+    const SIZE: usize = 2 * PAGE;
+
+    /// Two views of one pagefile section: the texture's, which the guards
+    /// watch, and the decoder's, through which it is written.
+    struct Views([MEMORY_MAPPED_VIEW_ADDRESS; 2]);
+
+    impl Drop for Views {
+        fn drop(&mut self) {
+            crate::watch::title_memory_remapped(self.0[0].Value as usize, SIZE);
+            for view in self.0 {
+                // SAFETY: our views, still mapped.
+                unsafe { UnmapViewOfFile(view) };
+            }
+        }
+    }
+
+    /// Writes `byte` over the texture through `at` on a thread of its
+    /// own, as the title's decoder threads do, and waits for it.
+    fn write_from_another_thread(at: usize, byte: u8) {
+        std::thread::spawn(move || {
+            // SAFETY: `SIZE` committed read-write bytes of a view, which
+            // nothing reads meanwhile (the caller waits).
+            unsafe { std::ptr::write_bytes(at as *mut u8, byte, SIZE) };
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// A texture whose memory another thread rewrites every frame through
+    /// another view of the same pages (the boot logo's video planes): the
+    /// guards see none of it, and the texture was read one frame in
+    /// eight. Once a read on its turn finds it changed it is read, and
+    /// shows the frame's contents, at every frame; once the writes stop,
+    /// one frame in eight again after `BLIND_FRAMES`. A write through the
+    /// texture's own view is seen by the guards and read at once.
+    #[test]
+    fn a_texture_rewritten_through_another_view_is_read_every_frame() {
+        // SAFETY: a new pagefile section mapped twice, read-write; the
+        // views hold it after the handle is closed.
+        let views = unsafe {
+            let section = CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                SIZE as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let views = [0, 1].map(|_| MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, SIZE));
+            CloseHandle(section);
+            assert!(views.iter().all(|v| !v.Value.is_null()));
+            Views(views)
+        };
+        let [texture, decoder] = views.0.map(|v| v.Value as usize);
+        let mut last = Last::default();
+        // One refresh as `Staging::refresh_timed` makes it for guarded
+        // memory; the read hashes what the texture's view shows, as
+        // `Staging::read_now` does. Returns the byte read, if it read.
+        let refresh = |last: &mut Last, frame: u64| -> (bool, Option<u8>) {
+            let (now, written) = crate::watch::writes(texture, texture + SIZE, true).expect("view memory is guarded");
+            let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
+            last.asked = now;
+            let mut seen = None;
+            last.refresh_guarded(frame, texture, unwritten, |last| {
+                // SAFETY: the texture's view: `SIZE` committed bytes, read
+                // only while no thread writes them.
+                let bytes = unsafe { std::slice::from_raw_parts(texture as *const u8, SIZE) };
+                last.hash = Some(blake3::hash(bytes));
+                seen = Some(bytes[0]);
+                SIZE
+            });
+            (unwritten, seen)
+        };
+        // The first look reads it whole.
+        assert_eq!(refresh(&mut last, 0), (false, Some(0)));
+        // Every frame the decoder writes the frame's picture first.
+        let mut first_read = None;
+        for frame in 1..=40u64 {
+            let picture = frame as u8;
+            write_from_another_thread(decoder, picture);
+            let (unwritten, seen) = refresh(&mut last, frame);
+            assert!(unwritten, "frame {frame}: the guards do not see writes through another view");
+            match first_read {
+                None => {
+                    if let Some(byte) = seen {
+                        assert_eq!(byte, picture);
+                        first_read = Some(frame);
+                    }
+                }
+                Some(_) => assert_eq!(seen, Some(picture), "frame {frame}: read with its picture"),
+            }
+        }
+        let first_read = first_read.expect("read on its turn");
+        assert!(first_read <= HASH_EVERY, "found within {HASH_EVERY} frames, not at {first_read}");
+        // The writes stop: read every frame until `BLIND_FRAMES` after
+        // the last change, then on its turn only.
+        let mut reads = 0;
+        for frame in 41..41 + BLIND_FRAMES + 8 * HASH_EVERY {
+            let (unwritten, seen) = refresh(&mut last, frame);
+            assert!(unwritten);
+            if frame < 40 + BLIND_FRAMES {
+                assert_eq!(seen, Some(40), "frame {frame}: still read every frame");
+            } else if seen.is_some() {
+                reads += 1;
+            }
+        }
+        assert!((7..=9).contains(&reads), "one frame in eight afterwards, read {reads} times in {} frames", 8 * HASH_EVERY);
+        // A write through the texture's own view, from another thread: the
+        // guards see it and the texture is read off its turn.
+        let frame = (41 + BLIND_FRAMES + 8 * HASH_EVERY..)
+            .find(|&f| !f.wrapping_add((texture >> 16) as u64).is_multiple_of(HASH_EVERY))
+            .unwrap();
+        write_from_another_thread(texture, 0xaa);
+        assert_eq!(refresh(&mut last, frame), (false, Some(0xaa)));
     }
 }

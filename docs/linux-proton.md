@@ -80,6 +80,13 @@ In the diagnostics build:
   translates, whether its pixel shader does or not. With the two switches
   together you can walk the world in a flat-colour view.
 
+In every build, a texture in view memory that changes with no write the
+guards see (the boot logo's video planes; a write through another view of
+the same pages is one the guards cannot see) is read at every refresh for
+about four seconds after each such change is found;
+`VICTORY_BLIND_TEXTURES=0` reads it one frame in eight, as before (the
+logo then stutters).
+
 In every build, a draw of depth-tested geometry whose pixel shader does
 not translate (or that the host refuses) is drawn with that debug shader
 instead of dropped; `VICTORY_PS_FALLBACK=0` turns that off.
