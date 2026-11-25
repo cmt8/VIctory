@@ -863,6 +863,18 @@ mod tests {
 
     use super::*;
 
+    /// The title memory a texture-to-buffer read-back lands in: its rows at
+    /// the title's pitch, nothing for an empty one or one past the address
+    /// space (after fxceless PR #565's test).
+    #[test]
+    fn a_read_back_lands_in_its_rows_and_no_further() {
+        assert_eq!(read_back_span(0x1000, [16, 3, 64]), Some((0x1000, 0x1090)));
+        assert_eq!(read_back_span(0x1000, [16, 1, 64]), Some((0x1000, 0x1010)));
+        assert_eq!(read_back_span(0x1000, [0, 3, 64]), None);
+        assert_eq!(read_back_span(0x1000, [16, 0, 64]), None);
+        assert_eq!(read_back_span(usize::MAX - 8, [16, 1, 16]), None);
+    }
+
     /// A view one thread has made and not yet recorded keeps its slot while
     /// other threads make far more views than the old shared ring had
     /// (after upstream PR #2844's `pending_rtv_survives_other_recorders`).
@@ -3075,7 +3087,8 @@ struct Sent {
     number: u64,
     card: Option<CardPlan>,
     back: Vec<Declared>,
-    /// Title-memory ranges written when its shader textures are copied back.
+    /// Title-memory ranges written when its shader textures are copied back,
+    /// and by its texture-to-buffer read-backs ([`read_back_span`]).
     texture_back_ranges: Vec<(usize, usize)>,
     /// Its bottom-of-pipe writes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -4453,6 +4466,17 @@ pub(crate) fn walls_trace() -> bool {
 /// ([`late`]) did not, at any stage: the flights' lists were settled
 /// without it, so the title read a buffer nobody wrote, as before read-backs
 /// were made (the exposure metering's two small float targets, every frame).
+/// The title memory `[at, end)` a texture-to-buffer read-back of `rows` rows
+/// of `row` bytes, `pitch` apart, writes from `at`; none if empty or past the
+/// address space (AscilCH's, fxceless PR #565).
+fn read_back_span(at: usize, [row, rows, pitch]: [usize; 3]) -> Option<(usize, usize)> {
+    if rows == 0 || row == 0 {
+        return None;
+    }
+    let end = at.checked_add((rows - 1).checked_mul(pitch)?.checked_add(row)?)?;
+    Some((at, end))
+}
+
 fn read_backs(list: &HostList) {
     // Textures shaders wrote that the title reads on the CPU
     // ([`crate::texback`]).
@@ -4460,15 +4484,22 @@ fn read_backs(list: &HostList) {
         crate::texback::land(back);
     }
     for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
+        let Some((start, end)) = read_back_span(*at, [*row, *rows, *pitch]) else {
+            continue;
+        };
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
-        // run; the title's destination holds every row (checked when the
-        // copy was recorded).
+        // run. Title memory is written through the kernel
+        // (`write_mapped`), its guards opened first: a page the title
+        // unmapped or guarded since the copy was recorded (the landing is
+        // late, on another thread) is left as it is instead of faulting in
+        // our copy (after AscilCH's fxceless PR #565).
         unsafe {
             if buffer.Map(0, None, Some(&mut data)).is_ok() && !data.is_null() {
                 let from = data.cast::<u8>().cast_const();
+                crate::watch::writing(start, end - start);
                 for line in 0..*rows {
-                    std::ptr::copy_nonoverlapping(from.add(line * row.next_multiple_of(256)), (*at as *mut u8).add(line * pitch), *row);
+                    write_mapped((*at + line * pitch) as *mut u8, from.add(line * row.next_multiple_of(256)), *row);
                 }
                 // The walls trace: what the title is handed (one row of at
                 // most 24 values: its 5x1 and 1x1 float targets).
@@ -6609,7 +6640,12 @@ impl Host {
             let back = declared_writes(runs);
             let mut texture_back_ranges = Vec::new();
             for list in runs {
-                texture_back_ranges.extend(list.deferred().texture_backs.iter().map(crate::texback::Back::range));
+                let d = list.deferred();
+                texture_back_ranges.extend(d.texture_backs.iter().map(crate::texback::Back::range));
+                // And the texture-to-buffer read-backs' (after AscilCH's
+                // fxceless PR #565): a submission sent ahead that reads that
+                // memory, a remap of it or a refresh waits for the landing.
+                texture_back_ranges.extend(d.backs.iter().filter_map(|&(_, at, shape)| read_back_span(at, shape)));
             }
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
             submission_us(0, (prepared - started).saturating_sub(settled).as_micros() as u64);
