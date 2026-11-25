@@ -415,6 +415,12 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, slot count, contents) →
     /// (first dynamic slot, whether any slot is a CBV backed by this list's scratch).
     fresh_tables: crate::fxhash::FxHashMap<(u64, u32, u64), (u32, bool)>,
+    /// Of the tables in `fresh_tables`, the list's epoch
+    /// ([`HostList::epoch`]) at which the readers listed (a stage's list of
+    /// what it reads, as [`Reader`] says) had all the table's entries
+    /// brought up to date, whether that read the tested depth target, and
+    /// what it noted as left out or replaced ([`SUBST`] bits; [`ready_once`]).
+    fresh_ready: crate::fxhash::FxHashMap<(u64, u32, u64), (u64, Vec<(Reader, bool, u8)>)>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -457,6 +463,7 @@ impl State {
             crate::descriptor::release_dynamic(heap, first, n);
         }
         self.fresh_tables.clear();
+        self.fresh_ready.clear();
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
         self.tables_gone = true;
@@ -1118,6 +1125,8 @@ impl State {
         // continuing part allocates its own scratch and refreshes constants.
         // `self.dynamic` stays intact until the final part's state drops.
         self.fresh_tables.retain(|_, &mut (_, has_cbv)| !has_cbv);
+        // (A new host list: its epochs are others.)
+        self.fresh_ready.clear();
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
@@ -3232,20 +3241,65 @@ impl State {
                 continue;
             }
             // The table and what its entries hold (record words).
-            let key = {
+            let key = if record_hash() {
+                let mut h = RecordHash::default();
+                for k in 0..n {
+                    let at = table + u64::from(k) * 32;
+                    // SAFETY: a descriptor slot in title memory.
+                    let record = unsafe { (at as *const [u32; 3]).read_unaligned() };
+                    // (Another table than the same slots made for a shader
+                    // that reads them in the title's formats.)
+                    h.add_with(record, half.contains(&(slot, k * 8)));
+                }
+                (table, n, h.0)
+            } else {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
                 for k in 0..n {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
                     unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
-                    // (Another table than the same slots made for a shader
-                    // that reads them in the title's formats.)
                     half.contains(&(slot, k * 8)).hash(&mut h);
                 }
                 (table, n, h.finish())
             };
             if let Some(&(first, _)) = self.fresh_tables.get(&key) {
+                // This reader had the table's entries brought up to date,
+                // and nothing changed in the list since: nothing to do again.
+                // Not for tables a shader writes through or picks views of
+                // by index.
+                let once = ready_once()
+                    && selected.is_empty()
+                    && entries.iter().all(|u| u.kind != ResourceType::Uav);
+                let reader = Reader {
+                    used: (used.as_ptr() as usize, used.len()),
+                    entries: entries.iter().fold(0u64, |h, u| {
+                        (h.rotate_left(13) ^ (u64::from(u.table_offset_dwords) << 16 | kind_number(u.kind)))
+                            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    }),
+                    stores: STORES.get(),
+                    tested: TESTED_DEPTH.get().0,
+                };
+                if once
+                    && let Some((epoch, ready)) = self.fresh_ready.get(&key)
+                    && *epoch == list.epoch()
+                    && let Some(&(_, depth, noted)) = ready.iter().find(|(r, ..)| *r == reader)
+                {
+                    if depth {
+                        TESTED_DEPTH.set((reader.tested, true));
+                    }
+                    // (What the reasons for dropped draws gathered then, for
+                    // this draw's pipeline too.)
+                    SUBST.set(SUBST.get() | noted);
+                    READY_ONCE_SKIPS.fetch_add(1, Ordering::Relaxed);
+                    made.push((slot, first * 32));
+                    continue;
+                }
+                // Whether these entries read the tested depth target (the
+                // flag as it was before, kept).
+                let depth_before = TESTED_DEPTH.get();
+                TESTED_DEPTH.set((depth_before.0, false));
+                let noted_before = SUBST.replace(0);
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
@@ -3261,6 +3315,23 @@ impl State {
                         && let Some(kind) = view_kind(&view)
                     {
                         readable(list, kind, &view);
+                    }
+                }
+                let depth = TESTED_DEPTH.get().1;
+                TESTED_DEPTH.set((depth_before.0, depth_before.1 || depth));
+                let noted = SUBST.get();
+                SUBST.set(noted_before | noted);
+                if once {
+                    // (The epoch as it is now: what this changed itself it
+                    // need not do again.)
+                    let epoch = list.epoch();
+                    let (at, ready) = self.fresh_ready.entry(key).or_default();
+                    if *at != epoch {
+                        *at = epoch;
+                        ready.clear();
+                    }
+                    if ready.len() < 16 {
+                        ready.push((reader, depth, noted));
                     }
                 }
                 made.push((slot, first * 32));
@@ -3982,6 +4053,74 @@ fn read_as_buffer<'a>(entries: impl Iterator<Item = &'a UsedResource>, k: u32) -
     any
 }
 
+/// Who reads a table made afresh, as far as [`readable`] goes by it: the
+/// stage's list of what it reads (where and how long), a fingerprint of its
+/// entries of the table, whether the stage stores to buffers, and the depth
+/// target the draw only tests.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Reader {
+    used: (usize, usize),
+    entries: u64,
+    stores: bool,
+    tested: usize,
+}
+
+/// A number for each kind of view, for [`Reader`].
+fn kind_number(kind: ResourceType) -> u64 {
+    match kind {
+        ResourceType::Srv => 1,
+        ResourceType::Sampler => 2,
+        ResourceType::Cbv => 3,
+        ResourceType::Uav => 4,
+        ResourceType::Other(n) => 0x100 | u64::from(n),
+    }
+}
+
+/// Whether a table a list reads again, with nothing changed in the list
+/// since ([`HostList::epoch`]), is left as it is (`VICTORY_READY_ONCE=0`:
+/// every entry is gone through again at every draw). After AvatarManz
+/// a1bdba4cf.
+fn ready_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_READY_ONCE").is_none_or(|v| v != "0"))
+}
+
+/// Tables left as they were by [`ready_once`], since the start.
+pub(crate) static READY_ONCE_SKIPS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the contents of tables made afresh are told apart by
+/// [`RecordHash`] (`VICTORY_RECORD_HASH=0`: the standard library's, as
+/// before).
+fn record_hash() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RECORD_HASH").is_none_or(|v| v != "0"))
+}
+
+/// A hash of records' words: 64 bits, two multiplications a record (the
+/// standard library's took 3 % of the recording threads' time, AvatarManz
+/// a1bdba4cf).
+#[derive(Default)]
+struct RecordHash(u64);
+
+impl RecordHash {
+    #[cfg(test)]
+    fn add(&mut self, record: [u32; 3]) {
+        self.add_with(record, false);
+    }
+
+    /// A record and a flag of the caller's.
+    fn add_with(&mut self, [a, b, c]: [u32; 3], flag: bool) {
+        let fold = |x: u64, y: u64| {
+            let p = u128::from(x) * u128::from(y);
+            p as u64 ^ (p >> 64) as u64
+        };
+        let words = u64::from(a) << 32 | u64::from(b);
+        let last = u64::from(c) | u64::from(flag) << 32;
+        let first = fold(self.0 ^ words ^ 0x2d35_8dcc_aa6c_78a5, 0x8bb8_4b93_962e_acc9 ^ last);
+        self.0 = fold(first ^ 0x4b33_a62e_d433_d4a3, 0x4d5a_2da5_1de1_aa47 ^ self.0.rotate_left(23)) ^ first;
+    }
+}
+
 /// Gets what a shader reads or writes through a view ready: buffer data
 /// copied, textures moved to the state they need.
 fn view_kind(view: &View) -> Option<ResourceType> {
@@ -4401,5 +4540,50 @@ mod tests {
         assert_eq!(jump_window(remembered, (7, 0, 12), 1 << 20), None);
         assert_eq!(jump_window(remembered, (7, 10, 16), 1 << 20), None);
         assert_eq!(jump_window(None, (7, 10, 12), 1 << 20), None);
+    }
+}
+
+#[cfg(test)]
+mod record_hash_tests {
+    use super::RecordHash;
+
+    #[test]
+    fn records_that_differ_hash_apart() {
+        let of = |records: &[[u32; 3]]| {
+            let mut h = RecordHash::default();
+            records.iter().for_each(|r| h.add(*r));
+            h.0
+        };
+        let mut seen = std::collections::HashSet::new();
+        // One record, one word or two of it different; runs of zeros; order.
+        for a in 0..64u32 {
+            for b in 0..64u32 {
+                for c in [0, 1, 0x8000_0000, u32::MAX] {
+                    assert!(seen.insert(of(&[[a, b, c]])));
+                    assert!(seen.insert(of(&[[1, 2, 3], [a, b, c]])));
+                    assert!(seen.insert(of(&[[a, b, c], [1, 2, 3], [0, 0, 0]])));
+                }
+            }
+        }
+        assert!(seen.insert(of(&[])));
+        // (One record of zeros is among the above.)
+        let zeros: Vec<u64> = (2..100).map(|n| of(&vec![[0; 3]; n])).collect();
+        assert!(zeros.iter().all(|h| seen.insert(*h)));
+    }
+
+    #[test]
+    fn the_flag_of_a_record_tells_tables_apart() {
+        let of = |flags: &[bool]| {
+            let mut h = RecordHash::default();
+            for (k, &flag) in flags.iter().enumerate() {
+                h.add_with([0x5654_4147, k as u32, 7], flag);
+            }
+            h.0
+        };
+        let mut seen = std::collections::HashSet::new();
+        for bits in 0..256u32 {
+            let flags: Vec<bool> = (0..8).map(|i| bits >> i & 1 != 0).collect();
+            assert!(seen.insert(of(&flags)), "flags {bits:#b}");
+        }
     }
 }

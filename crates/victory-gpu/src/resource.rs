@@ -1166,6 +1166,9 @@ pub(crate) struct HostTexture {
     /// resolve of the title's ([`note_written`]). Until then it holds what
     /// its memory held before it was made.
     written: std::sync::atomic::AtomicBool,
+    /// The texture's resource flags (asked once: the runtime takes some
+    /// 100 ns to say, and every texture of every draw is asked about).
+    flags: u32,
 }
 
 /// What a title texture has on the host: its host copy and, for a depth
@@ -1493,7 +1496,11 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         // are made before the next submission runs.
         crate::descriptor::texture_made(this as usize);
     }
-    r.host.used.store(crate::host::moment(), Relaxed);
+    // (Read first: the line is shared by all recording threads.)
+    let now = crate::host::moment();
+    if r.host.used.load(Relaxed) != now {
+        r.host.used.store(now, Relaxed);
+    }
     made.clone()
 }
 
@@ -2051,9 +2058,16 @@ fn host_bytes(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) ->
 
 #[cfg(windows)]
 impl HostTexture {
+    /// The texture's resource flags.
+    pub(crate) fn flags(&self) -> u32 {
+        self.flags
+    }
+
     pub(crate) fn new(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) -> HostTexture {
         use std::sync::atomic::Ordering::Relaxed;
         let bytes = host_bytes(&texture);
+        // SAFETY: a live texture.
+        let flags = unsafe { texture.GetDesc() }.Flags.0 as u32;
         HOST_TEXTURES[0].fetch_add(1, Relaxed);
         HOST_TEXTURES[1].fetch_add(bytes, Relaxed);
         HostTexture {
@@ -2064,6 +2078,7 @@ impl HostTexture {
             tiled: None,
             born_after: crate::host::started(),
             written: std::sync::atomic::AtomicBool::new(false),
+            flags,
         }
     }
 
@@ -2075,6 +2090,8 @@ impl HostTexture {
         tiled: crate::tiles::Tiled,
     ) -> HostTexture {
         HOST_TEXTURES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: a live texture.
+        let flags = unsafe { texture.GetDesc() }.Flags.0 as u32;
         HostTexture {
             texture,
             state: std::sync::atomic::AtomicU32::new(state),
@@ -2083,6 +2100,7 @@ impl HostTexture {
             tiled: Some(tiled),
             born_after: crate::host::started(),
             written: std::sync::atomic::AtomicBool::new(false),
+            flags,
         }
     }
 }

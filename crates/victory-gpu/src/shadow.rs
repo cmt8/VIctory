@@ -26,6 +26,9 @@ use crate::watch::PAGE;
 
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
+    /// The bytes of `buffer` (asked once: the runtime takes some 100 ns to
+    /// say, and every buffer view a draw makes asks).
+    width: u64,
     pub(crate) buffer: ID3D12Resource,
     data: *mut u8,
     gpu: u64,
@@ -2650,11 +2653,19 @@ impl Shadow {
         }));
     }
 
+    /// The bytes of the host buffer.
+    pub(crate) fn width(&self) -> u64 {
+        self.width
+    }
+
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
+        // SAFETY: a live buffer.
+        let width = unsafe { buffer.GetDesc() }.Width;
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
         LIVE[0].fetch_add(1, Ordering::Relaxed);
         LIVE[1].fetch_add(len, Ordering::Relaxed);
         Shadow {
+            width,
             buffer,
             data,
             gpu,
@@ -4063,7 +4074,72 @@ fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), 
 }
 
 fn buffers_write() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
-    BUFFERS.write().unwrap_or_else(|e| e.into_inner())
+    let map = BUFFERS.write().unwrap_or_else(|e| e.into_inner());
+    // What threads remember of it ([`FOUND`]) is of before. (Counted under
+    // the lock, before anything in the map changes.)
+    BUFFERS_CHANGED.fetch_add(1, Ordering::SeqCst);
+    map
+}
+
+/// How often [`BUFFERS`] was taken to be changed.
+static BUFFERS_CHANGED: AtomicU64 = AtomicU64::new(1);
+
+/// Answers a thread remembers.
+const FOUND_MOST: usize = 1024;
+
+/// An ask (address, bytes), the count of changes it was answered at, and the
+/// answer.
+type Found = (u64, u64, u64, std::sync::Weak<Shadow>);
+
+thread_local! {
+    /// The last answers of [`lookup`] out of [`BUFFERS`], by a hash of the
+    /// ask: the same buffers are asked about draw after draw, from five
+    /// threads, each time through the map's lock (one line of the
+    /// processor's memory all of them write) and a dozen of its nodes.
+    /// (From AvatarManz a1bdba4cf, profile waits-1: 7 % of the recording
+    /// threads' time.)
+    static FOUND: std::cell::RefCell<Vec<Found>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Whether [`FOUND`] is kept (`VICTORY_QUICK_FIND=0`: not, every ask takes
+/// the map's lock as before).
+fn quick_find() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_QUICK_FIND").is_none_or(|v| v != "0"))
+}
+
+fn found_at(address: u64, len: u64) -> usize {
+    let h = (address ^ len.rotate_left(32)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    (h >> 54) as usize % FOUND_MOST
+}
+
+/// What this thread remembers of an ask, if nothing in [`BUFFERS`] changed
+/// since: then the map would give the same copy.
+fn found(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let changed = BUFFERS_CHANGED.load(Ordering::SeqCst);
+    let shadow = FOUND
+        .try_with(|f| {
+            let f = f.borrow();
+            let (a, n, at, shadow) = f.get(found_at(address, len))?;
+            ((*a, *n, *at) == (address, len, changed)).then(|| shadow.upgrade()).flatten()
+        })
+        .ok()
+        .flatten()?;
+    // Whoever takes the map to take a copy out of it has counted before it
+    // does: a copy taken out after the first look is not handed out.
+    std::sync::atomic::fence(Ordering::SeqCst);
+    (BUFFERS_CHANGED.load(Ordering::SeqCst) == changed).then_some(shadow)
+}
+
+/// Remembers an answer given while `changed` was the count.
+fn remember(address: u64, len: u64, changed: u64, shadow: &Arc<Shadow>) {
+    let _ = FOUND.try_with(|f| {
+        let mut f = f.borrow_mut();
+        if f.is_empty() {
+            f.resize_with(FOUND_MOST, || (0, 0, 0, std::sync::Weak::new()));
+        }
+        f[found_at(address, len)] = (address, len, changed, Arc::downgrade(shadow));
+    });
 }
 
 /// A title buffer exists at `start` (`len` bytes).
@@ -4178,6 +4254,10 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
 }
 
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+    let quick = quick_find();
+    if quick && let Some(shadow) = found(address, len) {
+        return Some(shadow);
+    }
     let end = address.checked_add(len.max(1))?;
     // Fast path: the buffer found has its copy already (all but the first
     // ask for a buffer), so the ask only needs the read lock.
@@ -4185,7 +4265,14 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         let map = buffers_read();
         match map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end) {
             Some((_, entry)) => match &entry.shadow {
-                Some(shadow) => return Some(shadow.clone()),
+                Some(shadow) => {
+                    if quick {
+                        // (Nobody changes the map, nor counts, while this
+                        // lock is held.)
+                        remember(address, len, BUFFERS_CHANGED.load(Ordering::SeqCst), shadow);
+                    }
+                    return Some(shadow.clone());
+                }
                 // The entry exists but its copy is not made yet: drop the
                 // read lock and make it under the write lock.
                 None => true,
@@ -4427,9 +4514,18 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     };
     // Under the lock, with the handing out: see `let_go_idle`.
     let note = |shadow: &Shadow| {
-        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
-        shadow.asked[0].fetch_min(address, Ordering::Relaxed);
-        shadow.asked[1].fetch_max(end, Ordering::Relaxed);
+        // (Read first: the lines are shared by all recording threads, and
+        // a write takes them from the others even when it changes nothing.)
+        let now = crate::host::moment();
+        if shadow.used.load(Ordering::Relaxed) != now {
+            shadow.used.store(now, Ordering::Relaxed);
+        }
+        if shadow.asked[0].load(Ordering::Relaxed) > address {
+            shadow.asked[0].fetch_min(address, Ordering::Relaxed);
+        }
+        if shadow.asked[1].load(Ordering::Relaxed) < end {
+            shadow.asked[1].fetch_max(end, Ordering::Relaxed);
+        }
         if unsized_ask {
             shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
         }
@@ -4795,6 +4891,40 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod quick_find_tests {
+    use super::*;
+
+    /// A thread's remembered answer is the map's while the map is as it
+    /// was, and never a copy the map no longer holds: a buffer released and
+    /// another registered at the same address is found anew.
+    #[test]
+    fn a_remembered_answer_goes_with_the_buffer() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let title = vec![0u8; 64 << 10];
+        let start = title.as_ptr() as u64;
+        let len = title.len() as u64;
+        // (Resource numbers no title resource has.)
+        let (first, second) = (usize::MAX - 0x51, usize::MAX - 0x52);
+        register(first, start, len);
+        let Some(a) = find(start + 64, 256) else {
+            unregister(first, start);
+            return; // no copy made here
+        };
+        let again = find(start + 64, 256).expect("found again");
+        assert!(Arc::ptr_eq(&a, &again), "the same copy while the map is as it was");
+        unregister(first, start);
+        register(second, start, len);
+        let b = find(start + 64, 256).expect("the new buffer's copy");
+        assert!(!Arc::ptr_eq(&a, &b), "not the released buffer's copy");
+        assert!(Arc::ptr_eq(&b, &find(start + 64, 256).expect("found again")));
+        unregister(second, start);
+        drop(title);
+    }
 }
 
 #[cfg(test)]
