@@ -291,7 +291,7 @@ pub(crate) fn finished() -> u64 {
 /// if none is.
 pub(crate) fn retire<T: 'static>(object: T) {
     let started = STARTED.load(Ordering::Acquire);
-    if started <= FINISHED.load(Ordering::Acquire) {
+    if bury_lag() == 0 && started <= FINISHED.load(Ordering::Acquire) {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
         drop(object);
         return;
@@ -303,8 +303,40 @@ pub(crate) fn retire<T: 'static>(object: T) {
         .push((started, Retired(Box::new(object))));
 }
 
-/// Drops what waited for submissions up to `finished`.
+/// How many submissions later than it could (once the last one that may
+/// use it has finished) an object let go is dropped (`VICTORY_BURY_LAG`, 64
+/// unless given, about a frame and a half at the 40 to 48 submissions a
+/// frame of the world; `0`: at once, as before). An object let go while
+/// nothing runs waits as well: host lists recorded and not yet sent may
+/// name it, and nothing else holds it for them.
+///
+/// The device losses of another fork were page faults in memory nothing
+/// named any more, at no command in particular (AvatarManz/VIctory-7900XTX
+/// a0b4909df). What is held longer is memory: the host textures, copies
+/// and buffers let go in those submissions (the memory line's counts of
+/// them stay up a frame or two longer).
+fn bury_lag() -> u64 {
+    static LAG: OnceLock<u64> = OnceLock::new();
+    *LAG.get_or_init(|| std::env::var("VICTORY_BURY_LAG").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(64))
+}
+
+/// How many settled flights' host lists are kept before they are reset for
+/// reuse (`VICTORY_LAND_LAG`; `0` unless given: at once). AvatarManz/
+/// VIctory-7900XTX a0b4909df keeps 64, with the objects of [`bury_lag`].
+/// Off here: a landed list gives back its dynamic descriptor slots
+/// (`crate::list::recycle` drops its draw state), and 2^18 of them ran out
+/// under Wine once more submissions were in the air between settles
+/// (`descriptor::host::DYNAMIC_MOST`); 64 flights more would hold well over
+/// a frame of tables, and a table that finds none waits up to 250 ms and
+/// then drops its draw. The lists have run (their fence was waited for).
+fn land_lag() -> usize {
+    static LAG: OnceLock<usize> = OnceLock::new();
+    *LAG.get_or_init(|| std::env::var("VICTORY_LAND_LAG").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+/// Drops what waited for submissions up to `finished`, less [`bury_lag`].
 fn bury(finished: u64) {
+    let finished = finished.saturating_sub(bury_lag());
     let done: Vec<(u64, Retired)> = {
         let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
         if retired.is_empty() {
@@ -322,6 +354,17 @@ fn bury(finished: u64) {
 /// Objects [`retire`] dropped at once (no submission was running) and
 /// kept until a running submission finished, since the start.
 static RETIREMENTS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// For the memory line: [`RETIREMENTS`], the objects let go that wait for
+/// submissions to finish now, and [`bury_lag`].
+pub(crate) fn retirements() -> [u64; 4] {
+    [
+        RETIREMENTS[0].load(Ordering::Relaxed),
+        RETIREMENTS[1].load(Ordering::Relaxed),
+        RETIRED.lock().unwrap_or_else(|e| e.into_inner()).len() as u64,
+        bury_lag(),
+    ]
+}
 
 /// What the layer did to the host's objects lately, newest last (sweeps
 /// that let host copies go, pipeline library calls, saves and trims): said
@@ -399,12 +442,14 @@ pub(crate) fn removal_context() -> String {
         _ => "copying back what a submission wrote (nothing of ours was running on the card)",
     };
     let mut text = format!(
-        "the submitting thread was {phase}, of {} lists, for {:.1} ms; {}; objects let go at once {} and after a running submission {}; submissions started {} finished {}",
+        "the submitting thread was {phase}, of {} lists, for {:.1} ms; {}; objects let go at once {} and after a running submission {}, {} of them still held (VICTORY_BURY_LAG={}); submissions started {} finished {}",
         SUBMITTING[1].load(Ordering::Relaxed),
         ms(SUBMITTING[2].load(Ordering::Relaxed)),
         crate::pipeline::library_removal_note(),
         RETIREMENTS[0].load(Ordering::Relaxed),
         RETIREMENTS[1].load(Ordering::Relaxed),
+        RETIRED.try_lock().map_or(0, |r| r.len()),
+        bury_lag(),
         STARTED.load(Ordering::Relaxed),
         FINISHED.load(Ordering::Relaxed),
     );
@@ -3955,7 +4000,11 @@ pub(crate) fn land_soon() {
 /// Resets the host lists of settled flights and keeps them for reuse, as
 /// a queue does for the lists it ran (`crate::list::recycle`).
 fn land() {
-    let landed = std::mem::take(&mut line().landed);
+    let landed: Vec<_> = {
+        let mut line = line();
+        let n = line.landed.len().saturating_sub(land_lag());
+        line.landed.drain(..n).collect()
+    };
     for (lists, order) in landed {
         crate::list::recycle(lists, &order);
     }
@@ -9339,6 +9388,14 @@ impl Meter {
                     c[5] / 1e3,
                     mb(c[6]),
                     asked_us / 1e3,
+                );
+            }
+            {
+                let [at_once, held, waiting, lag] = retirements();
+                tracing::info!(
+                    "host objects let go, since the start: {at_once} dropped at once, {held} held for submissions; \
+                     {waiting} held now, each until {lag} submissions after the last that may use it have finished \
+                     (VICTORY_BURY_LAG=0: until it has)"
                 );
             }
             let p: Vec<[f64; 3]> = crate::watch::PROTECTS
