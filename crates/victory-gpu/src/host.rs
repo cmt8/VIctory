@@ -6079,6 +6079,33 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         // The kernel writes the destination: it must not be guarded.
         crate::watch::writing(dst as usize, len);
     }
+    // A source in the runtime's placeholders with a page not there, known
+    // from its own word (`crate::inplace::view_books`): its mapped parts are
+    // read and the rest is zeros, as below, without the failing read and
+    // the questions after it, each of which waits for the runtime's
+    // remapping under Wine.
+    if !title_dst
+        && let Some(parts) = crate::inplace::mapped_parts(src as usize, len)
+        && parts.iter().map(|p| p.1).sum::<usize>() < len
+    {
+        COPY_BOOKS.fetch_add(1, Ordering::Relaxed);
+        let mut at = src as usize;
+        for &(from, n) in parts.iter().chain(std::iter::once(&(src as usize + len, 0))) {
+            if from > at {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::Unmapped, (from - at) as u64);
+                // SAFETY: inside the destination, which is host memory.
+                unsafe { dst.add(at - src as usize).write_bytes(0, from - at) };
+            }
+            let to = dst.wrapping_add(from - src as usize);
+            if n > 0 && !read(from as *const u8, to, n) {
+                // Remapped this moment: around its holes, as below.
+                read_pieces(from as *const u8, to, n, false);
+            }
+            at = from + n;
+        }
+        return;
+    }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
     let whole = read(src, dst, len);
@@ -6111,6 +6138,10 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::SparseUs, sparse.elapsed().as_micros() as u64);
 }
+
+/// Since the last frame-rate line: copies of title memory into host memory
+/// read around their holes from the runtime's word ([`copy_mapped`]).
+pub(crate) static COPY_BOOKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// After a failed bulk read into host memory, skip contiguous holes. Never
 /// cache the query across copies: the title may remap the same address.
@@ -6629,6 +6660,19 @@ impl Meter {
                      {first:.1} read whole that way, {on:.1} not (a page was not there), {partly:.1} of them taken as partly \
                      mapped while the runtime remapped instead of waiting for it, {skipped:.1} partly mapped ones read less \
                      than 30 frames ago passed over before the copy (VICTORY_TEXTURE_PARTLY_WAIT=1: neither)"
+                );
+            }
+            let [looks, refreshes, staged] =
+                [0, 1, 2].map(|i| crate::texture::BOOKS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            let copies = COPY_BOOKS.swap(0, Ordering::Relaxed) as f64 / frames;
+            let folded = crate::descriptor::host::CHANGES_FOLDED.load(Ordering::Relaxed);
+            if looks + refreshes + staged + copies > 0.0 || folded > 0 {
+                tracing::info!(
+                    "what is mapped, from the runtime's word, per frame (VICTORY_VIEW_BOOKS=0: asked of the kernel): \
+                     {looks:.1} looks of the texture pass at a slot, {staged:.1} at a staged texture, {refreshes:.1} texture \
+                     refreshes of one with a page not there, {copies:.1} copies into host memory read around holes; \
+                     since the start, {folded} changes of a texture's memory folded into a look an earlier change made due \
+                     (VICTORY_TEXTURE_QUIET_FRAMES=0: none)"
                 );
             }
             let [kept, made] = [0, 1].map(|i| crate::texture::STAGING_TAKEN[i].swap(0, Ordering::Relaxed) as f64 / frames);

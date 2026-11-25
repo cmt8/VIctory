@@ -708,3 +708,86 @@ fn texture_checks_bench() {
     }
 }
 
+/// What the questions about a texture streaming in cost (`VICTORY_MEMBENCH=1`):
+/// a 4 MiB texture in a placeholder with every other 64 KiB block mapped,
+/// as the texture pass asks how much of it is there
+/// (`crate::texture::mapped_bytes`) and a refresh reads it around its
+/// holes, from the runtime's word (`crate::inplace::view_books`, a pool
+/// whose placeholder and views were told of) and from the kernel's (a pool
+/// that was not); idle, and while another thread remaps pages of a third
+/// pool (the runtime streaming).
+#[test]
+fn view_books_bench() {
+    if !on() {
+        return;
+    }
+    const BLOCKS: usize = 64;
+    let mut told = Pool::new(BLOCKS + 1);
+    let mut untold = Pool::new(BLOCKS + 1);
+    crate::inplace::title_memory_placeholder(told.base, (BLOCKS + 1) * PAGE);
+    for block in (0..BLOCKS).step_by(2) {
+        assert!(told.map(block));
+        assert!(untold.map(block));
+        (told.mapped[block], untold.mapped[block]) = (true, true);
+        crate::inplace::title_memory_view(told.at(block), PAGE, told.section as usize, (block * PAGE) as u64);
+    }
+    let len = BLOCKS * PAGE;
+    assert_eq!(crate::inplace::mapped_bytes(told.base, len), Some((len / 2) as u64), "the books know the told pool");
+    assert_eq!(crate::inplace::mapped_bytes(untold.base, len), None, "and not the other");
+    assert_eq!(crate::texture::mapped_bytes(told.base as *const u8, len), (len / 2) as u64);
+    assert_eq!(crate::texture::mapped_bytes(untold.base as *const u8, len), (len / 2) as u64);
+    let mut read = vec![0u8; len];
+    let round = |label: &str, n: usize, read: &mut Vec<u8>| {
+        report(&format!("{label}: mapped_bytes of a half-mapped 4 MiB texture, from the books"), ns_per(n, |_| {
+            std::hint::black_box(crate::texture::mapped_bytes(told.base as *const u8, len));
+        }));
+        report(&format!("{label}: mapped_bytes of a half-mapped 4 MiB texture, asking the kernel"), ns_per(n, |_| {
+            std::hint::black_box(crate::texture::mapped_bytes(untold.base as *const u8, len));
+        }));
+        report(&format!("{label}: read around the holes, from the books"), ns_per(n, |_| {
+            let parts = crate::inplace::mapped_parts(told.base, len).expect("told");
+            read.fill(0);
+            for (at, n) in parts {
+                assert!(crate::host::read_into(at as *const u8, &mut read[at - told.base..at - told.base + n]));
+            }
+        }));
+        report(&format!("{label}: read around the holes, the kernel copy (fails, then asks)"), ns_per(n, |_| {
+            assert!(!crate::host::read_into(untold.base as *const u8, read));
+            crate::host::copy_mapped(read.as_mut_ptr(), untold.base as *const u8, len, false);
+        }));
+    };
+    round("idle", 200, &mut read);
+    let mut churn = Pool::new(64);
+    for page in 0..50 {
+        assert!(churn.map(page));
+        churn.mapped[page] = true;
+    }
+    let churn = Arc::new(churn);
+    for remappers in [1usize, 2] {
+        let stop = Arc::new(AtomicBool::new(false));
+        let threads: Vec<_> = (0..remappers)
+            .map(|t| {
+                let (churn, stop) = (churn.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    let mut i = 0;
+                    while !stop.load(Ordering::Relaxed) {
+                        let page = t * 25 + i % 25;
+                        assert!(churn.unmap(page));
+                        assert!(churn.remap(page));
+                        i += 1;
+                    }
+                })
+            })
+            .collect();
+        round(&format!("{remappers} thread(s) remapping"), 40, &mut read);
+        stop.store(true, Ordering::Relaxed);
+        for t in threads {
+            t.join().unwrap();
+        }
+    }
+    for pool in [&told, &untold] {
+        crate::watch::title_memory_remapped(pool.base, (BLOCKS + 1) * PAGE);
+    }
+    // The pools' views are unmapped by their drops.
+    drop(churn);
+}

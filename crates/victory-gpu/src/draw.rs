@@ -1999,7 +1999,9 @@ impl State {
                         host.texture_slot_later(index, write, frame, most);
                         continue;
                     }
-                    if !crate::texture::committed(address as *const u8, 1) {
+                    // (Its first block alone; from the runtime's word where
+                    // it has one, without a probe that faults.)
+                    if crate::texture::mapped_bytes(address as *const u8, 1) == 0 {
                         HEAP_TEXTURES_PARTLY[2].fetch_add(1, Ordering::Relaxed);
                     }
                     partly = Some(mapped);

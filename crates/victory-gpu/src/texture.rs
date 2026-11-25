@@ -1230,6 +1230,19 @@ impl Staging {
         // to the read under the lock below (`copy_first`).
         if copy_first() {
             use std::sync::atomic::Ordering::Relaxed;
+            // What of it is mapped, from the runtime's own word where the
+            // texture lies in its placeholders (`crate::inplace::view_books`):
+            // one known to have a page not there is not read through the
+            // kernel up to that page, which fails there, nor asked about
+            // page by page; it is read as a partly mapped one at once.
+            if partly_no_wait()
+                && let Some(parts) = crate::inplace::mapped_parts(self.memory as usize, size)
+                && parts.iter().map(|p| p.1).sum::<usize>() < size
+            {
+                UNLOCKED[3].fetch_add(1, Relaxed);
+                BOOKS[1].fetch_add(1, Relaxed);
+                return self.read_partly_from(last, size, Some(&parts));
+            }
             let read = with_read(size, |read| {
                 if !crate::host::read_into(self.memory, read) {
                     return false;
@@ -1334,6 +1347,16 @@ impl Staging {
     /// unmapped pages is slow, and nothing tells us when pages arrive): a
     /// mip that streams in shows up to 30 frames late.
     fn read_partly(&self, last: &mut Last, size: usize) -> usize {
+        self.read_partly_from(last, size, None)
+    }
+
+    /// [`Staging::read_partly`]; with `parts`, the parts of the memory that
+    /// are mapped ([`crate::inplace::mapped_parts`]): those are read and
+    /// the rest is zeros, as the kernel copy around holes reads it, without
+    /// asking the kernel where the holes are. A part that cannot be read
+    /// (the runtime remapping it this moment) reads as zeros too; its
+    /// remapping makes the texture look again.
+    fn read_partly_from(&self, last: &mut Last, size: usize, parts: Option<&[(usize, usize)]>) -> usize {
         let frame = crate::frame::current();
         if last.partial.is_some_and(|at| frame < at + 30) {
             return 0;
@@ -1342,7 +1365,19 @@ impl Staging {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         let changed = with_read(size, |read| {
-            crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+            match parts {
+                Some(parts) => {
+                    read.fill(0);
+                    let start = self.memory as usize;
+                    for &(at, n) in parts {
+                        let piece = &mut read[at - start..at - start + n];
+                        if !crate::host::read_into(at as *const u8, piece) {
+                            piece.fill(0);
+                        }
+                    }
+                }
+                None => crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false),
+            }
             let hash = blake3::hash(read);
             if last.hash == Some(hash) {
                 return false;
@@ -1516,8 +1551,23 @@ pub(crate) fn staged(resource: This) -> Option<(u64, bool)> {
         map.as_ref()?.get(&(resource as usize))?.clone()
     };
     let size = s.layout.size as usize;
-    Some((size as u64, committed(s.memory, size)))
+    let whole = match crate::inplace::mapped_bytes(s.memory as usize, size) {
+        Some(mapped) => {
+            BOOKS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            mapped == size as u64
+        }
+        None => committed(s.memory, size),
+    };
+    Some((size as u64, whole))
 }
+
+/// Since the last frame-rate line, questions about what of a texture's
+/// memory is mapped answered from the runtime's own word
+/// (`crate::inplace::view_books`) instead of the kernel's: the texture
+/// pass's looks at a slot ([`mapped_bytes`]), refreshes of a texture known
+/// to have a page not there, and the pass's looks whether a staged texture
+/// is whole ([`staged`]).
+pub(crate) static BOOKS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
 /// unmapped until their pages arrive).
@@ -1659,6 +1709,12 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     }
     let start = at as usize;
     let end = start.saturating_add(len);
+    // From the runtime's own word, without a question to the kernel that
+    // faults for every block not there (`crate::inplace::view_books`).
+    if let Some(mapped) = crate::inplace::mapped_bytes(start, len) {
+        BOOKS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return mapped;
+    }
     if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
         return 0;
     }

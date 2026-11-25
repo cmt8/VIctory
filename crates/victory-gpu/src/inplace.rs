@@ -401,6 +401,157 @@ pub(crate) fn views_of_section(section: usize, offset: u64, len: usize) -> Vec<(
     runs
 }
 
+/// The runtime's placeholder reservations for physical pages (`xmem`'s
+/// `XMemVirtualAlloc` of 64 KiB pages without a commit), by start: their
+/// end, and when (`crate::host::now_ms`) a look last found the reservation
+/// still there. Inside them, title memory is mapped exactly where a view
+/// the runtime told of ([`title_memory_view`]) lies: the runtime maps and
+/// unmaps there only under its remapping lock, and tells of each change
+/// inside it.
+static PLACEHOLDERS: Mutex<BTreeMap<usize, (usize, u64)>> = Mutex::new(BTreeMap::new());
+
+/// The runtime reserved `[at, at + len)` as a placeholder for physical
+/// pages (`XMemVirtualAlloc`).
+pub fn title_memory_placeholder(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let mut p = PLACEHOLDERS.lock().unwrap_or_else(|e| e.into_inner());
+    // A reservation made where an older one was: that one is gone.
+    let end = at.saturating_add(len);
+    let gone: Vec<usize> = p.range(..end).filter(|&(&s, &(e, _))| e > at && s < end).map(|(&s, _)| s).collect();
+    for s in gone {
+        p.remove(&s);
+    }
+    p.insert(at, (end, crate::host::now_ms()));
+}
+
+/// Whether the questions "what of `[at, at + len)` is mapped" are answered
+/// from the views the runtime told of where that memory lies in its
+/// placeholders (`VICTORY_VIEW_BOOKS`: on by default under Wine, off
+/// elsewhere; `=0` or `=1` says).
+///
+/// Under Wine every other answer takes ntdll's process-wide lock on the
+/// memory map (`virtual_mutex`): a query (`VirtualQuery`,
+/// `QueryWorkingSetEx`), and a read through the kernel that fails, which
+/// faults inside ntdll (dlls/ntdll/unix/virtual.c `NtReadVirtualMemory`,
+/// whose fault goes through `virtual_handle_fault`). The runtime's remapping
+/// holds that lock across wineserver requests, thousands of times a frame
+/// while the world streams in, so each such question waits: `membench`
+/// has a failing 4 KiB read at 2 us idle and 50 us beside one thread
+/// remapping, a query at 0.7 us and 11 us, and with two threads
+/// remapping a query 31 ms. The texture pass asks of every due slot of a
+/// texture streaming in, one question per 64 KiB block of it, and a
+/// refresh of a texture with a page not there read it through the kernel
+/// until the read failed, then asked again block by block.
+pub(crate) fn view_books() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_VIEW_BOOKS").as_deref().map(str::trim) {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => crate::host::on_wine(),
+    })
+}
+
+/// How often, at most, a placeholder reservation is looked at again to
+/// see that it is still there (the title releases one with the host's
+/// `VirtualFree`, which nothing hooks): milliseconds.
+const PLACEHOLDER_LOOK_MS: u64 = 1000;
+
+/// Whether `[at, end)` lies inside one placeholder reservation of the
+/// runtime's that is still there (looked at again at most every
+/// [`PLACEHOLDER_LOOK_MS`]).
+fn in_placeholder(at: usize, end: usize) -> bool {
+    let now = crate::host::now_ms();
+    let (start, looked) = {
+        let p = PLACEHOLDERS.lock().unwrap_or_else(|e| e.into_inner());
+        match p.range(..=at).next_back() {
+            Some((&s, &(e, looked))) if end <= e => (s, looked),
+            _ => return false,
+        }
+    };
+    if now.saturating_sub(looked) < PLACEHOLDER_LOOK_MS {
+        return true;
+    }
+    // Still a reservation of ours: reserved (a placeholder) or a view at
+    // its start. Free memory or private committed memory there means it
+    // was released (and perhaps allocated again by another).
+    use windows_sys::Win32::System::Memory::{MEM_FREE, MEM_PRIVATE, MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(start as *const c_void, &mut info, size_of_val(&info)) };
+    let there = n != 0 && info.State != MEM_FREE && !(info.State == MEM_COMMIT && info.Type == MEM_PRIVATE);
+    let mut p = PLACEHOLDERS.lock().unwrap_or_else(|e| e.into_inner());
+    if there {
+        if let Some(entry) = p.get_mut(&start) {
+            entry.1 = now;
+        }
+    } else {
+        p.remove(&start);
+    }
+    there
+}
+
+/// With [`view_books`], if `[at, at + len)` lies in one of the runtime's
+/// placeholder reservations: the parts of it the views it told of show
+/// (address, bytes), in order and joined. `None` otherwise (the caller
+/// asks the kernel). While the runtime remaps (`crate::watch::
+/// title_memory_remapping`) the answer may be a moment ahead of or behind
+/// the kernel's; a read of a part that fails reads as not there.
+pub(crate) fn mapped_parts(at: usize, len: usize) -> Option<Vec<(usize, usize)>> {
+    if len == 0 || !view_books() {
+        return None;
+    }
+    let end = at.checked_add(len)?;
+    if !in_placeholder(at, end) {
+        return None;
+    }
+    let mut parts: Vec<(usize, usize)> = Vec::new();
+    for (base, bytes) in views_between(at, end) {
+        let (lo, hi) = (base.max(at), base.saturating_add(bytes).min(end));
+        if lo >= hi {
+            continue;
+        }
+        match parts.last_mut() {
+            Some((first, n)) if *first + *n == lo => *n += hi - lo,
+            _ => parts.push((lo, hi - lo)),
+        }
+    }
+    Some(parts)
+}
+
+/// With [`view_books`], if `at` lies in one of the runtime's placeholder
+/// reservations: where the run of unmapped memory from `at` on ends (the
+/// next view's start, or the reservation's end), or `at` itself if a view
+/// shows `at`. `None` otherwise (the caller asks the kernel).
+pub(crate) fn unmapped_end(at: usize) -> Option<usize> {
+    if !view_books() {
+        return None;
+    }
+    let reservation_end = {
+        let p = PLACEHOLDERS.lock().unwrap_or_else(|e| e.into_inner());
+        match p.range(..=at).next_back() {
+            Some((_, &(e, _))) if at < e => e,
+            _ => return None,
+        }
+    };
+    if !in_placeholder(at, at + 1) {
+        return None;
+    }
+    let v = views();
+    if v.views.range(..=at).next_back().is_some_and(|(&base, view)| base + view.0 > at) {
+        return Some(at);
+    }
+    let next = v.views.range(at..).next().map_or(reservation_end, |(&base, _)| base);
+    Some(next.min(reservation_end))
+}
+
+/// [`mapped_parts`] summed: the bytes of `[at, at + len)` mapped, if known.
+pub(crate) fn mapped_bytes(at: usize, len: usize) -> Option<u64> {
+    mapped_parts(at, len).map(|parts| parts.iter().map(|p| p.1 as u64).sum())
+}
+
 /// How the views cover `[at, at + len)`.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum Cover {
@@ -1260,5 +1411,47 @@ mod tests {
             views_gone(view as usize, 3 * K64);
             mem::VirtualFree(base as *mut c_void, 0, mem::MEM_RELEASE);
         }
+    }
+
+    /// In a placeholder the runtime told of, what is mapped is what its
+    /// views show: parts in order and joined, the end of an unmapped run,
+    /// and nothing known outside it (`VICTORY_VIEW_BOOKS`, on under Wine).
+    #[test]
+    fn the_books_say_what_is_mapped_in_a_placeholder() {
+        if !view_books() {
+            return;
+        }
+        // SAFETY: a reservation of the test's own; nothing is mapped in it.
+        let base = unsafe { mem::VirtualAlloc(std::ptr::null(), 8 * K64, mem::MEM_RESERVE, mem::PAGE_NOACCESS) } as usize;
+        assert_ne!(base, 0);
+        let at = |block: usize| base + block * K64;
+        assert_eq!(mapped_parts(base, 8 * K64), None, "not told of yet");
+        title_memory_placeholder(base, 8 * K64);
+        assert_eq!(mapped_parts(base, 8 * K64), Some(Vec::new()), "nothing mapped");
+        // Views at blocks 2-3 (one view and another after it) and 6.
+        title_memory_view(at(2), K64, 77, 0);
+        title_memory_view(at(3), K64, 77, K64 as u64);
+        title_memory_view(at(6), K64, 78, 0);
+        assert_eq!(mapped_parts(base, 8 * K64), Some(vec![(at(2), 2 * K64), (at(6), K64)]));
+        assert_eq!(mapped_parts(at(3) + 100, K64), Some(vec![(at(3) + 100, K64 - 100)]), "cut to the range");
+        assert_eq!(mapped_bytes(at(1), 3 * K64), Some(2 * K64 as u64));
+        assert_eq!(unmapped_end(base), Some(at(2)));
+        assert_eq!(unmapped_end(at(2)), Some(at(2)), "mapped");
+        assert_eq!(unmapped_end(at(4) + 8), Some(at(6)));
+        assert_eq!(unmapped_end(at(7)), Some(at(8)), "to the reservation's end");
+        // Outside it, and across its end: the kernel is asked.
+        assert_eq!(mapped_parts(at(7), 2 * K64), None);
+        assert_eq!(unmapped_end(at(8)), None);
+        // A view gone.
+        views_gone(at(2), 2 * K64);
+        assert_eq!(mapped_parts(base, 8 * K64), Some(vec![(at(6), K64)]));
+        views_gone(at(6), K64);
+        // A reservation made in its place replaces it.
+        title_memory_placeholder(at(4), 2 * K64);
+        assert_eq!(mapped_parts(base, K64), None);
+        assert_eq!(mapped_parts(at(4), K64), Some(Vec::new()));
+        PLACEHOLDERS.lock().unwrap().remove(&at(4));
+        // SAFETY: the test's own reservation.
+        unsafe { mem::VirtualFree(base as *mut c_void, 0, mem::MEM_RELEASE) };
     }
 }

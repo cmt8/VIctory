@@ -162,6 +162,12 @@ pub extern "system" fn XMemVirtualAlloc(
             "XMemVirtualAlloc"
         );
     }
+    // Physical pages are mapped there only by `map` (which tells the GPU
+    // side of every view), so the GPU side can say what is mapped there
+    // without asking the host (`VICTORY_VIEW_BOOKS`).
+    if placeholder && !at.is_null() {
+        victory_gpu::title_memory_placeholder(at as usize, size);
+    }
     at
 }
 

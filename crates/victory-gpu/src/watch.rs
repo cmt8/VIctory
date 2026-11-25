@@ -623,6 +623,11 @@ fn is_view(start: usize, end: usize) -> bool {
     };
     static HOLES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let holes = *HOLES.get_or_init(|| std::env::var_os("VICTORY_GUARD_HOLES").is_none_or(|v| v != "0"));
+    // In the runtime's placeholders: views and their holes, which is what
+    // the walk below finds (`crate::inplace::view_books`).
+    if holes && crate::inplace::mapped_parts(start, end.saturating_sub(start)).is_some() {
+        return true;
+    }
     let mut at = start;
     loop {
         // SAFETY: plain data filled in by the query.
@@ -757,6 +762,11 @@ fn uncommitted_end(block: usize) -> usize {
     use windows_sys::Win32::System::Memory::{
         MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
+    // In the runtime's placeholders, from its own word: no question that
+    // waits for the runtime's remapping under Wine (`crate::inplace::view_books`).
+    if let Some(end) = crate::inplace::unmapped_end(block * BLOCK) {
+        return end / BLOCK;
+    }
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.

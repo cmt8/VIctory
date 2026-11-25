@@ -220,6 +220,19 @@ frames later).
   texture streaming in is then uploaded once its pages are in instead of
   whole at every frame of the stream. The status line "what is mapped,
   from the runtime's word" counts the changes folded so.
+- `VICTORY_VIEW_BOOKS` (on under Wine, off elsewhere; `=0` or `=1`
+  says): what of title memory in the runtime's placeholders for physical
+  pages is mapped is answered from the views the runtime told of, not
+  asked of the kernel: the texture pass's looks at a slot, a texture
+  refresh of a texture with a page not there (read around its holes),
+  copies into host memory around holes, and the guards' questions where
+  an unmapped run ends and whether a range is view memory. Under Wine
+  each such question took ntdll's `virtual_mutex`, which the runtime's
+  remapping holds across wineserver requests (`membench`
+  `view_books_bench`: a half-mapped 4 MiB texture asked about in 0.8 us
+  from the books against 71 us idle, 355 us beside one thread remapping
+  and 45 ms beside two). A placeholder is looked at again at most once a
+  second to see it is still there.
 
 ## Tests
 
