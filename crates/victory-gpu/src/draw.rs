@@ -1506,7 +1506,16 @@ impl State {
                 None
             };
             if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
+                // (A root signature holds 64 dwords.)
+                let mut room = [0u32; 64];
+                let mut more = Vec::new();
+                let values: &mut [u32] = match room.get_mut(..dwords as usize) {
+                    Some(values) => values,
+                    None => {
+                        more.resize(dwords as usize, 0);
+                        &mut more
+                    }
+                };
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
                         values[u.index as usize] =
@@ -3109,14 +3118,14 @@ impl State {
         indexed: &[RootIndexedView],
         half: &[(u8, u32)],
         compute: bool,
-    ) -> Vec<(u8, u32)> {
+    ) -> Few<(u8, u32), 16> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
-        let mut fresh: Vec<u8> = used
-            .iter()
-            .filter(tables)
-            .filter(|u| u.kind == ResourceType::Cbv)
-            .map(|u| u.slot)
-            .collect();
+        let mut fresh: Few<u8, 16> = Few::default();
+        for u in used.iter().filter(tables).filter(|u| u.kind == ResourceType::Cbv) {
+            if !fresh.contains(&u.slot) {
+                fresh.push(u.slot);
+            }
+        }
         // The view shown in place of the title's at dword `at` of the table
         // in root parameter `slot`, if the shader moves halves there and
         // the title's view is a 16-bit float or signed buffer view.
@@ -3171,27 +3180,28 @@ impl State {
             let (Some(host), Some(index)) = (heap.host(), heap.index(end)) else {
                 continue;
             };
-            if index >= host.count() {
+            if index >= host.count() && !fresh.contains(&u.slot) {
                 fresh.push(u.slot);
             }
         }
+        // (Each slot once since it was put in.)
         fresh.sort_unstable();
-        fresh.dedup();
         for u in used.iter().filter(tables) {
             if !fresh.contains(&u.slot) {
                 self.table_entry(list, u, compute);
             }
         }
-        let mut made = Vec::new();
-        for slot in fresh {
+        let mut made = Few::default();
+        for &slot in fresh.iter() {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
-            let entries: Vec<&UsedResource> = used
-                .iter()
-                .filter(tables)
-                .filter(|u| u.slot == slot)
-                .collect();
+            // (Their places among `used`.)
+            let mut places: Few<u16, 32> = Few::default();
+            for (i, _) in used.iter().enumerate().filter(|(_, u)| tables(u) && u.slot == slot) {
+                places.push(i as u16);
+            }
+            let entries = || places.iter().map(|&i| &used[usize::from(i)]);
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
@@ -3226,8 +3236,7 @@ impl State {
             );
             selected.sort_unstable();
             selected.dedup();
-            let n = entries
-                .iter()
+            let n = entries()
                 .map(|u| u.table_offset_dwords / 8)
                 .chain(selected.last().copied())
                 .max()
@@ -3270,10 +3279,10 @@ impl State {
                 // by index.
                 let once = ready_once()
                     && selected.is_empty()
-                    && entries.iter().all(|u| u.kind != ResourceType::Uav);
+                    && entries().all(|u| u.kind != ResourceType::Uav);
                 let reader = Reader {
                     used: (used.as_ptr() as usize, used.len()),
-                    entries: entries.iter().fold(0u64, |h, u| {
+                    entries: entries().fold(0u64, |h, u| {
                         (h.rotate_left(13) ^ (u64::from(u.table_offset_dwords) << 16 | kind_number(u.kind)))
                             .wrapping_mul(0x9E37_79B9_7F4A_7C15)
                     }),
@@ -3300,14 +3309,14 @@ impl State {
                 let depth_before = TESTED_DEPTH.get();
                 TESTED_DEPTH.set((depth_before.0, false));
                 let noted_before = SUBST.replace(0);
-                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
+                for u in entries().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
                         readable(list, u.kind, &view);
                     }
                 }
                 for k in selected {
-                    if entries.iter().any(|u| u.table_offset_dwords / 8 == k) {
+                    if entries().any(|u| u.table_offset_dwords / 8 == k) {
                         continue;
                     }
                     let handle = table + u64::from(k) * 32;
@@ -3353,7 +3362,7 @@ impl State {
             let mut has_cbv = false;
             for k in 0..n {
                 let index = first + k;
-                let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
+                let used = entries().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
                         has_cbv = true;
@@ -3365,7 +3374,7 @@ impl State {
                         host.constant_at(index, gpu, size);
                     }
                     Some(view)
-                        if read_as_buffer(entries.iter().copied(), k)
+                        if read_as_buffer(entries(), k)
                             && crate::descriptor::host::kind_mismatch(&view, 4) =>
                     {
                         // A texture view where the shader reads a buffer: its
@@ -3374,9 +3383,7 @@ impl State {
                         // fault); the console read whatever its first
                         // dwords said. Read as nothing instead.
                         crate::descriptor::host::KIND_MISMATCHES[0].fetch_add(1, Ordering::Relaxed);
-                        let uav = entries
-                            .iter()
-                            .any(|u| u.table_offset_dwords / 8 == k && u.kind == ResourceType::Uav);
+                        let uav = entries().any(|u| u.table_offset_dwords / 8 == k && u.kind == ResourceType::Uav);
                         if uav {
                             host.null_raw_uav_at(index);
                         } else {
@@ -4053,6 +4060,55 @@ fn read_as_buffer<'a>(entries: impl Iterator<Item = &'a UsedResource>, k: u32) -
     any
 }
 
+/// A few things, up to `N` of them without memory of the heap: what a draw's
+/// tables are gone through with, some six lists a stage. (AvatarManz
+/// 4e77a8795.)
+pub(crate) struct Few<T, const N: usize> {
+    few: [T; N],
+    len: usize,
+    /// All of them, if they are more.
+    many: Vec<T>,
+}
+
+impl<T: Copy + Default, const N: usize> Default for Few<T, N> {
+    fn default() -> Self {
+        Few { few: [T::default(); N], len: 0, many: Vec::new() }
+    }
+}
+
+impl<T: Copy, const N: usize> Few<T, N> {
+    fn push(&mut self, what: T) {
+        if self.many.is_empty() && self.len < N {
+            self.few[self.len] = what;
+            self.len += 1;
+        } else {
+            if self.many.is_empty() {
+                self.many.extend_from_slice(&self.few);
+            }
+            self.many.push(what);
+        }
+    }
+}
+
+impl<T, const N: usize> std::ops::Deref for Few<T, N> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        if self.many.is_empty() { &self.few[..self.len] } else { &self.many }
+    }
+}
+
+impl<T, const N: usize> std::ops::DerefMut for Few<T, N> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        if self.many.is_empty() { &mut self.few[..self.len] } else { &mut self.many }
+    }
+}
+
+impl<T: std::fmt::Debug, const N: usize> std::fmt::Debug for Few<T, N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::ops::Deref::deref(self).fmt(f)
+    }
+}
+
 /// Who reads a table made afresh, as far as [`readable`] goes by it: the
 /// stage's list of what it reads (where and how long), a fingerprint of its
 /// entries of the table, whether the stage stores to buffers, and the depth
@@ -4227,10 +4283,13 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                 note_texture(*resource as This, aliased);
             }
             if !aliased
-                && let Some(t) = crate::resource::host_resource(*resource as This)
-                && crate::texture::title_written(t)
+                && let Some(t) = crate::resource::host_copy(*resource as This)
+                && t.flags() & 0x7 == 0
             {
-                crate::texture::upload(list, *resource as This, t);
+                // (A texture the title writes: no target, depth or unordered
+                // access, `crate::texture::title_written`, by the flags the
+                // host copy keeps.)
+                crate::texture::upload(list, *resource as This, &t.texture);
             }
             // A depth texture shaders also write: what they wrote, first.
             list.twin_use(*resource as This, false, false);
@@ -4545,7 +4604,18 @@ mod tests {
 
 #[cfg(test)]
 mod record_hash_tests {
-    use super::RecordHash;
+    use super::{Few, RecordHash};
+
+    #[test]
+    fn a_few_things_are_kept_in_order_however_many() {
+        for n in 0..10u32 {
+            let mut few: Few<u32, 4> = Few::default();
+            (0..n).for_each(|i| few.push(n - i));
+            assert_eq!(few.to_vec(), (0..n).map(|i| n - i).collect::<Vec<_>>());
+            few.sort_unstable();
+            assert_eq!(few.to_vec(), (1..=n).collect::<Vec<_>>());
+        }
+    }
 
     #[test]
     fn records_that_differ_hash_apart() {
