@@ -897,3 +897,16 @@ fn guard_runs_bench() {
     }
     pool.mapped.fill(false);
 }
+
+/// What a clock read costs (`VICTORY_MEMBENCH=1`): the status lines time
+/// the guards' calls, the kernel's write-watch askings and the refreshes'
+/// copies with two of them each.
+#[test]
+fn clock_bench() {
+    if !on() {
+        return;
+    }
+    report("Instant::now + elapsed", ns_per(1_000_000, |_| {
+        std::hint::black_box(Instant::now().elapsed());
+    }));
+}

@@ -1491,6 +1491,23 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
     out
 }
 
+/// Places of [`COPIES`]: bytes and microseconds of title memory copied
+/// into copies in the card's memory (their CPU side), of it the part
+/// compared against the copy-back's echo, and into copies in PC memory.
+const COPY_CARD: usize = 0;
+const COPY_ECHO: usize = 1;
+const COPY_PC: usize = 2;
+
+/// Since the last frame-rate line, by kind ([`COPY_CARD`]..): bytes and
+/// microseconds of title memory a refresh copied; then the bytes of the
+/// refreshed ranges the write watch or the guards said were unchanged.
+pub(crate) static COPIES: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+fn copied(kind: usize, bytes: usize, started: std::time::Instant) {
+    COPIES[2 * kind].fetch_add(bytes as u64, Ordering::Relaxed);
+    COPIES[2 * kind + 1].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+}
+
 /// Since the last frame-rate line, of the shader-written ranges looked for
 /// on the CPU (copies not in the card's memory): bytes snapshotted in
 /// windows outside buffers and in title buffers' copies; bytes compared in
@@ -3003,6 +3020,7 @@ impl Shadow {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written);
+                COPIES[6].fetch_add((to - from).saturating_sub(copied) as u64, Ordering::Relaxed);
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
                 {
@@ -3128,6 +3146,7 @@ impl Shadow {
         if from >= to {
             return 0;
         }
+        let started = std::time::Instant::now();
         if let Some(card) = &self.card {
             ECHO[1].fetch_add((to - from) as u64, Ordering::Relaxed);
             if !echo_compare() {
@@ -3140,17 +3159,25 @@ impl Shadow {
                         if lo > at {
                             self.copy_whole(at, lo);
                         }
+                        let comparing = std::time::Instant::now();
                         self.copy_compared(lo, hi);
+                        copied(COPY_ECHO, hi - lo, comparing);
                         at = hi;
                     }
                     if at < to {
                         self.copy_whole(at, to);
                     }
+                    copied(COPY_CARD, to - from, started);
                     return to - from;
                 }
             }
+            let n = self.copy_whole(from, to);
+            copied(COPY_CARD, n, started);
+            return n;
         }
-        self.copy_whole(from, to)
+        let n = self.copy_whole(from, to);
+        copied(COPY_PC, n, started);
+        n
     }
 
     /// [`Shadow::copy`] of `[from, to)` (inside the buffer), every byte.

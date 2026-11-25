@@ -144,6 +144,18 @@ pub(crate) fn slow_asks() -> [u64; 3] {
     [0, 1, 2].map(|i| SLOW[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
+/// Since the last frame-rate line: the kernel's write-watch askings
+/// (`GetWriteWatch`, failing ones included) and their microseconds. Under
+/// Wine each takes ntdll's `virtual_mutex` (`membench`: 1 MiB, 1.9 us idle,
+/// 22 us beside one thread remapping).
+pub(crate) static KERNEL_ASKS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+fn asked_kernel(started: std::time::Instant) {
+    use std::sync::atomic::Ordering::Relaxed;
+    KERNEL_ASKS[0].fetch_add(1, Relaxed);
+    KERNEL_ASKS[1].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+}
+
 /// The submission's refreshes are done: `writes` asks the kernel again.
 pub(crate) fn ask_ahead_done() {
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -271,7 +283,6 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;
-    #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // SAFETY: the answer buffer holds `count` entries.
     let failed = unsafe {
@@ -284,6 +295,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
             &mut granularity,
         )
     } != 0;
+    asked_kernel(started);
     if failed {
         return false;
     }
@@ -356,6 +368,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     if !known_view {
         ASKED_KERNEL.with(|n| n.set(n.get() + 1));
     }
+    let asking = std::time::Instant::now();
     // SAFETY: the answer buffer holds `count` entries.
     let failed = known_view
         || unsafe {
@@ -368,6 +381,9 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
                 &mut granularity,
             )
         } != 0;
+    if !known_view {
+        asked_kernel(asking);
+    }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
         if known_view {

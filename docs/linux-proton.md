@@ -241,6 +241,13 @@ frames later).
   `NtProtectVirtualMemory` wants one view). The status line "the guards'
   protection changes per frame" counts the calls, blocks and time by
   what they were for, and the write faults taken.
+- Not a switch: a status line "title memory copied by the refreshes per
+  frame" splits the frame line's "copies" by where the bytes went (copies
+  in the card's memory, of it the part compared against the copy-back's
+  echo, copies in PC memory), the bytes left as unchanged, and the
+  kernel's write-watch askings; what it does not name is the guards, the
+  journal and the locks. Its clock reads cost about 0.14 us each a copy
+  under Wine (`membench` `clock_bench`).
 
 ## Tests
 

@@ -6675,6 +6675,26 @@ impl Meter {
                      (VICTORY_TEXTURE_QUIET_FRAMES=0: none)"
                 );
             }
+            let c: Vec<f64> = crate::shadow::COPIES.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+            let [asks, asked_us] = [0, 1].map(|i| crate::watch::KERNEL_ASKS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if c.iter().any(|&v| v > 0.0) || asks > 0.0 {
+                let mb = |v: f64| v / (1 << 20) as f64;
+                tracing::info!(
+                    "title memory copied by the refreshes per frame: into copies in the card's memory {:.1} MB in {:.1} ms \
+                     (of it {:.1} MB compared against the copy-back's echo in {:.1} ms), into copies in PC memory {:.1} MB in \
+                     {:.1} ms; {:.1} MB of the ranges refreshed left as the write watch or the guards found them unchanged; \
+                     {asks:.0} write-watch askings of the kernel in {:.1} ms (the rest of the frame line's \"copies\" is the \
+                     guards, the journal and the locks)",
+                    mb(c[0]),
+                    c[1] / 1e3,
+                    mb(c[2]),
+                    c[3] / 1e3,
+                    mb(c[4]),
+                    c[5] / 1e3,
+                    mb(c[6]),
+                    asked_us / 1e3,
+                );
+            }
             let p: Vec<[f64; 3]> = crate::watch::PROTECTS
                 .iter()
                 .map(|row| [0, 1, 2].map(|i| row[i].swap(0, Ordering::Relaxed) as f64 / frames))
