@@ -6611,6 +6611,7 @@ impl Meter {
         let slow = crate::watch::slow_asks();
         // Over the same frames as the counts above.
         let drops = crate::pipeline::take_drops();
+        let substituted = crate::pipeline::take_substitutions();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
             tracing::info!(
@@ -6740,6 +6741,11 @@ impl Meter {
                     "dropped {:.1}/frame without a host pipeline: {why}",
                     *n as f64 / frames
                 );
+            }
+            // Draws that ran with something the title bound missing or
+            // replaced on the host (`crate::draw`, `Substituted`).
+            for (what, n) in substituted.iter().take(40) {
+                tracing::info!("substituted {:.1}/frame: {what}", *n as f64 / frames);
             }
         }
         if self.caption.is_none() {

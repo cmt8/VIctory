@@ -94,11 +94,11 @@ In the diagnostics build:
   format the frame writes (names as in `VICTORY_DUMP_TARGETS` files). The
   world's G-buffer shows its geometry while the final image is dark:
   `VICTORY_SHOW_TARGET=2560x1440-f28-3` on a Series X profile.
-- `VICTORY_DEBUG_PS=1` draws depth-tested geometry with a debug pixel
-  shader (surfaces coloured by their slope, from depth derivatives) instead
-  of the title's: the geometry of every draw whose vertex or mesh stage
-  translates, whether its pixel shader does or not. With the two switches
-  together you can walk the world in a flat-colour view.
+- `VICTORY_DEBUG_PS=1` and `VICTORY_PS_FALLBACK`: not on this branch. The
+  debug pixel shader they come with (upstream #994) was backed out
+  (b06b512a) and never came back, so no draw is ever drawn with a stand-in
+  pixel shader: a pixel shader that does not translate drops its draws,
+  which the drop reasons name.
 
 In every build, a texture in view memory that changes with no write the
 guards see (the boot logo's video planes; a write through another view of
@@ -107,9 +107,6 @@ about four seconds after each such change is found;
 `VICTORY_BLIND_TEXTURES=0` reads it one frame in eight, as before (the
 logo then stutters).
 
-In every build, a draw of depth-tested geometry whose pixel shader does
-not translate (or that the host refuses) is drawn with that debug shader
-instead of dropped; `VICTORY_PS_FALLBACK=0` turns that off.
 Under Wine, a texture picked by index that was uploaded whole is looked
 at again seven times (4 to about 3,600 frames after), and each look also
 reads the first 512 bytes of every 64 KiB page of it: a texture the title
@@ -257,6 +254,24 @@ frames later).
   host-copied texture whose memory holds views the title placed earlier;
   "HERO LEAD: a placed texture view lies in the memory ..." still names
   views placed after the copy.
+- With `VICTORY_DROP_REASONS=1` the drop lines are followed by up to 40
+  lines `substituted N/frame: <what> (<stage> <hash>, ...)`: draws and
+  dispatches that ran with something the title bound missing or replaced
+  on the host, counted once per draw and stage, by the pipeline's shaders.
+  What: a table slot the title wrote a record into that is null on the
+  host; a texture view whose texture has no host copy; a texture read in
+  a stand-in format; a texture whose memory is not all mapped (uploaded in
+  part or not at all); a buffer view with no host copy; a view in the
+  memory of a texture the host renders to that reads title memory instead.
+  Only what draws read through tables is seen; textures picked by index
+  have the queue line ("textures picked by index, the queue"), and a
+  buffer read at a computed index that finds no buffer view (the buffer
+  guard) is decided on the card and not counted.
+- `VICTORY_SKIP_PIPELINES=<hash>,<hash>,...` now works in every build (it
+  was in the diagnostics build only): draws and dispatches of pipelines
+  with one of these shaders (16 hex digits, as the "first bind" lines print
+  them) are dropped and named "skipped shader <hash>" in the drop reasons.
+  An A/B for which program draws a surface, with no translation changed.
 
 ## Tests
 

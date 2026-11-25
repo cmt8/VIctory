@@ -1298,6 +1298,22 @@ fn copied_source(this: This, desc: &ResourceDesc, address: u64) -> Option<This> 
     })
 }
 
+/// Whether a view the title placed in memory (`this`, a texture made by
+/// [`texture_at`]) lies where a texture the host renders to or writes
+/// lies, though [`alias_of`] found no way to read that texture through it
+/// (another size, levels or texel width): the view then shows title
+/// memory, which the host's writes never reach (for the substitution
+/// counts with `VICTORY_DROP_REASONS=1`).
+#[cfg(windows)]
+pub(crate) fn target_unread(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let r = resource(this);
+    r.host.placed.load(std::sync::atomic::Ordering::Relaxed)
+        && TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&(r.data() as u64))
+}
+
 /// The textures made for views the title placed in `[start, end)`
 /// ([`texture_at`]): their address and resource.
 #[cfg(windows)]
