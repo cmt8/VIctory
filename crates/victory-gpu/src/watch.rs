@@ -2916,9 +2916,18 @@ fn protect_run(g: &Guards, from: usize, to: usize, claims: &mut Claims) {
 /// refresh, around its unmapped pages (run 54: 300 such ranges, 570 MB
 /// copied a frame for them, 255 copies a frame reading around holes).
 /// `VICTORY_GUARD_HOLES=0` looks at the first address only, as before.
+///
+/// A range that begins in free memory is none: free memory is not the
+/// runtime's (its views' holes are placeholders, reserved), and guarding
+/// it guards whatever is allocated there later. A null address's window
+/// (a loose copy from 0) is such a range, and under Wine the process heap
+/// and the first file mappings lie in the first 4 MiB: walked to a mapping
+/// there, its blocks were guarded, the heap's among them, and a heap write
+/// by a thread holding the guards' lock (here, or in the fault handler)
+/// faulted into the handler, which waits for that lock for ever.
 fn is_view(start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery,
+        MEM_COMMIT, MEM_FREE, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
     static HOLES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let holes = *HOLES.get_or_init(|| std::env::var_os("VICTORY_GUARD_HOLES").is_none_or(|v| v != "0"));
@@ -2928,7 +2937,7 @@ fn is_view(start: usize, end: usize) -> bool {
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
         let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
-        if n == 0 {
+        if n == 0 || (at == start && info.State == MEM_FREE) {
             return false;
         }
         if info.Type == MEM_MAPPED {
@@ -4543,6 +4552,76 @@ mod tests {
             for block in 0..3 {
                 VirtualFree((p + block * BLOCK) as *mut _, 0, MEM_RELEASE);
             }
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        }
+    }
+
+    /// Free memory is not watched: the window a null address falls in (a
+    /// loose copy of title memory from 0). Watched, its blocks would be
+    /// guarded once something is allocated there: under Wine the process
+    /// heap, whose writes then fault into the handler while a thread holds
+    /// the guards' lock.
+    #[test]
+    fn free_memory_is_not_watched() {
+        assert!(!is_view(0, 4 << 20), "the window of a null address");
+        assert!(writes(0, 4 << 20, true).is_none(), "the window of a null address");
+    }
+
+    /// A range that begins in free memory is no view, also where a view
+    /// follows the free memory: walked to the view, the range's free blocks
+    /// were guarded with it.
+    #[test]
+    fn a_range_that_begins_in_free_memory_is_not_a_view() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
+            MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, PAGE_NOACCESS, UnmapViewOfFile2,
+            VirtualAlloc2,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        // SAFETY: a fresh placeholder of two blocks, split; the second is
+        // a view of a pagefile section, the first given back (free).
+        let (p, section, view) = unsafe {
+            let p = VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                2 * BLOCK,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            ) as usize;
+            assert_ne!(p, 0);
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                BLOCK as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            VirtualFree(p as *mut _, BLOCK, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+            let view = MapViewOfFile3(
+                section,
+                GetCurrentProcess(),
+                (p + BLOCK) as *const _,
+                0,
+                BLOCK,
+                MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            );
+            assert_eq!(view.Value as usize, p + BLOCK);
+            assert_ne!(VirtualFree(p as *mut _, 0, MEM_RELEASE), 0);
+            (p, section, view)
+        };
+        assert!(is_view(p + BLOCK, p + 2 * BLOCK), "the view alone");
+        assert!(!is_view(p, p + 2 * BLOCK), "free memory, then the view");
+        // SAFETY: our view, its placeholder and section.
+        unsafe {
+            UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER);
+            VirtualFree((p + BLOCK) as *mut _, 0, MEM_RELEASE);
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
     }
