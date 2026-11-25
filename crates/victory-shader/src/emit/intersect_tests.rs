@@ -490,7 +490,33 @@ impl Drop for Memory {
 /// the reference. `pointers` is what node pointers count from, in bytes
 /// before the first node.
 fn run(wide: bool, descriptor: Descriptor, pointers: u64, sort: bool) {
-    let (shader, res) = build(wide, descriptor).expect("the program lowers");
+    run_as(wide, descriptor, pointers, sort, false);
+}
+
+/// What the node test gives for `case` with nothing built
+/// (`super::bvh_miss`): a box node has no child the ray enters, any other
+/// node is a triangle the ray misses.
+fn missed(case: &Case) -> [u32; 4] {
+    match case {
+        Some((_, kind, _)) if kind & 6 == 4 => [bvh::NONE; 4],
+        Some(_) => bvh::MISS.map(f32::to_bits),
+        None => BEFORE,
+    }
+}
+
+/// [`run`]; with `miss`, the program is made with the node test answering
+/// "nothing here" (`super::bvh_miss`) and compared with [`missed`].
+fn run_as(wide: bool, descriptor: Descriptor, pointers: u64, sort: bool, miss: bool) {
+    super::BVH_MISS_TEST.set(Some(miss));
+    let built = build(wide, descriptor);
+    super::BVH_MISS_TEST.set(None);
+    let (shader, res) = built.expect("the program lowers");
+    // What each thread must give: the reference, or with `miss` what a
+    // walk over nothing built gives. (The checks below that the scene
+    // covers every kind of answer are of the reference either way.)
+    let want = |scene: &Scene, case: &Case, sort: bool| {
+        if miss { missed(case) } else { expected(scene, case, sort) }
+    };
     assert_eq!(res.bvh.len(), 1);
     let (scene, batches) = scene();
     // The reference must see a bit of everything, or the comparison
@@ -563,7 +589,7 @@ fn run(wide: bool, descriptor: Descriptor, pointers: u64, sort: bool) {
             for t in 0..THREADS as usize {
                 let case = batch.get(t).copied().flatten();
                 let want = match batch.get(t) {
-                    Some(c) => expected(&scene, c, sort),
+                    Some(c) => want(&scene, c, sort),
                     // A thread past the batch: its record is zeros, so it
                     // is masked out.
                     None => BEFORE,
@@ -598,6 +624,18 @@ fn the_64_bit_node_test_in_a_host_buffer_matches_the_reference_on_the_card() {
 #[test]
 fn the_32_bit_node_test_in_a_host_buffer_matches_the_reference_on_the_card() {
     run(false, Descriptor::Table, u64::from(NODES), true);
+}
+
+/// With nothing built (`super::bvh_miss`, the default while the structure
+/// builder is off) the node test reads no node and answers by the node's
+/// kind: no child entered for a box, a miss for anything else; threads
+/// outside the lane mask keep their registers.
+#[test]
+fn with_nothing_built_the_node_test_misses_on_the_card() {
+    run_as(true, Descriptor::Table, u64::from(NODES), true, true);
+    run_as(false, Descriptor::Table, u64::from(NODES), true, true);
+    let _memory = Memory::at(BASE);
+    run_as(true, WHOLE, BASE + u64::from(NODES), true, true);
 }
 
 /// Where the tests' title memory puts the buffer: past 4 GiB, on 256 bytes.

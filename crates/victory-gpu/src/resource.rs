@@ -1236,7 +1236,11 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
     }
     // Under the table's lock: a texture leaves it before it is freed.
     let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
-    let other = *targets.get(&(r.data() as u64))? as This;
+    let Some(&other) = targets.get(&(r.data() as u64)) else {
+        drop(targets);
+        return copied_source(this, &r.desc, r.data() as u64);
+    };
+    let other = other as This;
     let o = resource(other);
     const DEPTH: u32 = 0x2;
     let same = one(&o.desc)
@@ -1249,6 +1253,73 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
         && target_format(o.desc.format) == o.desc.format
         && element(o.desc.format).is_some_and(|e| e.1 == 1 && Some(e) == element(r.desc.format));
     same.then_some(other)
+}
+
+/// Whether a view the title placed exactly where a texture the host copied
+/// into lies, of the same size, levels and layers and texels of the same
+/// width, reads that texture's texels ([`copied_source`]). On by default;
+/// `VICTORY_COPIED_VIEWS=0`: it is filled from title memory, as before.
+#[cfg(windows)]
+fn copied_views() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COPIED_VIEWS").is_none_or(|v| v != "0"))
+}
+
+/// For [`alias_of`] where no target lies at the view's address: the title
+/// texture the host copied into (`crate::texture::host_written`) that lies
+/// at that very address, if it has the view's size, levels and layers and
+/// texels of the same width (a block-compressed format counts by its
+/// blocks). The title's character bake copies its result into
+/// block-compressed textures on the card; a view placed in such a
+/// texture's memory got a host copy of its own, filled from title memory,
+/// which the copy never reached ("HERO LEAD" in the log), and showed
+/// whatever bytes that memory held before.
+#[cfg(windows)]
+fn copied_source(this: This, desc: &ResourceDesc, address: u64) -> Option<This> {
+    const DEPTH: u32 = 0x2;
+    if !copied_views() {
+        return None;
+    }
+    crate::texture::host_copied_at(address, |other| {
+        if other == this || other.is_null() {
+            return false;
+        }
+        let o = &resource(other).desc;
+        o.dimension == desc.dimension
+            && o.width == desc.width
+            && o.height == desc.height
+            && o.mip_levels == desc.mip_levels
+            && o.mip_levels >= 1
+            && o.depth_or_array_size == desc.depth_or_array_size
+            && o.sample_count <= 1
+            && o.flags & DEPTH == 0
+            && element(o.format).is_some()
+            && element(o.format) == element(desc.format)
+    })
+}
+
+/// Whether a view the title placed in memory (`this`, a texture made by
+/// [`texture_at`]) lies where a texture the host renders to or writes
+/// lies, though [`alias_of`] found no way to read that texture through it
+/// (another size, levels or texel width): the view then shows title
+/// memory, which the host's writes never reach (for the substitution
+/// counts with `VICTORY_DROP_REASONS=1`).
+#[cfg(windows)]
+pub(crate) fn target_unread(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let r = resource(this);
+    r.host.placed.load(std::sync::atomic::Ordering::Relaxed)
+        && TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&(r.data() as u64))
+}
+
+/// The textures made for views the title placed in `[start, end)`
+/// ([`texture_at`]): their address and resource.
+#[cfg(windows)]
+pub(crate) fn placed_in(start: u64, end: u64) -> Vec<(u64, This)> {
+    let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    map.range((start, [0u32; 14])..(end, [0u32; 14])).map(|(&(at, _), &r)| (at, r as This)).collect()
 }
 
 /// Whether host copies are made on first use. On by default;

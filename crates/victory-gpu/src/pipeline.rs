@@ -427,7 +427,7 @@ pub(crate) fn drop_reasons() -> bool {
 }
 
 /// Shader hashes as printed in the pipeline diagnostics.
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -447,7 +447,12 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+/// `VICTORY_SKIP_PIPELINES=<hash>,<hash>,...` (any build; it was in the
+/// diagnostics build only): draws and dispatches of pipelines with one of
+/// these shaders (16 hex digits, as the "first bind" lines print them) are
+/// dropped and counted as "skipped shader <hash>" in the drop reasons. An
+/// A/B for which program draws a surface, with no translation changed.
+#[cfg(windows)]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
@@ -463,7 +468,7 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
         .map(|shader| shader.hash.as_str())
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && skipped_shader(pipeline(this)).is_some()
 }
@@ -486,10 +491,7 @@ pub(crate) fn note_drop_or(this: This, other: Option<&str>) {
         Some("no pipeline set".to_owned())
     } else {
         let p = pipeline(this);
-        #[cfg(feature = "diagnostics")]
         let skipped = skipped_shader(p).map(|hash| format!("skipped shader {hash}"));
-        #[cfg(not(feature = "diagnostics"))]
-        let skipped = None;
         skipped
             .or_else(|| make::missing(&p.host))
             .or_else(|| other.map(|why| format!("{why} ({:?})", p.shaders)))
@@ -520,6 +522,48 @@ pub(crate) fn take_drops() -> Vec<(String, u64)> {
     // a HashMap iteration order change cannot change which reasons appear.
     drops.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     drops
+}
+
+/// Draws and dispatches that ran with something the title bound replaced
+/// or missing on the host, since the last [`take_substitutions`], by what
+/// and by the pipeline's shaders ([`drop_reasons`], as the drops).
+#[cfg(windows)]
+#[allow(clippy::type_complexity)]
+static SUBSTITUTIONS: Mutex<Option<HashMap<(&'static str, usize), (u64, Vec<Arc<Shader>>)>>> = Mutex::new(None);
+
+/// Counts one draw or dispatch of `this` that ran with `what` in place of
+/// what the title bound ([`drop_reasons`]; a lock per such draw, nothing
+/// for the others).
+#[cfg(windows)]
+pub(crate) fn note_substituted(this: This, what: &'static str) {
+    if !drop_reasons() {
+        return;
+    }
+    let mut map = SUBSTITUTIONS.lock().unwrap_or_else(|e| e.into_inner());
+    // The shaders are kept with the count (the title may release the
+    // pipeline before the line is written).
+    let entry = map.get_or_insert_with(HashMap::new).entry((what, this as usize)).or_insert_with(|| {
+        let shaders = if this.is_null() { Vec::new() } else { pipeline(this).shaders.clone() };
+        (0, shaders)
+    });
+    entry.0 += 1;
+}
+
+/// The substitutions counted since the last call, as (what, the
+/// pipeline's shaders by stage and hash, count), most first.
+#[cfg(windows)]
+pub(crate) fn take_substitutions() -> Vec<(String, u64)> {
+    let map = SUBSTITUTIONS.lock().unwrap_or_else(|e| e.into_inner()).take();
+    // By what and shaders: two title pipelines of the same shaders are one
+    // line.
+    let mut by: HashMap<String, u64> = HashMap::new();
+    for ((what, _), (n, shaders)) in map.into_iter().flatten() {
+        let shaders: Vec<String> = shaders.iter().map(|s| format!("{} {}", s.stage, s.hash)).collect();
+        *by.entry(format!("{what} ({})", shaders.join(", "))).or_default() += n;
+    }
+    let mut out: Vec<(String, u64)> = by.into_iter().collect();
+    out.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out
 }
 
 /// The stage's container, if it has one.
@@ -767,7 +811,7 @@ pub fn save_pipeline_cache() {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(all(windows, feature = "diagnostics"))]
+    #[cfg(windows)]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
         assert!(super::parse_skip_hashes(" , ").is_empty());

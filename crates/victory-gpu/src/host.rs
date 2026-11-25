@@ -4650,6 +4650,9 @@ impl Host {
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }
         let behind = late && flying();
+        // Descriptor records the title copied into its heaps as bytes,
+        // before the lists that index those slots run.
+        crate::descriptor::sync_heaps();
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
@@ -6747,6 +6750,8 @@ impl Meter {
                 "indirect records per frame: {emptied:.1} run empty with their list's budget spent ({spent:.1} lists ran out; VICTORY_INDIRECT_BUDGET_LOG2 sets it), {nothing:.1} asked for nothing (or past what one execution runs), {cut:.1} draws cut to the vertex or instance bounds"
             );
         }
+        crate::shadow::exact_line(frames);
+        crate::descriptor::sync_line(frames);
         late_line(frames);
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);
@@ -6919,6 +6924,7 @@ impl Meter {
         let slow = crate::watch::slow_asks();
         // Over the same frames as the counts above.
         let drops = crate::pipeline::take_drops();
+        let substituted = crate::pipeline::take_substitutions();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
             tracing::info!(
@@ -7054,6 +7060,11 @@ impl Meter {
                     "dropped {:.1}/frame without a host pipeline: {why}",
                     *n as f64 / frames
                 );
+            }
+            // Draws that ran with something the title bound missing or
+            // replaced on the host (`crate::draw`, `Substituted`).
+            for (what, n) in substituted.iter().take(40) {
+                tracing::info!("substituted {:.1}/frame: {what}", *n as f64 / frames);
             }
         }
         if self.caption.is_none() {

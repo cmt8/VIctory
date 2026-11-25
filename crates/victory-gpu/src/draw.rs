@@ -70,6 +70,28 @@ thread_local! {
     /// milliseconds and the bytes that run may take, in place of the
     /// pass's own per frame.
     static PASS_BUDGET: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+    /// While a stage's tables are walked: what of what the title bound the
+    /// host left out or replaced ([`SUBSTITUTED`] bits).
+    static SUBST: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+/// What a draw can run with in place of what the title bound, counted per
+/// draw and pipeline with `VICTORY_DROP_REASONS=1` (the lines
+/// "substituted N/frame: <what> (<shaders>)"), by bit of [`SUBST`].
+const SUBSTITUTED: [&str; 6] = [
+    "a table slot the title wrote a record into is null on the host",
+    "a texture view whose texture has no host copy (null)",
+    "a texture read in a stand-in format",
+    "a texture not all mapped (uploaded in part or not at all)",
+    "a buffer view with no host copy (null)",
+    "a view in the memory of a texture the host renders to that reads title memory instead",
+];
+
+/// Notes `what` ([`SUBSTITUTED`]) for the draw being prepared.
+fn substituted(what: usize) {
+    if crate::pipeline::drop_reasons() {
+        SUBST.set(SUBST.get() | 1 << what);
+    }
 }
 
 /// The milliseconds of every frame the pass that uploads textures picked
@@ -955,7 +977,6 @@ impl State {
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
         DROP_WHY.set(None);
-        #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
         }
@@ -1108,8 +1129,15 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
+            SUBST.set(0);
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
             STORES.set(true);
+            let mask = SUBST.replace(0);
+            for (bit, what) in SUBSTITUTED.iter().enumerate() {
+                if mask & 1 << bit != 0 {
+                    crate::pipeline::note_substituted(self.pipeline as This, what);
+                }
+            }
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 drop_why("a descriptor table found no free slots");
@@ -2217,7 +2245,6 @@ impl State {
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
         self.window = None;
-        #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::pipeline::note_drop(self.pipeline as This);
@@ -2636,6 +2663,8 @@ impl State {
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
             }
+        } else if record_written(handle) {
+            substituted(0);
         }
     }
 
@@ -2826,6 +2855,9 @@ impl State {
                         host.make_null(index);
                         if used.is_some() {
                             once!(slot, "a table entry without a view");
+                            if record_written(table + u64::from(k) * 32) {
+                                substituted(0);
+                            }
                         }
                     }
                 }
@@ -3060,7 +3092,6 @@ impl State {
         count: Option<u64>,
     ) -> bool {
         // Skip before the argument clamp can mutate the indirect buffer.
-        #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
@@ -3342,6 +3373,35 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
     }
 }
 
+/// Whether the descriptor record at `handle` (title memory) holds
+/// anything: a slot the title never wrote, or wrote zeros, reads null on
+/// the console too.
+fn record_written(handle: u64) -> bool {
+    let mut words = [0u8; 12];
+    crate::host::read_into(handle as *const u8, &mut words) && words.iter().any(|&b| b != 0)
+}
+
+/// The substitutions ([`SUBSTITUTED`]) a texture a shader samples comes
+/// with: no host copy, a stand-in format, memory not all mapped, or a view
+/// in a render target's memory that reads title memory (not `aliased`).
+fn note_texture(resource: This, aliased: bool) {
+    let Some(host) = crate::resource::host_resource(resource) else {
+        substituted(1);
+        return;
+    };
+    if crate::resource::stands_in(resource) {
+        substituted(2);
+    }
+    if crate::texture::title_written(host) {
+        if crate::texture::staged(resource).is_some_and(|(_, whole)| !whole) {
+            substituted(3);
+        }
+        if !aliased && crate::resource::target_unread(resource) {
+            substituted(5);
+        }
+    }
+}
+
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
@@ -3364,6 +3424,12 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             }
         }
     }
+    if crate::pipeline::drop_reasons()
+        && crate::descriptor::host::buffer_range(view).is_some()
+        && crate::descriptor::host::buffer_copy(view).is_none()
+    {
+        substituted(4);
+    }
     match (view, kind) {
         (View::Shader(resource, _), ResourceType::Srv) => {
             // A view the title placed, in another format, in the memory of
@@ -3371,6 +3437,9 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // the host (title memory does not have them).
             let aliased = crate::resource::alias_of(*resource as This)
                 .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
+            if crate::pipeline::drop_reasons() && crate::resource::buffer_bytes(*resource as This).is_none() {
+                note_texture(*resource as This, aliased);
+            }
             if !aliased
                 && let Some(t) = crate::resource::host_resource(*resource as This)
                 && crate::texture::title_written(t)

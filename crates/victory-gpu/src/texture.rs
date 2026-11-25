@@ -186,6 +186,10 @@ static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
 /// texture's layout first.
 struct Through {
     buffer: ID3D12Resource,
+    /// For a source the host copied into rather than rendered to: its
+    /// write ([`host_write_tick`]) the last copy was recorded after (0:
+    /// none).
+    copied: std::sync::atomic::AtomicU64,
     parts: Vec<(
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
@@ -303,6 +307,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                 let [of_written, of_read] = rows;
                 let through = Arc::new(Through {
                     buffer,
+                    copied: std::sync::atomic::AtomicU64::new(0),
                     parts: of_written.into_iter().zip(of_read).collect(),
                 });
                 map.insert(placed as usize, through.clone());
@@ -310,7 +315,16 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             }
         }
     };
-    let first = list.first_use(placed as usize);
+    // A source the host copied into (not one it renders to or writes in
+    // shaders): copied once per write of it, not once per list. The
+    // placed view's host copy keeps what the last copy put there.
+    let tick = title_written(from).then(|| host_write_tick(source)).flatten();
+    if let Some(tick) = tick
+        && through.copied.load(std::sync::atomic::Ordering::Relaxed) == tick
+    {
+        return true;
+    }
+    let first = list.first_use(placed as usize) || tick.is_some();
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
     // shows as a change of state.
@@ -372,6 +386,9 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             .ResourceBarrier(&[crate::host::transition(&through.buffer, read, common)]);
     }
     list.keep(&through.buffer);
+    if let Some(tick) = tick {
+        through.copied.store(tick, std::sync::atomic::Ordering::Relaxed);
+    }
     // A draw that also writes the source (a view of it handled before
     // this one) needs it in that state again; the next read of the alias
     // then copies once more, as it must after a write.
@@ -763,24 +780,83 @@ pub(crate) fn host_written(resource: This) {
         let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
         set.get_or_insert_with(Default::default).insert(resource as usize)
     };
+    // When the host last wrote it ([`host_write_tick`]).
+    let tick = WRITE_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    HOST_WRITES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(resource as usize, tick);
     // Diagnostics (run 177): where its title memory is, for placed views
     // the title reads that memory through ([`placed_in_host_written`]).
-    if new && let Some((at, desc)) = crate::resource::texture_memory(resource) {
-        // SAFETY: 56 bytes in the description's layout.
-        let words = unsafe { std::ptr::from_ref(&desc).cast::<[u32; 14]>().read_unaligned() };
-        let bytes = crate::resource::placed_bytes(&words).unwrap_or(0);
-        if !at.is_null() && bytes > 0 {
-            HOST_WRITTEN_AT
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(at as u64, (bytes, words[4], words[6], words[7], words[8], resource as usize));
+    let Some((at, desc)) = crate::resource::texture_memory(resource) else {
+        return;
+    };
+    // SAFETY: 56 bytes in the description's layout.
+    let words = unsafe { std::ptr::from_ref(&desc).cast::<[u32; 14]>().read_unaligned() };
+    let bytes = crate::resource::placed_bytes(&words).unwrap_or(0);
+    if at.is_null() || bytes == 0 {
+        return;
+    }
+    if new {
+        HOST_WRITTEN_AT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(at as u64, (bytes, words[4], words[6], words[7], words[8], resource as usize));
+    }
+    // Views the title placed in this memory before the copy: the lead
+    // above looks only at views made after it, and the character bake's
+    // textures are viewed (their slots made ready by the texture pass run
+    // just before the bake draws) before the bake copies into them.
+    let placed = crate::resource::placed_in(at as u64, at as u64 + bytes);
+    if placed.is_empty() {
+        return;
+    }
+    if new {
+        static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
+            tracing::warn!(
+                copied_address = format_args!("{:#x}", at as u64),
+                copied_bytes = bytes,
+                copied_width = words[4],
+                copied_height = words[6],
+                copied_layers_levels = format_args!("{:#x}", words[7]),
+                copied_format = words[8],
+                views = placed.len(),
+                first_view_offset = placed[0].0 - at as u64,
+                same_address = placed.iter().any(|&(a, _)| a == at as u64),
+                "HERO LEAD (view made before the copy): the host copied into a texture whose memory holds views the title placed earlier; \
+                 one at the same address and of the same size and texel width reads the copied texture (VICTORY_COPIED_VIEWS=0: not)"
+            );
         }
     }
+    // Their slots are due again: a view that reads the copied texture
+    // copies it again ([`alias`]), and a slot the texture pass made from
+    // title memory before the copy is made again.
+    crate::descriptor::host::remapped(at as usize, bytes as usize);
+}
+
+/// Since the start, writes by the host of title textures (copies and
+/// resolves into them), and the last one into each ([`host_write_tick`]).
+static WRITE_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static HOST_WRITES: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
+
+/// When the host last copied or resolved into `resource` (a number that
+/// only grows), if it ever did.
+fn host_write_tick(resource: This) -> Option<u64> {
+    HOST_WRITES.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(&(resource as usize)).copied()
+}
+
+/// The title texture the host copied into whose memory starts at `address`
+/// ([`host_written`]), if `fits` says it may be read for a view placed
+/// there (asked under the table's lock: a texture leaves the table when
+/// the title releases it).
+pub(crate) fn host_copied_at(address: u64, fits: impl FnOnce(This) -> bool) -> Option<This> {
+    let map = HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner());
+    let resource = map.get(&address)?.5 as This;
+    fits(resource).then_some(resource)
 }
 
 /// The title memory of textures the host copied into, by address: bytes
 /// and description words 4, 6, 7 and 8 (width, height, layers and levels,
 /// format).
+#[allow(clippy::type_complexity)]
 static HOST_WRITTEN_AT: Mutex<std::collections::BTreeMap<u64, (u64, u32, u32, u32, u32, usize)>> =
     Mutex::new(std::collections::BTreeMap::new());
 
@@ -840,6 +916,9 @@ pub(crate) fn forget(resource: usize) {
     let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(set) = set.as_mut() {
         set.remove(&resource);
+    }
+    if let Some(writes) = HOST_WRITES.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        writes.remove(&resource);
     }
     // Its memory may be given to other textures now (run 177: most of the
     // "HERO LEAD" lines were views in memory a released texture had held).

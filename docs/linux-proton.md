@@ -94,11 +94,11 @@ In the diagnostics build:
   format the frame writes (names as in `VICTORY_DUMP_TARGETS` files). The
   world's G-buffer shows its geometry while the final image is dark:
   `VICTORY_SHOW_TARGET=2560x1440-f28-3` on a Series X profile.
-- `VICTORY_DEBUG_PS=1` draws depth-tested geometry with a debug pixel
-  shader (surfaces coloured by their slope, from depth derivatives) instead
-  of the title's: the geometry of every draw whose vertex or mesh stage
-  translates, whether its pixel shader does or not. With the two switches
-  together you can walk the world in a flat-colour view.
+- `VICTORY_DEBUG_PS=1` and `VICTORY_PS_FALLBACK`: not on this branch. The
+  debug pixel shader they come with (upstream #994) was backed out
+  (b06b512a) and never came back, so no draw is ever drawn with a stand-in
+  pixel shader: a pixel shader that does not translate drops its draws,
+  which the drop reasons name.
 
 In every build, a texture in view memory that changes with no write the
 guards see (the boot logo's video planes; a write through another view of
@@ -107,9 +107,6 @@ about four seconds after each such change is found;
 `VICTORY_BLIND_TEXTURES=0` reads it one frame in eight, as before (the
 logo then stutters).
 
-In every build, a draw of depth-tested geometry whose pixel shader does
-not translate (or that the host refuses) is drawn with that debug shader
-instead of dropped; `VICTORY_PS_FALLBACK=0` turns that off.
 Under Wine, a texture picked by index that was uploaded whole is looked
 at again seven times (4 to about 3,600 frames after), and each look also
 reads the first 512 bytes of every 64 KiB page of it: a texture the title
@@ -323,6 +320,71 @@ frames later).
   copy (what changes in between goes up with the next send either way).
   The status line "runs under 256 bytes sent up ... by one pass" counts
   them.
+
+### Rendering round 5 (linux/fx-next5-render)
+
+- `VICTORY_VIEW_OWN_COPY` (on; `=0` as before): a buffer view that does
+  not start on an element of its buffer's host copy (the title places
+  structured views at ring positions in its big GPU heap) is made on a copy
+  of its own bytes instead of being refused and read as zeros (upstream
+  86a5ed6 by Marvis, as ported by fxceless a26859fc: meshlet culling
+  constants and colour-bake parameter blocks among them). The line "buffer
+  views off their copy's elements" counts them; the once-only warnings
+  "buffer view not on an element of its host copy" no longer appear with
+  it on.
+- `VICTORY_BVH_MISS` (unset: on unless `VICTORY_BVH_BUILDER=1`; `=0` as
+  before; `=1` on even with the builder): the ray-tracing node tests
+  (`image_bvh_intersect_ray`, `image_bvh64_intersect_ray`) answer "nothing
+  here" without reading the node: a box node has no child the ray enters,
+  any other node is a triangle the ray misses. The structure builder's
+  dispatches are dropped unless `VICTORY_BVH_BUILDER=1`, but the programs
+  that walk the structures ran all the same over title memory nothing
+  built, and hit whatever it held: the coloured grain on eyes, glass and a
+  forearm patch in the linux/fx-next4 run is the suspected result. With
+  the switch every ray leaves the scene, so the title shows what it shows
+  for a miss (reflection probes or sky; nothing in the way of a shadow or
+  occlusion ray). Part of the shader cache key, as is
+  `VICTORY_BVH_BUILDER` now: changing either translates every shader
+  again.
+- `VICTORY_HEAP_SYNC` (on; `=0` as before): descriptor records the title
+  copies into its shader-visible heap as plain bytes (no descriptor call)
+  are found by the heap's written pages before each submission and their
+  host slots made again where the record changed (upstream 86a5ed6 by
+  Marvis; fxceless pull request #305 by Flyander; fxceless a26859fc and
+  9376fd60). Without it those slots stayed null or kept the view they
+  showed before. Slots that draws read through tables lately are left to
+  their draws (`VICTORY_HEAP_SYNC_TABLES=1` mirrors those too). The line
+  "descriptor records the title copied into its heap as bytes" gives pages,
+  slots looked at, slots made again and the milliseconds per frame.
+- `VICTORY_COPIED_VIEWS` (on; `=0` as before): a view the title places
+  exactly where a texture lies that the host copied into (the character
+  bake copies its result into block-compressed textures), of the same size,
+  levels, layers and texel width, reads that texture's texels (copied on
+  the card when the copy lands), instead of a host copy of its own filled
+  from title memory, which the host's copy never reached. Such a view's
+  slots are made due again whenever the host copies into the texture. The
+  log line "HERO LEAD (view made before the copy)" (up to 200) names every
+  host-copied texture whose memory holds views the title placed earlier;
+  "HERO LEAD: a placed texture view lies in the memory ..." still names
+  views placed after the copy.
+- With `VICTORY_DROP_REASONS=1` the drop lines are followed by up to 40
+  lines `substituted N/frame: <what> (<stage> <hash>, ...)`: draws and
+  dispatches that ran with something the title bound missing or replaced
+  on the host, counted once per draw and stage, by the pipeline's shaders.
+  What: a table slot the title wrote a record into that is null on the
+  host; a texture view whose texture has no host copy; a texture read in
+  a stand-in format; a texture whose memory is not all mapped (uploaded in
+  part or not at all); a buffer view with no host copy; a view in the
+  memory of a texture the host renders to that reads title memory instead.
+  Only what draws read through tables is seen; textures picked by index
+  have the queue line ("textures picked by index, the queue"), and a
+  buffer read at a computed index that finds no buffer view (the buffer
+  guard) is decided on the card and not counted.
+- `VICTORY_SKIP_PIPELINES=<hash>,<hash>,...` now works in every build (it
+  was in the diagnostics build only): draws and dispatches of pipelines
+  with one of these shaders (16 hex digits, as the "first bind" lines print
+  them) are dropped and named "skipped shader <hash>" in the drop reasons.
+  An A/B for which program draws a surface, with no translation changed.
 
 ## Tests
 
