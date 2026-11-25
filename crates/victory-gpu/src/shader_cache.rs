@@ -80,6 +80,7 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_MESH_OUTPUT_STRICT",
                     "VICTORY_FIRST_HALF",
                     "VICTORY_FIRSTLANE_OWN",
+                    "VICTORY_HALF_SUM_PRESENT",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');

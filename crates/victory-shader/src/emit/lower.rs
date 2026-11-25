@@ -1018,6 +1018,14 @@ thread_local! {
     pub(super) static TEST_F16_NEAREST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// `VICTORY_HALF_SUM_PRESENT=0`: a wave sum of 16-bit floats where not every lane of a host
+/// wave of 64 runs is refused as before ([`Lower::half_sum_present`]); its program's
+/// dispatches are then dropped. For A/B runs only: the sum it gives is exact.
+fn half_sum_present_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HALF_SUM_PRESENT").is_none_or(|v| v != "0"))
+}
+
 /// `VICTORY_WAVE_OWN_BITS=0`: a wave OR where not every lane runs is refused as before
 /// ([`super::own_bits`]).
 fn own_bits_on() -> bool {
@@ -2093,6 +2101,9 @@ impl<'a> Lower<'a> {
         if !every {
             if halves {
                 need(self.cur_ir);
+                return Err(WHERE);
+            }
+            if !half_sum_present_on() {
                 return Err(WHERE);
             }
             return Ok(self.half_sum_present(x));
