@@ -153,6 +153,48 @@ longer before they are cut, which on a slow card can mean a reset.
 being made (500 by default; 0 never waits, pipelines then appear a few
 frames later).
 
+### Memory sync and card memory (fxceless 8dd30ab4, linux/fx-next4)
+
+- `VICTORY_VIEW_GUARD` (on; `=0` as before): a guarded 64 KiB block of a
+  physical page is guarded at every title view of that page (up to 64
+  views), and a write through any of them opens them all. Under Wine each
+  extra view costs one `VirtualProtect` when guarded and one when opened,
+  each under ntdll's process-wide `virtual_mutex` (as is every write fault
+  on a guarded page), so it competes with the runtime's remapping for that
+  lock. The runtime's own kept view of each section (`VICTORY_SECTION_VIEWS`)
+  is not a title view and is never guarded. `=0` restores the old guard
+  exactly (the views' bookkeeping is still kept, nothing acts on it).
+- `VICTORY_READ_BESIDE` (on; `=0` as before): `fread` and DirectStorage
+  file reads into title addresses are read into a buffer and copied in;
+  a kernel write into title memory (our copy-backs, a synchronous
+  `ReadFile`) that the kernel refuses because a guard was set again over it
+  is opened and made again. Under Wine the kernel side of those writes does
+  not fault into our handler (a read-only page fails the call). The status
+  line "kernel writes into title memory refused ..." counts the second tries.
+- `VICTORY_PAGE_WRITES` (under Wine `1` by default, elsewhere `0`):
+  DirectStorage writes into physical pages, which go through the runtime's
+  kept view, are told to the GPU side at every title address that shows
+  the pages: `1` opens the guards there and makes the placed textures that
+  hold the bytes due again; `0` counts only (as before); `guards`, `slots`,
+  `all` (also plain-address reads) for finer A/B. The status line "writes
+  behind the guards, since the start" has the counts.
+- `VICTORY_DSTORAGE_RETRIES` (12): page-destination writes refused for a
+  moment are tried again; `0` as before.
+- `VICTORY_FULL_CARD_PASS` (on; `=0` as before): on a full card, texture
+  slots that need a new host copy are held back for about four seconds so a
+  pass reaches the slots behind them.
+- Off by default: `VICTORY_LEVELS_ON_DEMAND=1` (host copies of placed
+  textures take card memory level by level; `VICTORY_LEVELS_MIN_KB`),
+  `VICTORY_CARD_ROOM_FOR_BUFFERS=1`, and the diagnostics
+  `VICTORY_MERGE_RACE=1`, `VICTORY_REFRESH_CHECK=1` (no longer turned on by
+  `VICTORY_WALLS_TRACE`), `VICTORY_CARD_ACCOUNTING`.
+- Not switches: a copy-back keeps the title's byte where the title and a
+  shader both changed it, and writes back only the shader's bytes; a
+  render target in R9G9B9E5 (format 67) is made in 16-bit float RGBA when
+  the host does not render to it. fxceless's `translate --warm` and its
+  shader cache key are not in this tree (its own key and
+  `translate --cache` are).
+
 ## Tests
 
 ```sh
