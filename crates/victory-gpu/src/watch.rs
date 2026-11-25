@@ -659,7 +659,53 @@ struct Guards {
     /// runtime last mapped or unmapped them. They are view memory whether
     /// their guard stands now or a write has opened it.
     viewed: BTreeSet<usize>,
+    /// Blocks a write fault of the title's opened, and when ([`rest`]).
+    opened: BTreeMap<usize, std::time::Instant>,
 }
+
+/// How long a block the title has just opened by a write is left open by
+/// the askings that take it (`VICTORY_GUARD_REST=<microseconds>`, 3,000
+/// unless given; `0`: not at all, guarded again at the next asking, as
+/// before).
+///
+/// In another fork's book of the faults (AvatarManz/VIctory-7900XTX
+/// 7bc7c0748, run faults-1), 220 of a frame's 586 faults came within 3 ms
+/// after a refresh had taken the block and made it read-only while the
+/// title was still writing it: made read-only, written, opened, up to a
+/// dozen times a frame. Under Wine each fault is some 150 us and each change
+/// of protection takes ntdll's lock on the memory map, which every other
+/// thread's faults and protection changes wait for. A block that rests is
+/// told as written at each asking, so no write is missed (it is copied
+/// again instead: the trade); the first asking after its rest guards it
+/// again, before its copy is taken, and a later write faults as before. The
+/// other views of its pages are not left clean while it rests: a write
+/// through it does not fault, so they are told as written too
+/// ([`protect`], [`guard`]).
+fn rest() -> std::time::Duration {
+    #[cfg(test)]
+    {
+        REST_IN_TEST.get()
+    }
+    #[cfg(not(test))]
+    {
+        static US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        std::time::Duration::from_micros(*US.get_or_init(|| {
+            std::env::var("VICTORY_GUARD_REST").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(3000)
+        }))
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`rest`] for what this thread asks (0, not at all, unless a test
+    /// sets it).
+    static REST_IN_TEST: std::cell::Cell<std::time::Duration> = const { std::cell::Cell::new(std::time::Duration::ZERO) };
+}
+
+/// Since the last frame-rate line: blocks an asking left open because the
+/// title had just written them ([`rest`]), and blocks not noted clean
+/// because another view of their pages was resting.
+pub(crate) static RESTED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Whether a block once guarded stays known as view memory while its
 /// guard is open (`VICTORY_VIEW_KNOWN=1`; off by default).
@@ -703,6 +749,24 @@ fn view_known() -> bool {
 }
 
 impl Guards {
+    /// Whether `block` is left open for now: the title has just written it
+    /// ([`rest`]).
+    fn rests(&self, block: usize, rest: std::time::Duration) -> bool {
+        !rest.is_zero() && self.opened.get(&block).is_some_and(|at| at.elapsed() < rest)
+    }
+
+    /// A write fault of the title's opened `block` ([`rest`]).
+    fn opened(&mut self, block: usize) {
+        const MANY: usize = 1 << 13;
+        if self.opened.len() >= MANY {
+            self.opened.retain(|_, at| at.elapsed().as_millis() < 50);
+            if self.opened.len() >= MANY {
+                self.opened.clear();
+            }
+        }
+        self.opened.insert(block, std::time::Instant::now());
+    }
+
     /// Whether `block` is known to be view memory (see [`known_view`]).
     /// (`views` is ours and always kept; fxceless's `viewed`, every block
     /// made read-only since the runtime last mapped there, is asked only
@@ -745,6 +809,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     uncommitted: (0, BTreeMap::new()),
     aliased: BTreeSet::new(),
     viewed: BTreeSet::new(),
+    opened: BTreeMap::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -777,6 +842,7 @@ fn guard(start: usize, end: usize, epoch: Option<u64>) -> Option<Vec<usize>> {
         return None;
     }
     install();
+    let rest = rest();
     let mut g = guards();
     g.views.insert(start / BLOCK);
     let mut written = Vec::new();
@@ -820,7 +886,7 @@ fn guard(start: usize, end: usize, epoch: Option<u64>) -> Option<Vec<usize>> {
                 // copies: a later write through it must fault again, or
                 // this view would not hear of it.
                 g.clean.insert(block);
-                if alias_lazy() && g.aliased.contains(&block) {
+                if (alias_lazy() || !rest.is_zero()) && g.aliased.contains(&block) {
                     let mut others: Vec<usize> = crate::inplace::pages_of(block * BLOCK)
                         .into_iter()
                         .map(|alias| alias / BLOCK)
@@ -828,8 +894,23 @@ fn guard(start: usize, end: usize, epoch: Option<u64>) -> Option<Vec<usize>> {
                         .collect();
                     others.sort_unstable();
                     others.dedup();
-                    protect_aliases(&mut g, &others);
+                    // A view the title has just written through is left
+                    // open ([`rest`]): its writes do not fault, so this
+                    // view is told as written again at its next asking.
+                    let before = others.len();
+                    others.retain(|&alias| !g.rests(alias, rest));
+                    if others.len() < before {
+                        g.clean.remove(&block);
+                        RESTED[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    if alias_lazy() {
+                        protect_aliases(&mut g, &others);
+                    }
                 }
+            } else if g.rests(block, rest) {
+                // Just written by the title: left open and told as written
+                // (above) until it has rested.
+                RESTED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             } else {
                 run.get_or_insert(block);
                 continue;
@@ -914,6 +995,7 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     if !view_guard() {
         return;
     }
+    let rest = rest();
     let mut aliases: Vec<usize> = Vec::new();
     for (base, bytes) in crate::inplace::views_between(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK)) {
         let first = (base / BLOCK).max(from);
@@ -932,7 +1014,16 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
                 let alias = alias / BLOCK;
                 g.aliased.insert(alias);
                 if alias != block && !g.protected.contains(&alias) {
-                    aliases.push(alias);
+                    if g.rests(alias, rest) {
+                        // Written through that view a moment ago and left
+                        // open ([`rest`]): this one hears of no write
+                        // through it, so it is told as written again.
+                        if g.clean.remove(&block) {
+                            RESTED[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    } else {
+                        aliases.push(alias);
+                    }
                 }
             }
         }
@@ -1646,6 +1737,9 @@ fn install() {
         // (then it is ours again, not read-only for some other reason).
         let mut g = guards();
         if open(&mut g, at, at + 1, OPEN_FAULT) {
+            if !rest().is_zero() {
+                g.opened(at / BLOCK);
+            }
             FAULTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
@@ -2160,6 +2254,7 @@ mod tests {
             uncommitted: (0, BTreeMap::new()),
             aliased: BTreeSet::new(),
             viewed: BTreeSet::new(),
+            opened: BTreeMap::new(),
         };
         assert_eq!(g.uncommitted_until(first, Some(7)), first + 4);
         // SAFETY: the second block of our reservation.
@@ -2262,6 +2357,61 @@ mod tests {
             assert_eq!(guard(guarded, guarded + SIZE, None), Some(vec![pages(1)]), "round {round}");
             assert_eq!(guard(guarded, guarded + SIZE, None), Some(Vec::new()), "round {round}");
         }
+        drop_views(section, &[guarded, other], SIZE);
+    }
+
+    /// With [`rest`]: a block the title has just written is left open and
+    /// told as written at each check until it has rested; the check after
+    /// that guards it again, and a later write faults and is seen.
+    #[test]
+    fn a_block_just_written_rests() {
+        const SIZE: usize = 2 * BLOCK;
+        let (section, guarded, other) = two_views(SIZE);
+        let pages = |block: usize| (guarded + block * BLOCK) / PAGE;
+        let rests = |on: bool| REST_IN_TEST.set(std::time::Duration::from_secs(if on { 3600 } else { 0 }));
+        rests(true);
+        assert_eq!(guard(guarded, guarded + SIZE, None), Some(vec![pages(0), pages(1)]));
+        // SAFETY (all): the guarded view, read-write once the handler has
+        // opened it.
+        unsafe { ((guarded + BLOCK + 8) as *mut u8).write(1) };
+        assert_eq!(guard(guarded, guarded + SIZE, None), Some(vec![pages(1)]));
+        unsafe { ((guarded + BLOCK + 16) as *mut u8).write(2) };
+        assert_eq!(guard(guarded, guarded + SIZE, None), Some(vec![pages(1)]), "resting, so written");
+        assert!(!guards().protected.contains(&((guarded + BLOCK) / BLOCK)), "guarded while resting");
+        rests(false);
+        assert_eq!(guard(guarded, guarded + SIZE, None), Some(vec![pages(1)]), "guarded again");
+        assert_eq!(guard(guarded, guarded + SIZE, None), Some(Vec::new()));
+        unsafe { ((guarded + BLOCK + 24) as *mut u8).write(3) };
+        assert_eq!(guard(guarded, guarded + SIZE, None), Some(vec![pages(1)]));
+        drop_views(section, &[guarded, other], SIZE);
+    }
+
+    /// With [`rest`]: writes through another view of the pages, left open
+    /// as it rests, are told at the guarded view at each of its checks,
+    /// not only at the first after the fault.
+    #[test]
+    fn writes_through_a_resting_other_view_are_reported_at_the_guarded_one() {
+        const SIZE: usize = 2 * BLOCK;
+        let (section, guarded, other) = two_views(SIZE);
+        let pages = |block: usize| (guarded + block * BLOCK) / PAGE;
+        let rests = |on: bool| REST_IN_TEST.set(std::time::Duration::from_secs(if on { 3600 } else { 0 }));
+        rests(true);
+        assert_eq!(guard(guarded, guarded + SIZE, None), Some(vec![pages(0), pages(1)]));
+        for round in 0..3u8 {
+            // SAFETY: the other view, read-write once the handler has
+            // opened it (and left so while it rests).
+            unsafe { ((other + BLOCK + 8) as *mut u8).write(round) };
+            assert_eq!(guard(guarded, guarded + SIZE, None), Some(vec![pages(1)]), "round {round}");
+            assert!(!guards().protected.contains(&((other + BLOCK) / BLOCK)), "guarded while resting");
+        }
+        rests(false);
+        // The other view is guarded again at this check.
+        assert_eq!(guard(guarded, guarded + SIZE, None), Some(vec![pages(1)]));
+        assert_eq!(guard(guarded, guarded + SIZE, None), Some(Vec::new()));
+        // SAFETY: as above; the write faults and opens it.
+        unsafe { ((other + BLOCK + 16) as *mut u8).write(9) };
+        assert_eq!(guard(guarded, guarded + SIZE, None), Some(vec![pages(1)]));
+        assert_eq!(guard(guarded, guarded + SIZE, None), Some(Vec::new()));
         drop_views(section, &[guarded, other], SIZE);
     }
 

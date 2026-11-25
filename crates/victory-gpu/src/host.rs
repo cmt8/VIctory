@@ -9403,6 +9403,7 @@ impl Meter {
                 .map(|row| [0, 1, 2].map(|i| row[i].swap(0, Ordering::Relaxed) as f64 / frames))
                 .collect();
             let faults = crate::watch::FAULTS.swap(0, Ordering::Relaxed) as f64 / frames;
+            let rested = [0, 1].map(|i| crate::watch::RESTED[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if p.iter().any(|r| r[0] > 0.0) || faults > 0.0 {
                 let f = |r: [f64; 3]| format!("{:.1} ({:.1} blocks, {:.1} ms)", r[0], r[1], r[2] / 1e3);
                 let all: f64 = p.iter().map(|r| r[2]).sum::<f64>() / 1e3;
@@ -9411,7 +9412,9 @@ impl Meter {
                      memory map under Wine (VICTORY_GUARD_RUNS=0: block by block): guarding {}, other views of the pages \
                      (VICTORY_VIEW_GUARD) {}; opening for a write fault {}, for a write through the kernel {}, for a \
                      DirectStorage write into physical pages {}, other views of the pages {}, where a view of guarded \
-                     pages was mapped {}; {all:.1} ms in all; {faults:.1} write faults taken",
+                     pages was mapped {}; {all:.1} ms in all; {faults:.1} write faults taken; {:.1} blocks just \
+                     written left open at an asking and told as written, {:.1} blocks told as written as another view \
+                     of their pages was so (VICTORY_GUARD_REST=0: none)",
                     f(p[0]),
                     f(p[1]),
                     f(p[2]),
@@ -9419,6 +9422,8 @@ impl Meter {
                     f(p[4]),
                     f(p[5]),
                     f(p[6]),
+                    rested[0],
+                    rested[1],
                 );
             }
             let [kept, made, slab] =
