@@ -1895,32 +1895,66 @@ impl HostList {
 /// title memory asks for every copy whole. What the title's threads write
 /// meanwhile is for later submissions (on the console it would race the
 /// GPU).
+/// Adjacent or nearby refreshes on the same shadow buffer within one 64 KiB
+/// guard block are merged into one `shadow.update`; wider gaps stay separate
+/// so small buffers at opposite ends of a large shared heap do not force
+/// refreshing the megabytes between them.
+const COALESCE_GAP: usize = 64 << 10;
+
+/// Sorts and merges `[from, to)` ranges that overlap or lie within `gap` bytes
+/// of each other, dropping empty ranges.
+fn coalesce_ranges(ranges: &mut Vec<(usize, usize)>, gap: usize) {
+    ranges.retain(|&(from, to)| from < to);
+    if ranges.len() <= 1 {
+        return;
+    }
+    ranges.sort_unstable_by_key(|&(from, _)| from);
+    let mut out = 0;
+    for i in 1..ranges.len() {
+        let (from, to) = ranges[i];
+        if from <= ranges[out].1.saturating_add(gap) {
+            ranges[out].1 = ranges[out].1.max(to);
+        } else {
+            out += 1;
+            ranges[out] = (from, to);
+        }
+    }
+    ranges.truncate(out + 1);
+}
+
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>,
     /// Where each copy's refresh is in `refreshes`, by copy.
     pending: std::collections::HashMap<usize, usize>,
-    /// The range of each copy brought up to date since the last title
+    /// The ranges of each copy brought up to date since the last title
     /// write, by copy (held, so that its address names no other).
-    current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
 }
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
-        let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
-        if self.current.get(&key).is_some_and(|&(_, a, b)| a <= address && end <= b) {
+        if len == 0 {
+            return;
+        }
+        let (key, end) = (
+            std::sync::Arc::as_ptr(shadow) as usize,
+            address.saturating_add(len),
+        );
+        if self
+            .current
+            .get(&key)
+            .is_some_and(|(_, spans)| spans.iter().any(|&(a, b)| a <= address && end <= b))
+        {
             return;
         }
         match self.pending.get(&key) {
-            Some(&i) => {
-                let (_, from, to) = &mut self.refreshes[i];
-                (*from, *to) = ((*from).min(address), (*to).max(end));
-            }
+            Some(&i) => self.refreshes[i].1.push((address, end)),
             None => {
                 self.pending.insert(key, self.refreshes.len());
-                self.refreshes.push((shadow.clone(), address, end));
+                self.refreshes.push((shadow.clone(), vec![(address, end)]));
             }
         }
     }
@@ -1945,24 +1979,28 @@ impl Batch {
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
         self.pending.clear();
         let mut total = 0;
-        for (shadow, from, to) in self.refreshes.drain(..) {
-            let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
-            let us = started.elapsed().as_micros() as u64;
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
-            PREPARING[0].fetch_add(us, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
-            total += copied;
-            // Kept: the union with what was current if they touch, else
-            // the larger.
-            let key = std::sync::Arc::as_ptr(&shadow) as usize;
-            let (_, a, b) = self.current.entry(key).or_insert((shadow, from, to));
-            if from <= *b && *a <= to {
-                (*a, *b) = ((*a).min(from), (*b).max(to));
-            } else if to - from > *b - *a {
-                (*a, *b) = (from, to);
+        for (shadow, mut ranges) in self.refreshes.drain(..) {
+            coalesce_ranges(&mut ranges, COALESCE_GAP);
+            if ranges.is_empty() {
+                continue;
             }
+            for &(from, to) in &ranges {
+                let started = std::time::Instant::now();
+                let copied = shadow.update(from, to - from);
+                let us = started.elapsed().as_micros() as u64;
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::range(from, to - from, us, 0);
+                PREPARING[0].fetch_add(us, Ordering::Relaxed);
+                PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+                total += copied;
+            }
+            let key = std::sync::Arc::as_ptr(&shadow) as usize;
+            let (_, kept) = self
+                .current
+                .entry(key)
+                .or_insert_with(|| (shadow, Vec::new()));
+            kept.extend(ranges);
+            coalesce_ranges(kept, 0);
         }
         total
     }
@@ -2908,7 +2946,7 @@ fn pump() {
 
 #[cfg(test)]
 mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
-    use super::Batch;
+    use super::{Batch, COALESCE_GAP, coalesce_ranges};
     use std::sync::Arc;
 
     #[test]
@@ -2938,6 +2976,33 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // A fresh submission starts over.
         let mut next = Batch::default();
         assert!(next.texture_due(&a));
+    }
+
+    #[test]
+    fn coalesce_ranges_merges_nearby_but_keeps_distant_ranges_separate() {
+        // Two 4 KiB buffers at opposite ends of a 174 MiB heap must stay two
+        // tiny refreshes instead of spanning the 174 MiB between them.
+        let mut distant = vec![(0x0AD0_0000, 0x0AD0_1000), (0x1000, 0x2000)];
+        coalesce_ranges(&mut distant, COALESCE_GAP);
+        assert_eq!(distant, vec![(0x1000, 0x2000), (0x0AD0_0000, 0x0AD0_1000)]);
+
+        // Overlapping, adjacent, and within-COALESCE_GAP ranges merge cleanly;
+        // empty ranges are dropped.
+        let mut mixed = vec![
+            (0x20000, 0x20000),
+            (0x10000, 0x11000),
+            (0x12000, 0x13000),
+            (0x10800, 0x11800),
+            (0x500000, 0x500100),
+            (0x500100, 0x500200),
+        ];
+        coalesce_ranges(&mut mixed, COALESCE_GAP);
+        assert_eq!(mixed, vec![(0x10000, 0x13000), (0x500000, 0x500200)]);
+
+        // Saturation near usize::MAX does not overflow.
+        let mut high = vec![(usize::MAX - 16, usize::MAX), (usize::MAX - 32, usize::MAX - 16)];
+        coalesce_ranges(&mut high, COALESCE_GAP);
+        assert_eq!(high, vec![(usize::MAX - 32, usize::MAX)]);
     }
 
     /// A host copy of tracked title memory: a submission whose lists all ask
