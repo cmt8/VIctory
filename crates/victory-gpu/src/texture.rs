@@ -397,8 +397,9 @@ fn no_wait() -> bool {
 /// [`copy_first`]: refreshes read through the kernel's copy first, and
 /// those that went on to the read under the lock (a page was not there).
 /// With [`partly_no_wait`]: refreshes read as partly mapped without
-/// waiting while the runtime remapped.
-pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+/// waiting while the runtime remapped, and refreshes of partly mapped
+/// textures passed over before the kernel copy (see `refresh_timed`).
+pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
 /// Whether a texture the kernel's copy could not read whole
 /// ([`copy_first`]) is read as a partly mapped one (zeros where a page is
@@ -964,7 +965,19 @@ impl Staging {
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let frame = crate::frame::current();
-            return last.refresh_guarded(frame, start, unwritten, |last| self.read_now(last, size));
+            return last.refresh_guarded(frame, start, unwritten, |last| {
+                // A partly mapped texture within its 30 frames, on its hash
+                // turn with no write or mapping seen: what the read would
+                // come to (`read_partly` reads nothing then), without the
+                // kernel copy that fails at its first missing page (2 us,
+                // and ~50 us while the runtime remaps: `membench`). A
+                // mapping under it resets its guards, so it is read then.
+                if unwritten && partly_no_wait() && last.partial.is_some_and(|at| frame < at + 30) {
+                    UNLOCKED[5].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return 0;
+                }
+                self.read_now(last, size)
+            });
         }
         self.read_now(last, size)
     }
@@ -979,6 +992,11 @@ impl Staging {
             let read = with_read(size, |read| {
                 if !crate::host::read_into(self.memory, read) {
                     return false;
+                }
+                // All of it is there now (`refresh_timed` passes over a
+                // partly mapped one on its turns).
+                if partly_no_wait() {
+                    last.partial = None;
                 }
                 let hash = blake3::hash(read);
                 #[cfg(feature = "diagnostics")]

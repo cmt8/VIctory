@@ -6478,12 +6478,14 @@ impl Meter {
                      {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there)"
                 );
             }
-            let [first, on, partly] = [2, 3, 4].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
-            if first + on > 0.0 {
+            let [first, on, partly, skipped] =
+                [2, 3, 4, 5].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if first + on + skipped > 0.0 {
                 tracing::info!(
                     "texture refreshes read through the kernel's copy first, per frame (VICTORY_TEXTURE_COPY_FIRST=1): \
                      {first:.1} read whole that way, {on:.1} not (a page was not there), {partly:.1} of them taken as partly \
-                     mapped while the runtime remapped instead of waiting for it (VICTORY_TEXTURE_PARTLY_WAIT=1 waits)"
+                     mapped while the runtime remapped instead of waiting for it, {skipped:.1} partly mapped ones read less \
+                     than 30 frames ago passed over before the copy (VICTORY_TEXTURE_PARTLY_WAIT=1: neither)"
                 );
             }
             let [kept, made] = [0, 1].map(|i| crate::texture::STAGING_TAKEN[i].swap(0, Ordering::Relaxed) as f64 / frames);
