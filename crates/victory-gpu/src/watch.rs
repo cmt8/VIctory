@@ -907,22 +907,55 @@ pub fn kernel_write_refused(at: usize, len: usize) -> bool {
 /// copies of buffers and textures read through tables take them again);
 /// 2, the placed textures picked by index that lie under it are due again;
 /// 4, both also for reads to plain addresses when they have finished.
-/// Unset or `guards`: bit 1 alone. `0`: nothing, counted only (the default
-/// until run 199). `1`: bits 1 and 2. `slots`: bit 2 alone. `all`:
-/// everything.
+/// Unset or `guards`: bit 1 alone, and under Wine bits 1 and 2
+/// ([`page_writes_from`]). `0`: nothing, counted only (the default until
+/// run 199). `1`: bits 1 and 2. `slots`: bit 2 alone. `all`: everything.
 /// (Bit 1 by default: in every run 10,000 to 50,000 guarded blocks of host
 /// copies lay under such writes and kept the bytes from before; runs 197
 /// and 198 opened them, 9,766 and 10,796 blocks, with nothing worse for
 /// it. Bit 2 makes texture slots due and is the one that flooded the
-/// queue in an earlier form: still asked for by name.)
+/// queue in an earlier form: still asked for by name off Wine.)
 pub(crate) fn page_writes() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("VICTORY_PAGE_WRITES").as_deref().map(str::trim) {
-        Ok("0") => 0,
-        Ok("1") => 3,
-        Ok("slots") => 2,
-        Ok("all") => 7,
+    *MODE.get_or_init(|| {
+        let value = std::env::var("VICTORY_PAGE_WRITES").ok();
+        page_writes_from(value.as_deref(), on_wine())
+    })
+}
+
+/// [`page_writes`] for the switch's value and whether we run under Wine.
+///
+/// Under Wine the runtime writes DirectStorage's page destinations through
+/// one view of each section that it keeps (`victory-hle` xmem,
+/// `whole_views`; never a title view, never guarded), so no write at a
+/// title address is seen for them, and a placed texture picked by index
+/// that was uploaded before a stream landed keeps the bytes from before
+/// (black texture blocks, interiors without walls or floor) until
+/// something else makes it look again. So there the default makes those
+/// slots due as well (`1`); off Wine the default stays `guards`.
+fn page_writes_from(value: Option<&str>, wine: bool) -> u8 {
+    match value.map(str::trim) {
+        Some("0") => 0,
+        Some("1") => 3,
+        Some("slots") => 2,
+        Some("all") => 7,
+        Some("guards") => 1,
+        _ if wine => 3,
         _ => 1,
+    }
+}
+
+/// Whether we run under Wine (its ntdll exports `wine_get_version`), as
+/// `victory-hle`'s xmem asks it.
+fn on_wine() -> bool {
+    static WINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WINE.get_or_init(|| {
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+        // SAFETY: plain lookups in ntdll, always loaded.
+        unsafe {
+            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+            !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+        }
     })
 }
 
@@ -1608,6 +1641,23 @@ mod tests {
         assert_eq!(guard(one, one + SIZE), Some(Vec::new()));
         assert_eq!(guard(two, two + SIZE), Some(Vec::new()));
         drop_views(section, &[one, two], SIZE);
+    }
+
+    /// `VICTORY_PAGE_WRITES`: unset, the guarded blocks opened off Wine and
+    /// the texture slots made due as well under Wine; a value given means
+    /// the same everywhere.
+    #[test]
+    fn page_writes_also_make_slots_due_by_default_under_wine() {
+        assert_eq!(page_writes_from(None, true), 3);
+        assert_eq!(page_writes_from(None, false), 1);
+        assert_eq!(page_writes_from(Some("guards"), true), 1);
+        assert_eq!(page_writes_from(Some("guards"), false), 1);
+        assert_eq!(page_writes_from(Some("0"), true), 0);
+        assert_eq!(page_writes_from(Some(" 1 "), false), 3);
+        assert_eq!(page_writes_from(Some("slots"), true), 2);
+        assert_eq!(page_writes_from(Some("all"), false), 7);
+        assert_eq!(page_writes_from(Some("junk"), true), 3);
+        assert_eq!(page_writes_from(Some("junk"), false), 1);
     }
 
     /// Our kernel write into title memory (a copy-back's `write_mapped`)
