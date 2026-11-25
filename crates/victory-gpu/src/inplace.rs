@@ -455,8 +455,12 @@ pub(crate) fn view_books() -> bool {
 
 /// How often, at most, a placeholder reservation is looked at again to
 /// see that it is still there (the title releases one with the host's
-/// `VirtualFree`, which nothing hooks): milliseconds.
-const PLACEHOLDER_LOOK_MS: u64 = 1000;
+/// `VirtualFree`, which nothing hooks): milliseconds. Until that look, an
+/// answer about memory allocated where a released reservation was may be
+/// wrong (what a copy or texture reads there then is read again when the
+/// look drops the reservation and the guards or the texture pass look
+/// again).
+const PLACEHOLDER_LOOK_MS: u64 = 250;
 
 /// Whether `[at, end)` lies inside one placeholder reservation of the
 /// runtime's that is still there (looked at again at most every
@@ -473,15 +477,19 @@ fn in_placeholder(at: usize, end: usize) -> bool {
     if now.saturating_sub(looked) < PLACEHOLDER_LOOK_MS {
         return true;
     }
-    // Still a reservation of ours: reserved (a placeholder) or a view at
-    // its start. Free memory or private committed memory there means it
-    // was released (and perhaps allocated again by another).
-    use windows_sys::Win32::System::Memory::{MEM_FREE, MEM_PRIVATE, MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    // Still a reservation of ours: reserved (a placeholder), or a view at
+    // its start that the runtime told of. Free memory, private committed
+    // memory, or a view nobody told of there means it was released (and
+    // perhaps allocated again by another).
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_FREE, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery};
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(start as *const c_void, &mut info, size_of_val(&info)) };
-    let there = n != 0 && info.State != MEM_FREE && !(info.State == MEM_COMMIT && info.Type == MEM_PRIVATE);
+    let told = || views().views.range(..=start).next_back().is_some_and(|(&base, view)| base + view.0 > start);
+    let there = n != 0
+        && info.State != MEM_FREE
+        && (info.State != MEM_COMMIT || (info.Type == MEM_MAPPED && told()));
     let mut p = PLACEHOLDERS.lock().unwrap_or_else(|e| e.into_inner());
     if there {
         if let Some(entry) = p.get_mut(&start) {
@@ -519,6 +527,13 @@ pub(crate) fn mapped_parts(at: usize, len: usize) -> Option<Vec<(usize, usize)>>
         }
     }
     Some(parts)
+}
+
+/// Tests: the placeholder reservation at `at` is forgotten (its memory is
+/// released and another test may get it).
+#[cfg(test)]
+pub(crate) fn forget_placeholder(at: usize) {
+    PLACEHOLDERS.lock().unwrap_or_else(|e| e.into_inner()).remove(&at);
 }
 
 /// With [`view_books`], if `at` lies in one of the runtime's placeholder
@@ -1450,7 +1465,7 @@ mod tests {
         title_memory_placeholder(at(4), 2 * K64);
         assert_eq!(mapped_parts(base, K64), None);
         assert_eq!(mapped_parts(at(4), K64), Some(Vec::new()));
-        PLACEHOLDERS.lock().unwrap().remove(&at(4));
+        forget_placeholder(at(4));
         // SAFETY: the test's own reservation.
         unsafe { mem::VirtualFree(base as *mut c_void, 0, mem::MEM_RELEASE) };
     }

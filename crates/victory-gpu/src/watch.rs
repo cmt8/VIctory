@@ -840,8 +840,15 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
         g.protected.extend(from..to);
         g.clean.extend(from..to);
     };
+    // A block the runtime's word says is not mapped (`crate::inplace::
+    // view_books`): absent, without the call that would be refused.
+    let hole = |block: usize| crate::inplace::unmapped_end(block * BLOCK).is_some_and(|end| end > block * BLOCK);
     let by_block = |g: &mut Guards, from: usize, to: usize| {
         for block in from..to {
+            if hole(block) {
+                g.absent.insert(block);
+                continue;
+            }
             if set_protection(GUARD_HERE, block, block + 1, PAGE_READONLY) {
                 note(g, block, block + 1);
             } else if block < uncommitted_end(block) {
@@ -858,6 +865,10 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
         let runs = runs_in_views(&blocks);
         if runs.len() > 1 {
             for (a, b) in runs {
+                if b - a == 1 && hole(a) {
+                    g.absent.insert(a);
+                    continue;
+                }
                 if set_protection(GUARD_HERE, a, b, PAGE_READONLY) {
                     note(g, a, b);
                 } else if b - a > 1 {
@@ -868,6 +879,10 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
             }
             return;
         }
+    }
+    if to - from == 1 && hole(from) {
+        g.absent.insert(from);
+        return;
     }
     if set_protection(GUARD_HERE, from, to, PAGE_READONLY) {
         note(g, from, to);
@@ -1930,6 +1945,51 @@ mod tests {
         assert_eq!(unsafe { *((two + 64) as *const u8) }, 0x5a);
         assert!(!kernel_write_refused(one, BLOCK), "nothing guarded now: nothing to open");
         drop_views(section, &[one, two], BLOCK);
+    }
+
+    /// In a placeholder the runtime told of, a block no view shows is
+    /// noted absent when its range is guarded, as the refused call over it
+    /// had it noted, and the view's block is guarded; the next check after
+    /// the hole is mapped takes it.
+    #[test]
+    fn a_hole_in_a_told_placeholder_is_absent() {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE_PLACEHOLDER,
+            MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3, PAGE_NOACCESS, UnmapViewOfFile2, VirtualAlloc2,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        if !crate::inplace::view_books() {
+            return;
+        }
+        // SAFETY: a placeholder and a section of the test's own; the view
+        // is unmapped and the placeholder released at the end.
+        unsafe {
+            let base = VirtualAlloc2(GetCurrentProcess(), std::ptr::null(), 2 * BLOCK, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, std::ptr::null_mut(), 0) as usize;
+            assert_ne!(base, 0);
+            let section = CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, 0, BLOCK as u32, std::ptr::null());
+            assert!(!section.is_null());
+            VirtualFree(base as *mut _, BLOCK, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+            let view = MapViewOfFile3(section, GetCurrentProcess(), base as *const _, 0, BLOCK, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, std::ptr::null_mut(), 0);
+            assert_eq!(view.Value as usize, base);
+            crate::inplace::title_memory_placeholder(base, 2 * BLOCK);
+            crate::inplace::title_memory_view(base, BLOCK, section as usize, 0);
+            let (first, hole) = (base / BLOCK, base / BLOCK + 1);
+            assert_eq!(guard(base, base + 2 * BLOCK, None), Some(vec![base / PAGE, base / PAGE + 1]), "both new at the first check");
+            {
+                let g = guards();
+                assert!(g.protected.contains(&first) && g.clean.contains(&first));
+                assert!(g.absent.contains(&hole) && !g.protected.contains(&hole));
+            }
+            assert!(!writable(base), "guarded");
+            assert_eq!(guard(base, base + 2 * BLOCK, None), Some(Vec::new()), "nothing written, the hole still a hole");
+            title_memory_remapped(base, 2 * BLOCK);
+            crate::inplace::forget_placeholder(base);
+            UnmapViewOfFile2(GetCurrentProcess(), MEMORY_MAPPED_VIEW_ADDRESS { Value: base as *mut _ }, MEM_PRESERVE_PLACEHOLDER);
+            VirtualFree(base as *mut _, 0, MEM_RELEASE);
+            VirtualFree((base + BLOCK) as *mut _, 0, MEM_RELEASE);
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        }
     }
 
     /// Blocks are joined into one protection change where they are

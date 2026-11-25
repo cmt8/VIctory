@@ -788,6 +788,7 @@ fn view_books_bench() {
     for pool in [&told, &untold] {
         crate::watch::title_memory_remapped(pool.base, (BLOCKS + 1) * PAGE);
     }
+    crate::inplace::forget_placeholder(told.base);
     // The pools' views are unmapped by their drops.
     drop(churn);
 }

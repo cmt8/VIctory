@@ -231,8 +231,12 @@ frames later).
   remapping holds across wineserver requests (`membench`
   `view_books_bench`: a half-mapped 4 MiB texture asked about in 0.8 us
   from the books against 71 us idle, 355 us beside one thread remapping
-  and 45 ms beside two). A placeholder is looked at again at most once a
-  second to see it is still there.
+  and 45 ms beside two). A placeholder is looked at again at most every
+  250 ms to see it is still there (the title releases one with the host's
+  `VirtualFree`, which nothing hooks); in that window an answer about
+  memory allocated where a released one was may be wrong for a moment.
+  The guards also note a block of a placeholder that no view shows absent
+  without the protection change Wine would refuse.
 - `VICTORY_GUARD_RUNS` (on; `=0` as before): the guards change the
   protection of consecutive blocks that lie in one view the runtime told
   of with one call (guarding, opening, and the other views of the pages
