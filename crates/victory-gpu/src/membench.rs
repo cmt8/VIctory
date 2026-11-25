@@ -991,3 +991,66 @@ fn small_copies_bench() {
         }
     }
 }
+
+/// What upload memory costs taken from the upload slabs (`crate::slab`)
+/// against a buffer made per use (`VICTORY_MEMBENCH=1`, on the host GPU
+/// the tests use): a region taken and given back alone, and taken, zeroed
+/// and written as a texture's staging is, against a buffer made, mapped,
+/// written and freed. Run with `VKD3D_CONFIG=no_upload_hvv` for the cost
+/// once vkd3d-proton's upload budget is spent (every buffer then made in
+/// system memory).
+#[test]
+fn slab_bench() {
+    if !on() || !crate::slab::on() {
+        return;
+    }
+    let Some(host) = crate::host::host() else {
+        return;
+    };
+    let source = vec![7u8; 4 << 20];
+    for size in [4usize << 10, 64 << 10, 256 << 10, 1 << 20, 4 << 20] {
+        let n = ((64usize << 20) / size).clamp(16, 512);
+        let ns = ns_per(n * 16, |_| {
+            std::hint::black_box(crate::slab::take(host, size as u64).expect("a region"));
+        });
+        println!("membench: slab region of {} KiB taken and given back: {ns:.0} ns", size >> 10);
+        let ns = ns_per(n, |_| {
+            let region = crate::slab::take(host, size as u64).expect("a region");
+            // SAFETY: the region's mapping holds `size` bytes.
+            unsafe {
+                region.data().write_bytes(0, size);
+                std::ptr::copy_nonoverlapping(source.as_ptr(), region.data(), size);
+            }
+        });
+        println!("membench: slab region of {} KiB taken, zeroed, written, given back: {ns:.0} ns", size >> 10);
+        let ns = ns_per(n, |_| {
+            let (buffer, data) = host.upload_buffer(size as u64).expect("an upload buffer");
+            // SAFETY: the mapping holds `size` bytes.
+            unsafe { std::ptr::copy_nonoverlapping(source.as_ptr(), data, size) };
+            drop(buffer);
+        });
+        println!("membench: upload buffer of {} KiB made, mapped, written, freed: {ns:.0} ns", size >> 10);
+    }
+    // Many held at once, given back in another order: the free runs' upkeep.
+    let mut held: Vec<crate::slab::Region> = Vec::new();
+    let started = Instant::now();
+    let mut seed = 1u64;
+    let mut ops = 0;
+    for _ in 0..200_000 {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        if held.len() < 2000 && (seed >> 62) != 0 {
+            if let Some(r) = crate::slab::take(host, ((seed >> 40) % 64 + 1) << 12) {
+                held.push(r);
+            }
+        } else if !held.is_empty() {
+            let at = (seed >> 20) as usize % held.len();
+            held.swap_remove(at);
+        }
+        ops += 1;
+    }
+    drop(held);
+    println!(
+        "membench: slab regions of 4-256 KiB, up to 2,000 held: {:.0} ns per take or give back",
+        started.elapsed().as_nanos() as f64 / ops as f64
+    );
+}

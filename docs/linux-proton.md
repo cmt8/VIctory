@@ -277,6 +277,27 @@ frames later).
   journal and the locks. Its clock reads cost about 0.14 us each a copy
   under Wine (`membench` `clock_bench`).
 
+### Upload memory and copy-back (linux/fx-next6-perf)
+
+- `VICTORY_UPLOAD_SLABS` (on under Wine, off elsewhere; `=0` as before,
+  `=1` turns it on elsewhere): texture staging buffers, the lists' upload
+  buffers (texture data copied from buffers, zeros for new levels), their
+  large scratch and their scratch chunks are regions of a few upload-heap
+  buffers kept for the run ("slabs"), given back when their holder lets go
+  (a texture's staging when no texture or list holds it, a list's upload
+  memory when the list is reset after its submissions ran), instead of a
+  buffer made and freed per use. vkd3d-proton counts every upload buffer
+  against a budget of a sixteenth of the card's memory (1.5 GB on a 24 GB
+  card) and past it makes each one in system memory, about 0.55 ms a
+  buffer whatever its size, with a lock error logged each time.
+  `VICTORY_UPLOAD_SLAB_MB` (128) is a slab's size and
+  `VICTORY_UPLOAD_SLABS_MB` (768) the most made; a request over a quarter
+  of a slab, or one the full slabs cannot serve, is made as before
+  (staging pool included). The status line "upload memory per frame from
+  the slabs" says how many regions were carved and how many requests were
+  made as before, and "texture staging buffers per frame" how many staging
+  buffers came from the slabs.
+
 ## Tests
 
 ```sh

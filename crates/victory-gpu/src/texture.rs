@@ -35,8 +35,13 @@ macro_rules! once {
 pub(crate) struct Staging {
     buffer: ID3D12Resource,
     /// The size class it was taken for from the kept buffers
-    /// ([`staging_pool`]), to which it goes back; 0: made for it alone.
+    /// ([`staging_pool`]), to which it goes back; 0: made for it alone, or
+    /// a region of an upload slab.
     class: u64,
+    /// Where in `buffer` its bytes start: 0, or the region's offset in an
+    /// upload slab ([`crate::slab`]), which goes back to the slab with it.
+    base: u64,
+    region: Option<crate::slab::Region>,
     /// Its bytes.
     #[cfg(feature = "diagnostics")]
     size: u64,
@@ -543,7 +548,8 @@ impl Drop for Staging {
         use std::sync::atomic::Ordering::Relaxed;
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
-        if self.class != 0 {
+        // A region of a slab goes back to it as `region` drops.
+        if self.class != 0 && self.region.is_none() {
             // Nothing uses it any more (lists that uploaded from it held it
             // until they had run): kept for the next texture of its class.
             give_staging(self.buffer.clone(), self.data, self.class);
@@ -626,13 +632,28 @@ unsafe impl Send for SpareStaging {}
 
 static SPARE_STAGING: Mutex<Option<SpareStaging>> = Mutex::new(None);
 
-/// Since the start: staging buffers taken from those kept, and made.
-pub(crate) static STAGING_TAKEN: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// Since the start: staging buffers taken from those kept, made, and
+/// taken from the upload slabs.
+pub(crate) static STAGING_TAKEN: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
-/// A staging buffer of at least `size` bytes, mapped: a kept one of its
-/// class, or a new one. With the class it goes back to (0: none).
-fn take_staging(host: &crate::host::Host, size: u64) -> Option<(ID3D12Resource, *mut u8, u64)> {
+/// Where a staging buffer's bytes are: a buffer and the offset in it, the
+/// mapping of those bytes, the size class it goes back to (0: none), and
+/// the slab region it is.
+type StagingMemory = (ID3D12Resource, u64, *mut u8, u64, Option<crate::slab::Region>);
+
+/// Staging memory of at least `size` bytes, mapped and zeroed: a region of
+/// an upload slab ([`crate::slab`]), else a kept buffer of its class, or a
+/// new one.
+fn take_staging(host: &crate::host::Host, size: u64) -> Option<StagingMemory> {
     use std::sync::atomic::Ordering::Relaxed;
+    if let Some(region) = crate::slab::take(host, size) {
+        STAGING_TAKEN[2].fetch_add(1, Relaxed);
+        // As a new buffer is: zeros (see below).
+        // SAFETY: the region's mapping holds at least `size` bytes, and
+        // nothing else holds the region.
+        unsafe { region.data().write_bytes(0, size as usize) };
+        return Some((region.buffer().clone(), region.offset(), region.data(), 0, Some(region)));
+    }
     let class = if staging_pool() { staging_class(size) } else { 0 };
     if class != 0 {
         let kept = {
@@ -651,12 +672,12 @@ fn take_staging(host: &crate::host::Host, size: u64) -> Option<(ID3D12Resource, 
             // SAFETY: the mapping holds `class` >= `size` bytes, and no
             // texture or list holds the buffer any more.
             unsafe { (data as *mut u8).write_bytes(0, size as usize) };
-            return Some((buffer, data as *mut u8, class));
+            return Some((buffer, 0, data as *mut u8, class, None));
         }
     }
     STAGING_TAKEN[1].fetch_add(1, Relaxed);
     let (buffer, data) = host.upload_buffer(if class != 0 { class } else { size })?;
-    Some((buffer, data, class))
+    Some((buffer, 0, data, class, None))
 }
 
 /// A staging buffer of class `class` no texture holds any more: kept, or
@@ -904,7 +925,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         {
             let f = footprint.Footprint;
             // SAFETY: live resources.
-            let (gpu, d) = unsafe { (staging.buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
+            let (gpu, d) = unsafe { (staging.buffer.GetGPUVirtualAddress() + staging.base, texture.GetDesc()) };
             let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
             list.note_read(
                 || {
@@ -940,7 +961,13 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
             pResource: unsafe { std::mem::transmute_copy(&staging.buffer) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                PlacedFootprint: *footprint,
+                // The footprints are laid out from the staging memory's
+                // start, which is `base` into the buffer (a multiple of
+                // 4 KiB, so the placement stays 512-byte aligned).
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: footprint.Offset + staging.base,
+                    Footprint: footprint.Footprint,
+                },
             },
         };
         // SAFETY: an open list; both locations name live resources.
@@ -1046,7 +1073,7 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
                 host.device
                     .GetCopyableFootprints(&d, level, 1, 0, Some(&mut footprint), None, None, Some(&mut bytes));
             }
-            let Some((buffer, data)) = list.upload(host, bytes) else {
+            let Some((buffer, offset, data)) = list.upload(host, bytes) else {
                 // (With the levels that share its tiles, if it is one of
                 // the small ones.)
                 unzeroed |= tiled.with_level(level);
@@ -1064,7 +1091,10 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
                 // SAFETY: as above; the list holds the buffer until it is reset.
                 pResource: unsafe { std::mem::transmute_copy(&buffer) },
                 Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
+                // Laid out from the memory's start, `offset` into the buffer.
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: footprint.Offset + offset, ..footprint },
+                },
             };
             // SAFETY: an open list; both locations name live resources.
             unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
@@ -1828,19 +1858,24 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
-    let (buffer, data, class) = take_staging(host, total)?;
-    crate::host::name(&buffer, || {
-        format!(
-            "staging of {resource:?} {}x{}x{} f{}",
-            d.Width, d.Height, d.DepthOrArraySize, d.Format.0
-        )
-    });
+    let (buffer, base, data, class, region) = take_staging(host, total)?;
+    // (A slab keeps its own name.)
+    if region.is_none() {
+        crate::host::name(&buffer, || {
+            format!(
+                "staging of {resource:?} {}x{}x{} f{}",
+                d.Width, d.Height, d.DepthOrArraySize, d.Format.0
+            )
+        });
+    }
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
     let s = Arc::new(Staging {
         buffer,
         class,
+        base,
+        region,
         #[cfg(feature = "diagnostics")]
         size: total,
         data,

@@ -1624,7 +1624,8 @@ impl Drop for Counted {
 /// A chunk of upload memory for lists' scratch data: the buffer, its
 /// mapping and its host GPU address.
 struct Chunk {
-    _buffer: ID3D12Resource,
+    /// Its own buffer, or a region of an upload slab ([`crate::slab`]).
+    _memory: Result<ID3D12Resource, crate::slab::Region>,
     data: usize,
     gpu: u64,
 }
@@ -1716,14 +1717,25 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
         ALIVE[5].fetch_add(1, Ordering::Relaxed);
         return Some(chunk);
     }
-    let (buffer, data) = host.upload_buffer(size)?;
+    ALIVE[1].fetch_add(1, Ordering::Relaxed);
+    ALIVE[2].fetch_add(size, Ordering::Relaxed);
+    if let Some(region) = crate::slab::take(host, size) {
+        return Some(Chunk {
+            data: region.data() as usize,
+            gpu: region.gpu(),
+            _memory: Err(region),
+        });
+    }
+    let Some((buffer, data)) = host.upload_buffer(size) else {
+        ALIVE[1].fetch_sub(1, Ordering::Relaxed);
+        ALIVE[2].fetch_sub(size, Ordering::Relaxed);
+        return None;
+    };
     name(&buffer, || "list scratch".into());
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    ALIVE[1].fetch_add(1, Ordering::Relaxed);
-    ALIVE[2].fetch_add(size, Ordering::Relaxed);
     Some(Chunk {
-        _buffer: buffer,
+        _memory: Ok(buffer),
         data: data as usize,
         gpu,
     })
@@ -1991,7 +2003,11 @@ struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
-    /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
+    /// Upload memory carved from the slabs ([`crate::slab`]), held as
+    /// `uploads` are.
+    regions: Vec<crate::slab::Region>,
+    /// The bytes of `uploads` and `regions` (counted in [`ALIVE`] while
+    /// they are held).
     upload_bytes: u64,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
@@ -2023,11 +2039,19 @@ impl Deferred {
         self.upload_bytes += size;
         self.uploads.push(buffer);
     }
+
+    /// Holds `region` (`size` bytes of a slab) until the list is reset.
+    fn hold_region(&mut self, region: crate::slab::Region, size: u64) {
+        ALIVE[6].fetch_add(1, Ordering::Relaxed);
+        ALIVE[7].fetch_add(size, Ordering::Relaxed);
+        self.upload_bytes += size;
+        self.regions.push(region);
+    }
 }
 
 impl Drop for Deferred {
     fn drop(&mut self) {
-        ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
+        ALIVE[6].fetch_sub((self.uploads.len() + self.regions.len()) as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
     }
 }
@@ -5583,15 +5607,20 @@ impl HostList {
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
-    /// A mapped upload buffer of `size` bytes, alive until the list is
-    /// reset.
-    ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
-    pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    /// `size` bytes of mapped upload memory, alive until the list is
+    /// reset: the buffer, where in it they start (a multiple of 4 KiB) and
+    /// their mapping. A region of an upload slab ([`crate::slab`]), or a
+    /// buffer of their own.
+    pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+        if let Some(region) = crate::slab::take(host, size) {
+            let out = (region.buffer().clone(), region.offset(), region.data());
+            self.deferred().hold_region(region, size);
+            return Some(out);
+        }
         let (buffer, data) = host.upload_buffer(size)?;
         name(&buffer, || format!("list upload {size:#x}"));
         self.deferred().hold_upload(buffer.clone(), size);
-        Some((buffer, data))
+        Some((buffer, 0, data))
     }
 
     /// `len` bytes of upload memory (256-byte aligned) until the list is
@@ -5601,6 +5630,11 @@ impl HostList {
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
+            if let Some(region) = crate::slab::take(host, len) {
+                let out = (region.gpu(), region.data());
+                self.deferred().hold_region(region, len);
+                return Some(out);
+            }
             let (buffer, data) = host.upload_buffer(len)?;
             name(&buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
@@ -6719,12 +6753,16 @@ impl Meter {
                     f(p[6]),
                 );
             }
-            let [kept, made] = [0, 1].map(|i| crate::texture::STAGING_TAKEN[i].swap(0, Ordering::Relaxed) as f64 / frames);
-            if kept + made > 0.0 {
+            let [kept, made, slab] =
+                [0, 1, 2].map(|i| crate::texture::STAGING_TAKEN[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if kept + made + slab > 0.0 {
                 tracing::info!(
-                    "texture staging buffers per frame: {kept:.1} taken from those kept, {made:.1} made \
-                     (VICTORY_STAGING_POOL=0 makes each)"
+                    "texture staging buffers per frame: {slab:.1} carved from the upload slabs, {kept:.1} taken from those \
+                     kept, {made:.1} made (VICTORY_STAGING_POOL=0 makes each)"
                 );
+            }
+            if let Some(line) = crate::slab::line(frames) {
+                tracing::info!("{line}");
             }
             let blind = crate::texture::BLIND.swap(0, Ordering::Relaxed);
             if blind > 0 {
