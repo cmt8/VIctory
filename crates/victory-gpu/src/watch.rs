@@ -864,17 +864,40 @@ pub fn kernel_write_refused(at: usize, len: usize) -> bool {
 /// copies of buffers and textures read through tables take them again);
 /// 2, the placed textures picked by index that lie under it are due again;
 /// 4, both also for reads to plain addresses when they have finished.
-/// Unset or `0`: nothing, counted only. `1`: bits 1 and 2. `guards`: bit 1
-/// alone. `slots`: bit 2 alone. `all`: everything.
+/// `0`: nothing, counted only. `1`: bits 1 and 2. `guards`: bit 1 alone.
+/// `slots`: bit 2 alone. `all`: everything. Unset: `1` under Wine, `0`
+/// elsewhere ([`page_writes_from`]).
 pub(crate) fn page_writes() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("VICTORY_PAGE_WRITES").as_deref().map(str::trim) {
-        Ok("1") => 3,
-        Ok("guards") => 1,
-        Ok("slots") => 2,
-        Ok("all") => 7,
-        _ => 0,
+    *MODE.get_or_init(|| {
+        let value = std::env::var("VICTORY_PAGE_WRITES").ok();
+        page_writes_from(value.as_deref(), crate::host::on_wine())
     })
+}
+
+/// [`page_writes`] for the switch's value and whether we run under Wine.
+///
+/// Under Wine the runtime writes DirectStorage's page destinations
+/// through one view of each section that it keeps (`victory-hle` xmem,
+/// `whole_views`; never a title view, never guarded), so no write at a
+/// title address is ever seen for them: a host copy taken before a stream
+/// landed keeps the bytes from before it (geometry without its walls,
+/// black texture blocks), until something else makes it look again. The
+/// cause was found by Yorivel; fork PR #571 (arminkhaleghirod) tells the
+/// GPU side of these writes by default, and 8dd30ab4 counts them and acts
+/// with the switch. Here the acting is the default under Wine; Windows
+/// keeps 8dd30ab4's default (its views per write are not kept either, but
+/// it was not measured there).
+fn page_writes_from(value: Option<&str>, wine: bool) -> u8 {
+    match value.map(str::trim) {
+        Some("0") => 0,
+        Some("1") => 3,
+        Some("guards") => 1,
+        Some("slots") => 2,
+        Some("all") => 7,
+        _ if wine => 3,
+        _ => 0,
+    }
 }
 
 /// Since the start: writes into physical pages through the runtime's own
@@ -1706,6 +1729,21 @@ mod tests {
         assert_eq!(guard(one, one + SIZE, None), Some(Vec::new()));
         assert_eq!(guard(two, two + SIZE, None), Some(Vec::new()));
         drop_views(section, &[one, two], SIZE);
+    }
+
+    /// `VICTORY_PAGE_WRITES`: acting (guards opened, texture slots due) by
+    /// default under Wine, counting only by default elsewhere; `0` counts
+    /// only everywhere.
+    #[test]
+    fn page_writes_act_by_default_under_wine() {
+        assert_eq!(page_writes_from(None, true), 3);
+        assert_eq!(page_writes_from(None, false), 0);
+        assert_eq!(page_writes_from(Some("0"), true), 0);
+        assert_eq!(page_writes_from(Some(" 1 "), false), 3);
+        assert_eq!(page_writes_from(Some("guards"), true), 1);
+        assert_eq!(page_writes_from(Some("slots"), true), 2);
+        assert_eq!(page_writes_from(Some("all"), false), 7);
+        assert_eq!(page_writes_from(Some("junk"), true), 3);
     }
 
     /// Our kernel write into title memory (a copy-back's `write_mapped`)
