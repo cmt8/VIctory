@@ -8988,6 +8988,24 @@ impl Batch {
     }
 }
 
+/// Whether we run under Wine (its ntdll exports `wine_get_version`). There
+/// a view of a section is mapped and unmapped by wineserver requests made
+/// with the process's one lock on its memory map held, a lock every query,
+/// protection change and failed kernel copy also takes: while the title
+/// streams, memory questions that cost a microsecond wait up to tens of
+/// milliseconds for it (`membench`). Some reads take other ways there.
+pub(crate) fn on_wine() -> bool {
+    static WINE: OnceLock<bool> = OnceLock::new();
+    *WINE.get_or_init(|| {
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+        // SAFETY: plain lookups in ntdll, always loaded.
+        unsafe {
+            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+            !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+        }
+    })
+}
+
 /// Copies title memory at submission. The ranges were checked against their
 /// resources when recorded, but the title may since have unmapped pages of
 /// them (tiled memory, page mappings), which read as zeros here; a title
