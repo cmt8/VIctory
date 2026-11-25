@@ -614,7 +614,9 @@ Neither says what the card runs. Three switches, all off by default:
   frames. "Settles for title memory read per frame, by the place read":
   which 64 KiB of title memory each such settle was for, and how long the
   submitting thread stood in it. Cost: two timestamps and a resolve a list
-  and a clamp (the clamps' resolves wait for the list's end).
+  and a clamp (the clamps' resolves wait for the list's end);
+  `VICTORY_GPU_TIMES=lists` leaves the clamps' pairs out (some 4,000 a
+  frame), to see what the meter itself costs.
 - `VICTORY_CARD_HASH_WIDE=1`: the hash and compare passes over copies in
   the card's memory give each 64 KiB piece a group of 64 threads instead
   of one thread (64 steps of loads side by side instead of 4,096 one after

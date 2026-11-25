@@ -54,7 +54,7 @@ pub(crate) enum Kind {
     /// indirect records' clamp), run just ahead of it.
     Prelude,
     /// Inside a title list or a prelude: an indirect clamp, from its first
-    /// barrier to its last ([`times`] only).
+    /// barrier to its last ([`clamps`] only).
     Clamp,
     /// Inside a send-and-hash list: a copy's hash passes ([`times`] only).
     Hash,
@@ -147,9 +147,19 @@ pub(crate) fn on() -> bool {
 
 /// `VICTORY_GPU_TIMES=1`: lists are timed in any build, the clamps and hash
 /// passes inside them too, and [`line`] goes with every frame-rate line.
+/// `=lists`: the same without the clamps' pairs ([`clamps`]), for a run
+/// that checks what the meter itself costs.
 pub(crate) fn times() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMES").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMES").is_some_and(|v| v == "1" || v == "lists"))
+}
+
+/// Whether each indirect clamp has a pair of its own ([`times`], not
+/// `=lists`): some 4,000 a frame in the world scene, against a few hundred
+/// for everything else.
+pub(crate) fn clamps() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| times() && std::env::var_os("VICTORY_GPU_TIMES").is_some_and(|v| v == "1"))
 }
 
 fn make() -> Option<Meter> {
@@ -488,7 +498,7 @@ pub(crate) fn line() {
     let ms = |k: Kind| period[k.index()].0 as f64 / 1e3 / f;
     let n = |k: Kind| period[k.index()].1 as f64 / f;
     tracing::info!(
-        "the card's own clock per frame (VICTORY_GPU_TIMES=1; {frames} frames, lists recorded a second before): our lists ran \
+        "the card's own clock per frame (VICTORY_GPU_TIMES; {frames} frames, lists recorded a second before): our lists ran \
          {ran:.1} ms (their spans joined: the card's clock line's busy time less this is time our work waited in the queue); \
          the title's lists (with ours recorded as such: presents, uploads, clears) {:.1} ms in {:.1}, of it indirect clamps (in \
          those and in preludes) {:.1} ms in {:.1}; the lists' preludes {:.1} ms in {:.1}; our send-and-hash lists {:.1} ms in {:.1}, of it hash passes {:.1} ms in {:.1}; our compare \

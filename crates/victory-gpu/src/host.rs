@@ -7400,7 +7400,7 @@ impl HostList {
                     // The slots must hold clamped records before a draw
                     // reads them: a prelude that cannot record the passes
                     // is no prelude.
-                    let clamp = if crate::cardmeter::times() {
+                    let clamp = if crate::cardmeter::clamps() {
                         crate::cardmeter::begin(list, crate::cardmeter::Kind::Clamp)
                     } else {
                         crate::cardmeter::Span::NONE
