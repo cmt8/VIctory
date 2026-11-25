@@ -4550,6 +4550,9 @@ impl Host {
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }
         let behind = late && flying();
+        // Descriptor records the title copied into its heaps as bytes,
+        // before the lists that index those slots run.
+        crate::descriptor::sync_heaps();
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
@@ -6521,6 +6524,7 @@ impl Meter {
             );
         }
         crate::shadow::exact_line(frames);
+        crate::descriptor::sync_line(frames);
         late_line(frames);
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);

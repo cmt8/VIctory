@@ -33,6 +33,31 @@ pub(crate) const PAGE: usize = 64 << 10;
 /// The kernel's page, the unit of its answers.
 const KERNEL_PAGE: usize = 4096;
 
+/// A title-memory range whose changed pages another part of the layer
+/// reads for itself (`crate::descriptor::sync_heaps`: the title's
+/// shader-visible heap). From fxceless a26859fc.
+pub(crate) struct Tracked {
+    start: usize,
+    end: usize,
+    /// Per page: the asking after which it was last taken.
+    seen: Mutex<BTreeMap<usize, u64>>,
+}
+
+/// Tracks `[start, start + len)` ([`Tracked`]), view memory too when
+/// `views` (it is then guarded). `None` for memory that is neither
+/// write-watched nor view memory.
+pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
+    let end = start.checked_add(len)?;
+    if len == 0 || writes(start, end, views).is_none() {
+        return None;
+    }
+    Some(Tracked {
+        start,
+        end,
+        seen: Mutex::default(),
+    })
+}
+
 struct Journal {
     /// Numbers the askings; 0 is "never".
     asked: u64,
@@ -411,6 +436,41 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             .map(|(&p, &w)| (p, w))
             .collect(),
     ))
+}
+
+impl Tracked {
+    /// The changed pages of `[from, to)`, cut to the tracked range, as
+    /// runs `(start, end)`: those written since this last took them. A page
+    /// the range covers only in part stays changed, so that a later take
+    /// reads its other bytes.
+    pub(crate) fn take(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+        let (from, to) = (from.max(self.start), to.min(self.end));
+        if from >= to {
+            return Vec::new();
+        }
+        let Some((_, pages)) = writes(from, to, true) else {
+            return Vec::new();
+        };
+        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        for (page, write) in pages {
+            if seen.get(&page).is_some_and(|&last| last >= write) {
+                continue;
+            }
+            let (start, end) = ((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
+            if start >= end {
+                continue;
+            }
+            if (page * PAGE).max(self.start) >= from && ((page + 1) * PAGE).min(self.end) <= to {
+                seen.insert(page, write);
+            }
+            match ranges.last_mut() {
+                Some((_, last)) if *last == start => *last = end,
+                _ => ranges.push((start, end)),
+            }
+        }
+        ranges
+    }
 }
 
 /// Guarded blocks of view memory.

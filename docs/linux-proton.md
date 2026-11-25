@@ -236,6 +236,16 @@ frames later).
   occlusion ray). Part of the shader cache key, as is
   `VICTORY_BVH_BUILDER` now: changing either translates every shader
   again.
+- `VICTORY_HEAP_SYNC` (on; `=0` as before): descriptor records the title
+  copies into its shader-visible heap as plain bytes (no descriptor call)
+  are found by the heap's written pages before each submission and their
+  host slots made again where the record changed (upstream 86a5ed6 by
+  Marvis; fxceless pull request #305 by Flyander; fxceless a26859fc and
+  9376fd60). Without it those slots stayed null or kept the view they
+  showed before. Slots that draws read through tables lately are left to
+  their draws (`VICTORY_HEAP_SYNC_TABLES=1` mirrors those too). The line
+  "descriptor records the title copied into its heap as bytes" gives pages,
+  slots looked at, slots made again and the milliseconds per frame.
 
 ## Tests
 
