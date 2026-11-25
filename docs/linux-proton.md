@@ -51,6 +51,26 @@ scripts/proton-run.sh run /path/to/game/<the title's exe> --execute
 With an Xbox controller connected, the keyboard is not a pad (as on
 Windows), so `VICTORY_KEYS` presses do not reach the title either.
 
+### The window's frame
+
+Under GNOME, Proton's Wine draws the window's title bar and borders itself,
+in Windows' classic look, instead of GNOME's. Valve's Wine (experimental_11.0)
+asks the window manager for no decorations when it is Mutter
+(`dlls/winex11.drv/window.c`: `get_mwm_decorations_for_style` returns none
+for "Mutter", which `net_supporting_wm_check_init` makes of GNOME's
+"GNOME Shell"), and then paints the non-client area itself. Its Wayland
+driver (`winewayland.drv`) has no server-side decorations either, and GNOME
+offers none to Wayland clients. Upstream Wine has no such rule, so:
+
+- `VICTORY_WINE=/usr/bin/wine scripts/proton-run.sh ...` runs a system Wine
+  (11.x) instead, which leaves the frame to GNOME. The script gives it a
+  prefix of its own (`~/.local/share/victory/wine`) with Proton's
+  vkd3d-proton and DXVK's `dxgi.dll`, and the Proton prefix's data folder
+  (saves, settings) unless `VICTORY_DATA_DIR` says otherwise.
+- `VICTORY_FULLSCREEN=1` makes the title's window borderless over the
+  whole primary screen (with either Wine; Wine shows it as a fullscreen
+  window).
+
 ### Without Proton (system Wine)
 
 A system Wine works too (reported with Wine 11.22 on RDNA2, RDNA3 and
@@ -79,6 +99,13 @@ In the diagnostics build:
   of the title's: the geometry of every draw whose vertex or mesh stage
   translates, whether its pixel shader does or not. With the two switches
   together you can walk the world in a flat-colour view.
+
+In every build, a texture in view memory that changes with no write the
+guards see (the boot logo's video planes; a write through another view of
+the same pages is one the guards cannot see) is read at every refresh for
+about four seconds after each such change is found;
+`VICTORY_BLIND_TEXTURES=0` reads it one frame in eight, as before (the
+logo then stutters).
 
 In every build, a draw of depth-tested geometry whose pixel shader does
 not translate (or that the host refuses) is drawn with that debug shader
