@@ -265,6 +265,7 @@ pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync
 #[cfg(windows)]
 pub(crate) fn sync_line(frames: f64) {
     let [pages, looked, mirrored, micros] = [0, 1, 2, 3].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    held_line(frames);
     if pages == 0 {
         return;
     }
@@ -278,12 +279,33 @@ pub(crate) fn sync_line(frames: f64) {
         host::COPIED_TABLED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames,
         micros as f64 / 1000.0 / frames
     );
-    let deferred = host::DEFERRED_VIEWS[0].swap(0, std::sync::atomic::Ordering::Relaxed);
-    let flushed = host::DEFERRED_VIEWS[1].swap(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// With the frame line: the title-slot writes held back for submissions
+/// on the card (`host::HostHeap::deferred_views`) since the last one.
+/// (Printed with [`sync_line`]'s, which says nothing while no heap page
+/// changed; these are counted apart from that.)
+#[cfg(windows)]
+fn held_line(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let deferred = host::DEFERRED_VIEWS[0].swap(0, Relaxed);
+    let flushed = host::DEFERRED_VIEWS[1].swap(0, Relaxed);
     if deferred > 0 || flushed > 0 {
         tracing::info!(
             "new-resource title-slot views held back until earlier submissions finished (VICTORY_DEFER_NEW_VIEWS=0: immediate): \
              {deferred} deferred, {flushed} published"
+        );
+    }
+    let [clears, replaces, cleared, replaced] = [0, 1, 2, 3].map(|i| host::HELD_CLEARS[i].swap(0, Relaxed));
+    if clears + replaces + cleared + replaced > 0 {
+        tracing::info!(
+            "title slots showing a host resource held back from null (and from another view with \
+             VICTORY_DEFER_SLOT_CLEARS=2) until the submissions on the card then finished (VICTORY_DEFER_SLOT_CLEARS=0: \
+             at once): per frame {:.1} clears held back, {:.1} published; {:.1} replacements held back, {:.1} published",
+            clears as f64 / frames,
+            cleared as f64 / frames,
+            replaces as f64 / frames,
+            replaced as f64 / frames,
         );
     }
 }
@@ -304,8 +326,10 @@ pub(crate) fn has_required_deferred_views() -> bool {
     })
 }
 
-/// Publishes deferred title-slot views whose backing host resource is now
-/// older than `crate::host::finished()`.
+/// Publishes the held-back title-slot writes that are due: views whose
+/// backing host resource is now older than `crate::host::finished()`, and
+/// clears (and replacements) asked for while submissions that have
+/// finished since were on the card.
 #[cfg(windows)]
 pub(crate) fn flush_deferred_views() {
     let finished = crate::host::finished();
