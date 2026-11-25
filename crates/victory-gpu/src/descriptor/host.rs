@@ -1275,14 +1275,17 @@ impl HostHeap {
             && index < victory_shader::emit::SLOT_VIEWS_COUNT
         {
             // SAFETY: inside the mapping; a whole slot, written at once:
-            // the address, the byte length and the element stride.
+            // the address, its record count as a buffer descriptor's third
+            // dword counts (elements of its stride; bytes of a raw view)
+            // and the stride.
             unsafe {
                 let at = (*data as *mut u32).add(index as usize * 4);
                 let (address, len) = range.unwrap_or((0, 0));
+                let stride = stride.unwrap_or(0);
                 at.write_volatile(address as u32);
                 at.add(1).write_volatile((address >> 32) as u32);
-                at.add(2).write_volatile(len as u32);
-                at.add(3).write_volatile(stride.unwrap_or(0));
+                at.add(2).write_volatile((len / u64::from(stride.max(1))) as u32);
+                at.add(3).write_volatile(stride);
             };
         }
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());

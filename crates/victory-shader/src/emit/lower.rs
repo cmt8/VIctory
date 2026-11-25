@@ -2704,8 +2704,11 @@ impl<'a> Lower<'a> {
     /// [`view_address`] for a table entry chosen at run time (a computed
     /// index into a descriptor table or the resource heap): the host's table
     /// of the buffer views' title addresses by heap slot
-    /// ([`shader::SLOT_VIEWS`]).
-    fn view_address_indexed(&mut self, site: Site, first: u8) -> Result<Option<(V, V, V, V)>, Why> {
+    /// ([`shader::SLOT_VIEWS`]), 16 bytes a slot. The view's address (low,
+    /// high) and its record count, as the descriptor's dwords 0, 1 and 2
+    /// would give them; the address is the view's own, wherever in the
+    /// table the descriptor sits.
+    fn view_address_indexed(&mut self, site: Site, first: u8) -> Result<Option<(V, V, V)>, Why> {
         let a = *self
             .scalar
             .get(&site)
@@ -2726,11 +2729,11 @@ impl<'a> Lower<'a> {
         let i32t = self.s.t.i32;
         let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
         self.s.m.tag(slot, Tag::Clamp);
-        let three = self.s.m.i32(3);
-        let byte = self.s.m.bin(c, Bin::Shl, slot, three);
+        let four = self.s.m.i32(4);
+        let byte = self.s.m.bin(c, Bin::Shl, slot, four);
         let h = self.s.root_srv_handle(super::shader::SLOT_VIEWS);
         let iu = self.s.m.undef(self.s.t.i32);
-        let mask = self.s.m.i8(0xF);
+        let mask = self.s.m.i8(0x7);
         let align = self.s.m.i32(4);
         let r = self.s.op(
             c,
@@ -2742,17 +2745,8 @@ impl<'a> Lower<'a> {
         );
         let lo = self.s.m.extract(c, r, 0);
         let hi = self.s.m.extract(c, r, 1);
-        let len = self.s.m.extract(c, r, 2);
-        let stride = self.s.m.extract(c, r, 3);
-        let (lo, hi, len, stride) = (
-            self.as_int(lo),
-            self.as_int(hi),
-            self.as_int(len),
-            self.as_int(stride),
-        );
-        let off = a.offset as i32;
-        let (lo, hi) = self.address_plus(lo, hi, off);
-        Ok(Some((lo, hi, len, stride)))
+        let records = self.s.m.extract(c, r, 2);
+        Ok(Some((self.as_int(lo), self.as_int(hi), self.as_int(records))))
     }
 
     /// `lo`, `hi` plus the instruction's byte offset `off`, with the carry.
@@ -5756,27 +5750,28 @@ impl<'a> Lower<'a> {
                 return Ok(());
             }
             if count <= 8 && count % 4 == 0 {
-                let mut wrote = false;
-                for group in 0..count / 4 {
-                    let first = (4 * group) as u8;
-                    let Some((lo, hi, len, stride)) =
-                        self.view_address_indexed(site, first).ok().flatten()
-                    else {
-                        continue;
-                    };
-                    wrote = true;
-                    for k in 4 * group..4 * group + 4 {
-                        let reg = Reg::S(code + k as u8);
-                        let v = match k % 4 {
-                            0 => lo,
-                            1 => hi,
-                            2 => len,
-                            _ => stride,
-                        };
-                        self.write(inst, reg, v, None);
+                let groups: Vec<_> = (0..count / 4)
+                    .map(|group| self.view_address_indexed(site, (4 * group) as u8).ok().flatten())
+                    .collect();
+                if groups.iter().any(Option::is_some) {
+                    for (group, words) in groups.into_iter().enumerate() {
+                        for k in 0..4u32 {
+                            let reg = Reg::S(code + (4 * group as u32 + k) as u8);
+                            match (words, k) {
+                                (Some((lo, _, _)), 0) => self.write(inst, reg, lo, None),
+                                (Some((_, hi, _)), 1) => self.write(inst, reg, hi, None),
+                                (Some((_, _, records)), 2) => self.write(inst, reg, records, None),
+                                // The format dword, or a group with no
+                                // view: no host value.
+                                _ => {
+                                    if let Some(v) = inst.write(reg) {
+                                        self.vals.insert(v, Val::Missing(OTHER));
+                                        self.stale.insert(v);
+                                    }
+                                }
+                            }
+                        }
                     }
-                }
-                if wrote {
                     return Ok(());
                 }
             }
@@ -5914,7 +5909,7 @@ impl<'a> Lower<'a> {
                         self.view_address_indexed(site, 0)
                             .ok()
                             .flatten()
-                            .map(|(lo, hi, _, _)| (lo, hi))
+                            .map(|(lo, hi, _)| (lo, hi))
                     })
                 {
                     words.extend([(0, lo), (1, hi)]);
