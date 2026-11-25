@@ -685,6 +685,30 @@ impl PlacedFootprint {
         };
         Some((host, [pitch * lines, row, lines, u64::from(self.row_pitch)]))
     }
+
+    /// For a read back of a source box of `extent` texels (width, height,
+    /// depth) into this footprint's corner: the bytes of a row and the rows
+    /// the copy writes, [`PlacedFootprint::host_rows`]'s cut to the box, so
+    /// that the title's bytes around the box stay as they are (after
+    /// Lilith133T's fxceless PR #794). An empty box writes no row.
+    /// shortcut: a box of several slices and less than a slice's height
+    /// lands every row of those slices.
+    pub(crate) fn boxed_rows(&self, [width, height, depth]: [u32; 3]) -> Option<(u64, u64)> {
+        let (element, block) = element(self.format)?;
+        let row = u64::from(self.width).div_ceil(block) * element;
+        if width == 0 || height == 0 || depth == 0 {
+            return Some((row, 0));
+        }
+        let slice_rows = u64::from(self.height).div_ceil(block).max(1);
+        let row = row.min(u64::from(width).div_ceil(block) * element);
+        let deep = u64::from(depth).min(u64::from(self.depth).max(1));
+        let rows = if deep == 1 {
+            u64::from(height).div_ceil(block).min(slice_rows)
+        } else {
+            deep * slice_rows
+        };
+        Some((row, rows))
+    }
 }
 const _: () = assert!(size_of::<PlacedFootprint>() == 32);
 
@@ -2953,6 +2977,26 @@ static RESOURCE_FUNCTIONS: Table<32> = {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// A read back of a box lands the box's rows and bytes, the whole
+    /// footprint's without one (after fxceless PR #794's test).
+    #[test]
+    fn a_boxed_read_back_lands_only_the_box() {
+        // R8G8B8A8 (28), 100x8, 2 slices, title pitch 512.
+        let f = PlacedFootprint { offset: 0, format: 28, width: 100, height: 8, depth: 2, row_pitch: 512 };
+        let (_, [_, row, rows, pitch]) = f.host_rows().unwrap();
+        assert_eq!((row, rows, pitch), (400, 16, 512));
+        assert_eq!(f.boxed_rows([10, 3, 1]), Some((40, 3)));
+        // Whole slices: every row of them.
+        assert_eq!(f.boxed_rows([100, 8, 2]), Some((400, 16)));
+        // Larger than the footprint: cut to it.
+        assert_eq!(f.boxed_rows([1000, 99, 9]), Some((400, 16)));
+        // Empty: nothing lands.
+        assert_eq!(f.boxed_rows([10, 0, 1]).map(|r| r.1), Some(0));
+        // BC1 (71): 4x4 blocks of 8 bytes; 6x5 texels are 2x2 blocks.
+        let bc = PlacedFootprint { offset: 0, format: 71, width: 64, height: 64, depth: 1, row_pitch: 256 };
+        assert_eq!(bc.boxed_rows([6, 5, 1]), Some((16, 2)));
+    }
 
     type Release = extern "system" fn(This) -> u32;
     type Map = extern "system" fn(This, u32, *const c_void, *mut *mut u8) -> HRESULT;

@@ -1133,6 +1133,18 @@ fn read_back(
     // The title's buffer holds every row at its own pitch.
     let bytes = pitch * (rows - 1) + row;
     let data = buffer_range(dst.resource, dst.footprint.offset, bytes).ok_or("a destination outside its buffer")?;
+    // A box: only its rows and bytes are the copy's, and only they land;
+    // the title's bytes around it stay as they are (after Lilith133T's
+    // fxceless PR #794). Landed whole, the rest of the footprint got our
+    // fresh read-back buffer's zeros in place of the title's bytes.
+    // SAFETY: a non-null source box names six dwords.
+    let (row, rows) = match unsafe { source_box.as_ref() } {
+        Some(&[left, top, front, right, bottom, back]) => dst
+            .footprint
+            .boxed_rows([right.saturating_sub(left), bottom.saturating_sub(top), back.saturating_sub(front)])
+            .ok_or("an unknown format")?,
+        None => (row, rows),
+    };
     let texture = crate::resource::host_resource(src.resource).ok_or("no host texture")?;
     let buffer = host.read_back_buffer(size).ok_or("no read-back buffer")?;
     // As a texture source of any copy: what shaders wrote to a depth twin
