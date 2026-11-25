@@ -597,3 +597,114 @@ fn staging_bench() {
         }
     }
 }
+
+/// What a submission's texture checks cost on one thread and several
+/// (`VICTORY_MEMBENCH=1`; `crate::host` `wide_textures`): each check as
+/// `crate::texture::Staging` makes it under Wine (the copy-first read
+/// through the kernel into a read buffer of its thread's, the hash of all
+/// of it, and, for a texture that changed, the detiling of every level
+/// into its staging memory), for a mix of texture sizes the world streams,
+/// one after another and on the threads kept for the snapshots
+/// (`crate::shadow::wide_run`).
+#[test]
+fn texture_checks_bench() {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, VirtualAlloc, VirtualFree};
+    if !on() {
+        return;
+    }
+    thread_local! {
+        static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    struct Texture {
+        layout: victory_formats::texture::Layout,
+        memory: usize,
+        staged: std::sync::Mutex<(Vec<u8>, Option<blake3::Hash>)>,
+    }
+    // A plain 2D texture of 8-byte texels (format 10), `levels` levels.
+    let make = |side: u32, levels: u32, seed: usize| -> Texture {
+        let words: [u32; 14] = [3, 0, 0, 0, side, 0, side, 1 | levels << 16, 10, 1, 0, 256, 3_145_728, 0];
+        // SAFETY: fourteen words are a resource description.
+        let desc: crate::resource::ResourceDesc = unsafe { std::mem::transmute(words) };
+        let layout = crate::resource::texture_layout(&desc).expect("a console layout").planes[0].layout.clone();
+        let size = layout.size as usize;
+        // SAFETY: a fresh allocation of ours, freed at the end.
+        let memory = unsafe { VirtualAlloc(std::ptr::null(), size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(memory, 0);
+        // SAFETY: the allocation's `size` bytes.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(memory as *mut u8, size) };
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = (i * 31 + i / 4093 + seed) as u8;
+        }
+        let staged: usize = layout.mips.iter().map(|m| (m.width as usize * 8).next_multiple_of(256) * m.height as usize).sum();
+        Texture { layout, memory, staged: std::sync::Mutex::new((vec![0; staged], None)) }
+    };
+    let mut textures = Vec::new();
+    for (side, levels, count) in [(256u32, 9u32, 64usize), (512, 10, 24), (1024, 11, 8)] {
+        for i in 0..count {
+            textures.push(Arc::new(make(side, levels, i)));
+        }
+    }
+    let bytes: usize = textures.iter().map(|t| t.layout.size as usize).sum();
+    // One check: read, hash, and detile if the hash changed (`changed`
+    // forgets the hash first, as a texture that streamed in does).
+    let check = |t: &Texture, changed: bool| {
+        let size = t.layout.size as usize;
+        READ.with(|read| {
+            let mut read = read.borrow_mut();
+            if read.len() < size {
+                read.resize(size, 0);
+            }
+            let read = &mut read[..size];
+            assert!(crate::host::read_into(t.memory as *const u8, read));
+            let hash = blake3::hash(read);
+            let mut staged = t.staged.lock().unwrap();
+            if changed {
+                staged.1 = None;
+            }
+            if staged.1 == Some(hash) {
+                return;
+            }
+            staged.1 = Some(hash);
+            let mut at = 0;
+            for (mip, m) in t.layout.mips.iter().enumerate() {
+                let pitch = (m.width as usize * 8).next_multiple_of(256);
+                let len = pitch * m.height as usize;
+                t.layout.detile(read, mip as u32, 0, &mut staged.0[at..at + len], pitch, len).expect("detiled");
+                at += len;
+            }
+        });
+    };
+    let mb_s = |ms: f64| bytes as f64 / (1 << 20) as f64 / (ms / 1e3);
+    for changed in [true, false] {
+        let what = if changed { "changed (read, hash, detile)" } else { "unchanged (read, hash)" };
+        for round in 0..3 {
+            let started = Instant::now();
+            for t in &textures {
+                check(t, changed);
+            }
+            let one = started.elapsed().as_secs_f64() * 1e3;
+            let started = Instant::now();
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = textures
+                .iter()
+                .map(|t| {
+                    let t = t.clone();
+                    Box::new(move || check(&t, changed)) as Box<dyn FnOnce() + Send>
+                })
+                .collect();
+            crate::shadow::wide_run(jobs);
+            let wide = started.elapsed().as_secs_f64() * 1e3;
+            println!(
+                "membench: texture checks, {} textures {:.0} MB, {what}, round {round}: one thread {one:.1} ms ({:.0} MB/s), wide {wide:.1} ms ({:.0} MB/s)",
+                textures.len(),
+                bytes as f64 / (1 << 20) as f64,
+                mb_s(one),
+                mb_s(wide)
+            );
+        }
+    }
+    for t in &textures {
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(t.memory as *mut c_void, 0, MEM_RELEASE) };
+    }
+}
+

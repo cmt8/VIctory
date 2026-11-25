@@ -1139,6 +1139,11 @@ impl Staging {
         *self.last.lock().unwrap_or_else(|e| e.into_inner()) = Last::default();
     }
 
+    /// Whether its levels get the card's memory on demand (`crate::tiles`).
+    pub(crate) fn on_demand(&self) -> bool {
+        self.on_demand
+    }
+
     /// The title memory the texture is read from: address and bytes.
     pub(crate) fn memory(&self) -> (usize, usize) {
         (self.memory as usize, self.layout.size as usize)

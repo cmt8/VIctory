@@ -239,7 +239,11 @@ and `policy::tests::repository_passes_policy` (runs `git`). Run
   (`VICTORY_RELAY_FETCH_QUEUE=0`: on the host's queue); the pieces hashed
   again after sends to card copies are one pass per copy
   (`VICTORY_CARD_PIECE_LISTS=0`); texture staging buffers are kept by
-  size class for the next texture (`VICTORY_STAGING_POOL=0`).
+  size class for the next texture (`VICTORY_STAGING_POOL=0`); a
+  submission's texture checks (read, hash, detile) run on the threads
+  kept for the snapshots and not one after another on the submitting
+  thread (`VICTORY_WIDE_TEXTURES=0`: one after another; `=1` turns it on
+  elsewhere; fxceless/victory-fork#768).
   Pages of a buffer copy in the card's memory that the copy-back wrote are
   reported written by the write watch and the guards like the title's own
   writes; their next refresh still reads them whole from title memory, but
