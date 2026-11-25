@@ -245,6 +245,14 @@ frames later).
   `NtProtectVirtualMemory` wants one view). The status line "the guards'
   protection changes per frame" counts the calls, blocks and time by
   what they were for, and the write faults taken.
+- `VICTORY_TEXTURE_STAGE_PER` (`frame`; `=pass` as before): the texture
+  pass's time (`VICTORY_TEXTURE_STAGE_MS`, 250 ms, three times that with a
+  backlog of 1,024 slots due, `VICTORY_TEXTURE_CATCHUP=0`: never) is the
+  frame's, as its bytes (`VICTORY_TEXTURE_STAGE_MB`) are, not each pass's:
+  a frame with two passes no longer takes the time twice. Lower
+  `VICTORY_TEXTURE_STAGE_MS` (and `VICTORY_TEXTURE_CATCHUP=0`) for smoother
+  frames while the world streams in, at the cost of textures that arrive
+  later.
 - Not a switch: a status line "title memory copied by the refreshes per
   frame" splits the frame line's "copies" by where the bytes went (copies
   in the card's memory, of it the part compared against the copy-back's

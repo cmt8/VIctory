@@ -376,6 +376,21 @@ pub(crate) static HEAP_TEXTURES_WAITING: AtomicU64 = AtomicU64::new(0);
 /// (`crate::resource::room`), for the memory line.
 pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 
+/// Whether the texture pass's time (`VICTORY_TEXTURE_STAGE_MS`, 250 ms;
+/// three times that with a backlog) is a frame's, as its bytes are
+/// (`VICTORY_TEXTURE_STAGE_PER=pass`: each pass's, as before).
+///
+/// The pass runs once or more a frame on the thread that records it, and
+/// each pass could take the whole time: run 232629 (linux/fx-next4) had
+/// "heap buffers 2.0 passes" lines of 1.3-2.2 s a frame while the scene
+/// after the first interior streamed in (750 ms a pass with a backlog of
+/// 4,900 slots due). With the time a frame's, the frame stops staging at
+/// the time as it does at the bytes, and the rest waits for the next frame.
+fn stage_time_per_frame() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_TEXTURE_STAGE_PER").as_deref().map(str::trim) != Ok("pass"))
+}
+
 /// Frames after a whole upload of a texture picked by index at which its
 /// memory is looked at again, each counted from the look before.
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
@@ -1852,9 +1867,13 @@ impl State {
         }) << 20;
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static SPENT: AtomicU64 = AtomicU64::new(0);
+        // The microseconds the frame's passes have taken so far
+        // ([`stage_time_per_frame`]).
+        static SPENT_US: AtomicU64 = AtomicU64::new(0);
         let frame = crate::frame::current();
         if FRAME.swap(frame, Ordering::Relaxed) != frame {
             SPENT.store(0, Ordering::Relaxed);
+            SPENT_US.store(0, Ordering::Relaxed);
         }
         // No more of them are made while the card has no room
         // (`resource::room`): by what is alive now, not by what was ever
@@ -1932,15 +1951,31 @@ impl State {
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
-        let (span, bytes_at_most) = match PASS_BUDGET.get() {
+        let (span, bytes_at_most, early) = match PASS_BUDGET.get() {
             Some((ms, bytes)) => {
-                (std::time::Duration::from_millis(ms), SPENT.load(Ordering::Relaxed).saturating_add(bytes))
+                (std::time::Duration::from_millis(ms), SPENT.load(Ordering::Relaxed).saturating_add(bytes), true)
             }
-            None => (span, per_frame),
+            None => (span, per_frame, false),
+        };
+        // The frame's earlier passes count against the time as their bytes
+        // do (not a run made early, which has a budget of its own).
+        let before = if early || !stage_time_per_frame() {
+            std::time::Duration::ZERO
+        } else {
+            std::time::Duration::from_micros(SPENT_US.load(Ordering::Relaxed))
         };
         let began = std::time::Instant::now();
+        struct Spent(std::time::Instant, bool);
+        impl Drop for Spent {
+            fn drop(&mut self) {
+                if self.1 {
+                    SPENT_US.fetch_add(self.0.elapsed().as_micros() as u64, Ordering::Relaxed);
+                }
+            }
+        }
+        let _spent = Spent(began, !early);
         for (index, write) in due {
-            if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
+            if SPENT.load(Ordering::Relaxed) >= bytes_at_most || before + began.elapsed() > span {
                 break;
             }
             // A placed texture whose memory is not mapped (not streamed in
