@@ -72,8 +72,10 @@ pub(crate) fn level() -> Option<f32> {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=4, b0), DescriptorTable(UAV(u0))"
-cbuffer Floor : register(b0) { float level; float3 tint; };
+// The root signature is made in code ([`root_signature`]): Wine's compiler
+// ignores a `[RootSignature]`. The image's size comes with the constants: it
+// has no `GetDimensions` on a writable texture.
+cbuffer Floor : register(b0) { float level; float3 tint; uint width; uint height; };
 RWTexture2D<uint> light : register(u0);
 float3 unpack(uint v) {
     return float3(v & 511, (v >> 9) & 511, (v >> 18) & 511) * exp2(float(v >> 27) - 24.0);
@@ -87,12 +89,9 @@ uint pack(float3 c) {
     uint3 m = min(uint3(c * scale + 0.5), 511u);
     return m.r | (m.g << 9) | (m.b << 18) | (uint(e) << 27);
 }
-[RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void main(uint3 at : SV_DispatchThreadID) {
-    uint w, h;
-    light.GetDimensions(w, h);
-    if (at.x >= w || at.y >= h) return;
+    if (at.x >= width || at.y >= height) return;
     // Without rays the resolve's inputs are unwritten and hold whatever
     // their memory had; replace with a constant indirect diffuse floor.
     light[at.xy] = pack(tint * level);
@@ -145,9 +144,9 @@ fn make(device: &ID3D12Device) -> windows::core::Result<Pass> {
         return Err(e);
     }
     let code = text(&code.ok_or_else(windows::core::Error::empty)?);
-    // SAFETY: the root signature is inside the shader; plain creations.
+    let root = root_signature(device)?;
+    // SAFETY: plain creations.
     unsafe {
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, &code)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE {
@@ -171,6 +170,30 @@ fn make(device: &ID3D12Device) -> windows::core::Result<Pass> {
             next: AtomicU32::new(0),
         })
     }
+}
+
+/// The pass's root signature: the level, tint and the image's size (six
+/// constants at b0), and a table of one UAV at u0, as the string
+/// `RootConstants(num32BitConstants=6, b0), DescriptorTable(UAV(u0))` would
+/// make it. Serialized here because Wine's compiler ignores a
+/// `[RootSignature]` in the source, and the blob it gives holds none.
+fn root_signature(device: &ID3D12Device) -> windows::core::Result<ID3D12RootSignature> {
+    let range = [D3D12_DESCRIPTOR_RANGE1 {
+        RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+        NumDescriptors: 1,
+        BaseShaderRegister: 0,
+        RegisterSpace: 0,
+        Flags: D3D12_DESCRIPTOR_RANGE_FLAG_NONE,
+        OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
+    }];
+    let table = D3D12_ROOT_PARAMETER1 {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+            DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 { NumDescriptorRanges: 1, pDescriptorRanges: range.as_ptr() },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    };
+    crate::host::root_signature(device, &[crate::host::root_constants(0, 6), table], "ambient light")
 }
 
 fn uav_barrier(list: &ID3D12GraphicsCommandList) {
@@ -213,9 +236,17 @@ pub(crate) fn raise(list: &HostList, light: This) -> bool {
     ONCE.call_once(|| {
         tracing::info!(level, width = d.Width, height = d.Height, "ambient light");
     });
-    let slot = pass.next.fetch_add(1, Ordering::Relaxed) % SLOTS;
     list.keep(light);
-    let l = &list.list;
+    let t = tint();
+    record(&host.device, pass, &list.list, light, (d.Width as u32, d.Height), [level, t[0], t[1], t[2]]);
+    true
+}
+
+/// Records the pass over `light`, a `width` by `height` texture of 32-bit
+/// integers in the unordered-access state, into `l`: every texel gets the
+/// level times the tint (`constants`), packed.
+fn record(device: &ID3D12Device, pass: &Pass, l: &ID3D12GraphicsCommandList, light: &ID3D12Resource, (width, height): (u32, u32), constants: [f32; 4]) {
+    let slot = pass.next.fetch_add(1, Ordering::Relaxed) % SLOTS;
     uav_barrier(l);
     // SAFETY: an open list; a live texture the list keeps, in the
     // unordered-access state as the program before left it; a view in a slot
@@ -231,24 +262,21 @@ pub(crate) fn raise(list: &HostList, light: This) -> bool {
             ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
             ..Default::default()
         };
-        host.device
-            .CreateUnorderedAccessView(light, None::<&ID3D12Resource>, Some(&view), at);
+        device.CreateUnorderedAccessView(light, None::<&ID3D12Resource>, Some(&view), at);
         l.SetDescriptorHeaps(&[Some(pass.views.clone())]);
         l.SetComputeRootSignature(&pass.root);
         l.SetPipelineState(&pass.pso);
-        let t = tint();
-        let constants = [level, t[0], t[1], t[2]];
-        l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
+        let words = [constants[0].to_bits(), constants[1].to_bits(), constants[2].to_bits(), constants[3].to_bits(), width, height];
+        l.SetComputeRoot32BitConstants(0, words.len() as u32, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(
             1,
             D3D12_GPU_DESCRIPTOR_HANDLE {
                 ptr: gpu.ptr + u64::from(slot * pass.step),
             },
         );
-        l.Dispatch((d.Width as u32).div_ceil(8), d.Height.div_ceil(8), 1);
+        l.Dispatch(width.div_ceil(8), height.div_ceil(8), 1);
     }
     uav_barrier(l);
-    true
 }
 
 #[cfg(test)]
@@ -260,5 +288,90 @@ mod tests {
             return;
         };
         super::make(&host.device).expect("the ambient pass");
+    }
+
+    /// The pass writes every texel of an image of 32-bit integers with the
+    /// level times the tint as R9G9B9E5, on the host GPU (under Wine with
+    /// Wine's compiler too: the root signature is made in code).
+    #[test]
+    fn ambient_pass_fills_the_light_image() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let pass = super::make(&host.device).expect("the ambient pass");
+        let (width, height) = (20u32, 12u32);
+        let mut light: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a texture of ours.
+        unsafe {
+            host.device.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                    Width: u64::from(width),
+                    Height: height,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    Format: DXGI_FORMAT_R32_UINT,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                    ..Default::default()
+                },
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                None,
+                &mut light,
+            )
+        }
+        .expect("light image");
+        let light = light.expect("light image");
+        const PITCH: u32 = 256;
+        let back = host.read_back_buffer(u64::from(PITCH * height)).expect("read-back buffer");
+        let list = host.new_list().expect("command list");
+        let (level, tint) = (0.35f32, [0.94f32, 0.97, 1.0]);
+        super::record(&host.device, &pass, &list.list, &light, (width, height), [level, tint[0], tint[1], tint[2]]);
+        // SAFETY: an open list; live resources in the states named.
+        unsafe {
+            list.list.ResourceBarrier(&[crate::host::transition(&light, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&back),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: DXGI_FORMAT_R32_UINT, Width: width, Height: height, Depth: 1, RowPitch: PITCH },
+                    },
+                },
+            };
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&light),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+        }
+        list.close();
+        host.execute(&[&list]);
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: a read-back buffer the list has written and the host has
+        // waited for (`execute`).
+        unsafe { back.Map(0, None, Some(&mut mapped)) }.expect("mapped");
+        // SAFETY: the mapped rows.
+        let texels: Vec<u32> = (0..height)
+            .flat_map(|y| (0..width).map(move |x| (y, x)))
+            .map(|(y, x)| unsafe { mapped.cast::<u32>().add((y * PITCH / 4 + x) as usize).read() })
+            .collect();
+        // SAFETY: mapped above.
+        unsafe { back.Unmap(0, None) };
+        let first = texels[0];
+        assert!(texels.iter().all(|&t| t == first), "every texel the same");
+        // R9G9B9E5: nine bits a channel, a shared exponent biased by 24.
+        let scale = 2f32.powi((first >> 27) as i32 - 24);
+        let got = [first & 511, (first >> 9) & 511, (first >> 18) & 511].map(|m| m as f32 * scale);
+        for (c, (got, want)) in got.iter().zip(tint.map(|t| t * level)).enumerate() {
+            assert!((got - want).abs() <= want / 256.0, "channel {c}: {got} for {want} ({first:#x})");
+        }
+        list.reset();
     }
 }
