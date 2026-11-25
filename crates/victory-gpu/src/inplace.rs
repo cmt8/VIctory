@@ -609,6 +609,22 @@ fn in_placeholder(at: usize, end: usize) -> bool {
     if now.saturating_sub(looked) < PLACEHOLDER_LOOK_MS {
         return true;
     }
+    // The look is made with the runtime's remapping lock had at once, shared
+    // (`crate::watch::title_memory_reading_now`), or not now: the runtime
+    // maps a view before it tells of it and forgets one before it unmaps it,
+    // both inside that lock, and a look between the two found a view nobody
+    // had told of at the reservation's start and dropped the reservation for
+    // good. From then on every question about the memory there went to the
+    // kernel: in run a2 of linux/fx-next7 (18:45:17) the books stopped
+    // answering, and the layer's diagnostic look at each sampled texture
+    // (`VICTORY_DROP_REASONS=1`) probed every 4 KiB page of it with a
+    // one-byte kernel read, 3.2 million a frame on the recording threads.
+    // Not had: the answer stands as it was until a later question looks.
+    // (Tried, not waited for: the caller may hold it shared already, or be
+    // the runtime inside its remapping.)
+    let Some(_still) = crate::watch::title_memory_reading_now() else {
+        return true;
+    };
     // Still a reservation of ours: reserved (a placeholder), or a view at
     // its start that the runtime told of. Free memory, private committed
     // memory, or a view nobody told of there means it was released (and
@@ -629,8 +645,14 @@ fn in_placeholder(at: usize, end: usize) -> bool {
         if let Some(entry) = p.get_mut(&start) {
             entry.1 = now;
         }
-    } else {
-        p.remove(&start);
+    } else if p.remove(&start).is_some() {
+        // Said: every answer about it comes from the kernel from now on.
+        tracing::info!(
+            start = format_args!("{start:#x}"),
+            state = info.State,
+            kind = info.Type,
+            "a placeholder reservation of the runtime's is no longer there: what is mapped in it is asked of the kernel"
+        );
     }
     there
 }
