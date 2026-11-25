@@ -1335,6 +1335,24 @@ pub(crate) fn take_snapshots() {
     wide(copy_jobs(snaps));
 }
 
+/// [`take_snapshots`] for the noted snapshots of the copy whose mapping
+/// is `[data, data + len)` alone (tests: other tests' copies, run beside,
+/// note theirs in the same list and may have gone since).
+#[cfg(test)]
+fn take_snapshots_of(data: usize, len: usize) {
+    let mine: Vec<(usize, usize, usize)> = {
+        let mut snaps = SNAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let (mine, rest) = std::mem::take(&mut *snaps)
+            .into_iter()
+            .partition(|&(from, _, _)| from >= data && from < data + len);
+        *snaps = rest;
+        mine
+    };
+    if !mine.is_empty() {
+        wide(copy_jobs(mine));
+    }
+}
+
 /// `copies` (from, to, bytes) as pieces of work of about [`WIDE_JOB`]
 /// bytes each: long ones cut, short ones together.
 fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
@@ -3995,6 +4013,15 @@ mod copy_tests {
         unsafe { ((title + PAGE + 20) as *mut u8).write_volatile(0x55) };
         shadow.update(title + PAGE + 16, 16);
         assert_eq!(host(PAGE + 20), 0x55, "the title's constant reaches the copy");
+        // The submission's refreshes are done: its snapshots are taken now
+        // with `VICTORY_WIDE_BACK` (on by default), as `Host::submit` does
+        // before its lists go to the card. (Without this the snapshot held
+        // whatever its pooled memory held; the copy-back took a byte for
+        // the shader's only where the copy differed from it, and a byte
+        // for the title's where title memory differed from it, so the
+        // shader's byte went back only by chance.) This copy's alone: other
+        // tests note theirs in the same list.
+        take_snapshots_of(data as usize, len);
         // The shaders run: one byte written. The title writes meanwhile.
         // SAFETY: a byte of the copy's mapping.
         unsafe { data.add(10).write(0xaa) };
