@@ -1260,13 +1260,19 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 /// sampler heap is indexed directly (`SAMPLER_HEAP_DIRECTLY_INDEXED`) while
 /// the title binds no sampler heap: D3D12 requires one to be bound first
 /// (the debug layer's id 1419), and breaking that rule removes the device on
-/// NVIDIA. Slot 0 holds a point sampler, so an indexed read of it returns
+/// NVIDIA. Every slot holds a point sampler, so an indexed read of it returns
 /// something defined rather than whatever the memory held.
+///
+/// It has 2,048 slots, the most a sampler heap has and the bound translated
+/// shaders clamp a heap sampler's index to (`victory_shader::emit`): a
+/// shader that picks a heap sampler while the title binds none reads inside
+/// it at any index, not past the end of a one-slot heap.
 pub(crate) fn fallback_samplers() -> Option<&'static HostHeap> {
+    const SLOTS: u32 = 2048;
     static HEAP: std::sync::OnceLock<Option<HostHeap>> = std::sync::OnceLock::new();
     HEAP.get_or_init(|| {
-        let heap = HostHeap::new(true, 1)?;
-        null_sampler(heap.cpu(0));
+        let heap = HostHeap::new(true, SLOTS)?;
+        (0..SLOTS).for_each(|i| null_sampler(heap.cpu(i)));
         Some(heap)
     })
     .as_ref()
