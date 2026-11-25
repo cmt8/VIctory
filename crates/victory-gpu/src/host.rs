@@ -2578,6 +2578,9 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// The pipelines [`HostList::bind_pipeline`] kept, by address: a kept
+    /// pipeline's address names no other until the list is reset.
+    bound: std::collections::HashSet<usize>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -7724,6 +7727,39 @@ impl HostList {
             && self.twins.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
+    /// The list binds pipeline `pso` (named `name`, of root signature
+    /// `root`): both are kept until the list is reset, as the title may
+    /// release them before it submits the list, and the name noted
+    /// ([`HostList::used_pipeline`]). With `VICTORY_PIPELINE_ONCE` (on;
+    /// `0`: at every bind, as before) the keeping and the name are done the
+    /// first time the list binds it only: two interface queries, three
+    /// locks and a name looked up at every change of pipeline. The card's
+    /// clock per pipeline (`crate::cardmeter`) still marks every bind.
+    /// (After AvatarManz/VIctory-7900XTX ab86ef7f3.)
+    pub(crate) fn bind_pipeline(&self, name: &str, pso: &ID3D12PipelineState, root: &ID3D12RootSignature) {
+        static ONCE: OnceLock<bool> = OnceLock::new();
+        if !*ONCE.get_or_init(|| std::env::var("VICTORY_PIPELINE_ONCE").map_or(true, |v| v.trim() != "0")) {
+            self.used_pipeline(name);
+            self.keep(pso);
+            self.keep(root);
+            return;
+        }
+        let first = {
+            let mut deferred = self.deferred();
+            let first = deferred.bound.insert(pso.as_raw() as usize);
+            if first {
+                deferred.kept.push(pso.clone().into());
+                deferred.kept.push(root.clone().into());
+            }
+            first
+        };
+        if first {
+            self.used_pipeline(name);
+        } else {
+            self.meter_pipeline(name);
+        }
+    }
+
     /// Notes a pipeline the list binds; called where it is bound.
     pub(crate) fn used_pipeline(&self, name: &str) {
         {
@@ -7732,6 +7768,12 @@ impl HostList {
                 pipelines.insert(name.to_owned());
             }
         }
+        self.meter_pipeline(name);
+    }
+
+    /// With the card's clock per pipeline: the span of the pipeline bound
+    /// before ends here, and `name`'s begins.
+    fn meter_pipeline(&self, name: &str) {
         if crate::cardmeter::pipelines() {
             // The pipeline before it ends here on the card's clock.
             crate::cardmeter::end(&self.list, crate::cardmeter::Span::from_raw(self.pipeline_meter.swap(u32::MAX, Ordering::Relaxed)));
