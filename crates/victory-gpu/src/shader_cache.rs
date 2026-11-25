@@ -8,7 +8,7 @@
 //!
 //! The entry is our own encoding of [`HostShader`]: a field added to it
 //! must be added to `encode` and `decode` too (entries of older builds
-//! are ignored anyway).
+//! are ignored anyway: this file's own text is part of the key).
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -78,6 +78,8 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_WAVE_LOCAL",
                     "VICTORY_STRICT_JOINS",
                     "VICTORY_MESH_OUTPUT_STRICT",
+                    "VICTORY_FIRST_HALF",
+                    "VICTORY_FIRSTLANE_OWN",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');
@@ -88,6 +90,9 @@ fn build() -> &'static [u8; 32] {
                 }
                 // And which clean-up passes ran over the translated code.
                 bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
+                // And how an entry is encoded (`encode`, `decode`): this
+                // file, which the translator's hash does not cover.
+                bytes.extend_from_slice(include_bytes!("shader_cache.rs"));
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {
