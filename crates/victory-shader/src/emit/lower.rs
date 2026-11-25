@@ -337,6 +337,27 @@ pub(super) const LANE_MASK: Why = "a lane mask read as data";
 /// run that block are not all of the wave.
 pub(super) const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
 
+/// Why a dword of a descriptor read as data has no host value: which dword it is, `k` from
+/// the descriptor's first (a load may begin before it: a large `k`), of an image's eight or
+/// a buffer's four. The program stops on it all the same; the reason names the dword so
+/// that a run's log says which ones the title's programs read (they were all "a
+/// descriptor's address or format read as data").
+fn descriptor_dword_why(image: bool, k: u32) -> Why {
+    match (image, k) {
+        (false, 0 | 1) => "a buffer descriptor's address read as data",
+        (false, 2) => "a buffer descriptor's record count read as data",
+        (false, 3) => "a buffer descriptor's format dword read as data",
+        (true, 0) => "an image descriptor's address (dword 0) read as data",
+        (true, 1) => "an image descriptor's dword 1 (address, format) read as data",
+        (true, 2..=4) => "an image descriptor's size dwords read as data",
+        (true, 5) => "an image descriptor's dword 5 read as data",
+        (true, 6) => "an image descriptor's dword 6 read as data",
+        (true, 7) => "an image descriptor's dword 7 read as data",
+        (false, 4..=15) | (true, 8..=15) => "a dword past a descriptor read as data",
+        _ => "a dword before a descriptor read as data",
+    }
+}
+
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
 /// Per IR block: every lane of the wave that started the program runs it – no per-lane branch
@@ -5713,7 +5734,6 @@ impl<'a> Lower<'a> {
     // dwords (addresses, formats, tiling) have no host value: reading them
     // stops the program.
     fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
-        const OTHER: Why = "a descriptor's address or format read as data";
         let Fields::Smem {
             data: Some(Operand::Scalar { code, .. }),
             ..
@@ -5820,7 +5840,7 @@ impl<'a> Lower<'a> {
                         1 => self.write(inst, reg, hi, None),
                         _ => {
                             if let Some(v) = inst.write(reg) {
-                                self.vals.insert(v, Val::Missing(OTHER));
+                                self.vals.insert(v, Val::Missing(descriptor_dword_why(false, k)));
                                 self.stale.insert(v);
                             }
                         }
@@ -5844,7 +5864,12 @@ impl<'a> Lower<'a> {
                                 // view: no host value.
                                 _ => {
                                     if let Some(v) = inst.write(reg) {
-                                        self.vals.insert(v, Val::Missing(OTHER));
+                                        let why = if words.is_some() {
+                                            descriptor_dword_why(false, k)
+                                        } else {
+                                            "a descriptor with no host view read as data"
+                                        };
+                                        self.vals.insert(v, Val::Missing(why));
                                         self.stale.insert(v);
                                     }
                                 }
@@ -6007,7 +6032,7 @@ impl<'a> Lower<'a> {
                 Some(&(_, x)) => self.write(inst, Reg::S(code + k as u8), x, None),
                 None => {
                     if let Some(v) = inst.write(Reg::S(code + k as u8)) {
-                        self.vals.insert(v, Val::Missing(OTHER));
+                        self.vals.insert(v, Val::Missing(descriptor_dword_why(image.is_some(), rel)));
                         self.stale.insert(v);
                     }
                 }
