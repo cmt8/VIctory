@@ -525,6 +525,9 @@ struct Waiting {
     /// the fingerprint it had at the upload, how many looks found it
     /// unchanged, and the frame of the upload. A fingerprint of 0: none.
     checked: (u64, u64, u64, u8, u64),
+    /// The frame of the first change of its memory not looked at yet
+    /// ([`TextureQueue::changed`]); 0: none.
+    since: u64,
 }
 
 /// The queue of title slots whose texture view waits to be brought up to
@@ -551,7 +554,7 @@ impl TextureQueue {
         }
         self.writes += 1;
         let write = self.writes;
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), since: 0 });
     }
 
     fn remove(&mut self, index: u32) {
@@ -675,11 +678,28 @@ impl TextureQueue {
     /// written in `frame`: the slot is looked at from frame `due` as one
     /// written now, whatever was known of it (a pass at work on it does
     /// not take it out).
+    ///
+    /// With [`quiet_frames`]: a slot whose memory changed again before the
+    /// look an earlier change made due waits until its memory has been
+    /// still for that many frames, and at most [`QUIET_MOST`] frames from
+    /// the first change: a texture streaming in, its pages mapped and
+    /// written over several frames, is looked at once its stream is in,
+    /// not uploaded whole at every frame of it.
     fn changed(&mut self, index: u32, frame: u64, due: u64) {
         self.writes += 1;
         let write = self.writes;
-        let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+        let quiet = quiet_frames();
+        let (due, since) = match self.slots.get(&index) {
+            // Still waiting for the look an earlier change made due.
+            Some(w) if quiet > 0 && w.since != 0 && w.due > frame => {
+                CHANGES_FOLDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let latest = w.since.saturating_add(QUIET_MOST).max(due);
+                (w.due.max(frame + quiet).max(due).min(latest), w.since)
+            }
+            Some(w) => (w.due.min(due), frame),
+            None => (due, frame),
+        };
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), since });
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
@@ -707,6 +727,34 @@ impl TextureQueue {
         c
     }
 }
+
+/// Frames a slot whose memory keeps changing waits for it to be still
+/// before it is looked at ([`TextureQueue::changed`]):
+/// `VICTORY_TEXTURE_QUIET_FRAMES`, 2 by default; `0` looks at it as soon
+/// as the first change made it due, as before.
+///
+/// Run 232629 (Proton, linux/fx-next4) uploaded 333,000 textures picked by
+/// index in 21 minutes, 137 GB (109,000 of them, 46 GB, in the 4.7 minutes
+/// of the scene after the first interior): the runtime told of 6.3 million
+/// ranges mapped, unmapped or written under texture views, 502,000 of them
+/// DirectStorage writes (`VICTORY_PAGE_WRITES`), and every look a change
+/// made due uploaded the whole texture and detiled it at the submission
+/// (the frame line's "textures", 0.3-3 s a frame there), while the next
+/// pages of the same stream landed a frame later and made it due again.
+fn quiet_frames() -> u64 {
+    static FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FRAMES.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_QUIET_FRAMES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2)
+    })
+}
+
+/// The most frames a slot waits from the first change of its memory for
+/// it to be still ([`quiet_frames`]).
+const QUIET_MOST: u64 = 6;
+
+/// Since the start: changes of a slot's memory folded into the look an
+/// earlier change made due ([`quiet_frames`]).
+pub(crate) static CHANGES_FOLDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Whether `view` is of a texture the title may fill itself: a texture it
 /// placed in memory, or a texture object.
@@ -3191,6 +3239,49 @@ mod tests {
         assert_eq!(q.room(5), 1);
         assert!(q.due(5, 100).iter().any(|d| d.0 == 20));
         assert_eq!(q.room(6), 0);
+    }
+
+    /// A slot whose memory changes frame after frame (a texture streaming
+    /// in) is looked at once its memory has been still for the quiet
+    /// frames, and no later than `QUIET_MOST` frames from the first change;
+    /// one change alone is due as before, and so is one that comes when the
+    /// slot is due already.
+    #[test]
+    fn changes_while_a_look_is_pending_wait_for_quiet() {
+        assert_eq!(quiet_frames(), 2, "the default");
+        let mut q = TextureQueue::default();
+        let due = |q: &TextureQueue, frame: u64| q.due(frame, 100).iter().any(|d| d.0 == 7);
+        // One change at frame 10, due at 11 (a mapping's rule): as before.
+        q.changed(7, 10, 11);
+        assert!(!due(&q, 10));
+        assert!(due(&q, 11));
+        // Served at 11; the slot leaves the queue.
+        let write = q.due(11, 100)[0].1;
+        q.done(7, write);
+        // A stream: changes at 20, 21 and 22, each due a frame later. The
+        // first is due at 21; the second, before that look, pushes it to
+        // 23; the third to 24.
+        q.changed(7, 20, 21);
+        q.changed(7, 20, 21);
+        assert!(!due(&q, 21) && due(&q, 22), "folded: two frames of quiet after frame 20");
+        q.changed(7, 21, 22);
+        assert!(!due(&q, 22) && due(&q, 23));
+        q.changed(7, 22, 23);
+        assert!(!due(&q, 23) && due(&q, 24));
+        // It keeps changing: never past six frames from the first change.
+        for frame in 23..40 {
+            q.changed(7, frame, frame + 1);
+            if frame < 26 {
+                continue;
+            }
+            assert!(due(&q, 20 + QUIET_MOST), "frame {frame}");
+        }
+        // Due already (not served yet, for lack of budget): a change
+        // leaves it due.
+        let mut q = TextureQueue::default();
+        q.changed(8, 50, 51);
+        q.changed(8, 52, 53);
+        assert!(q.due(52, 100).iter().any(|d| d.0 == 8), "due since 51, a change at 52 keeps it due");
     }
 
     /// Textures of which only the smallest levels are held, packed into

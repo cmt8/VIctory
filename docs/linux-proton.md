@@ -211,6 +211,16 @@ frames later).
   shader cache key are not in this tree (its own key and
   `translate --cache` are).
 
+### Streaming (linux/fx-next5-perf)
+
+- `VICTORY_TEXTURE_QUIET_FRAMES` (2; `0` as before): a texture picked by
+  index whose memory the runtime maps, unmaps or writes again before the
+  look an earlier change made due waits until its memory has been still
+  for that many frames, and at most six frames from the first change; a
+  texture streaming in is then uploaded once its pages are in instead of
+  whole at every frame of the stream. The status line "what is mapped,
+  from the runtime's word" counts the changes folded so.
+
 ## Tests
 
 ```sh
