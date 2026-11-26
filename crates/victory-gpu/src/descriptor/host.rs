@@ -1414,6 +1414,53 @@ impl TextureQueue {
     }
 }
 
+/// Table entries whose view is not of the kind the shader reads there (a
+/// buffer view where it reads a texture's descriptor, or a texture view
+/// where it reads a buffer's), since the start: `[in tables made afresh,
+/// whose dynamic slot reads nothing instead, read in place in the title's
+/// slot]`.
+pub(crate) static KIND_MISMATCHES: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether a table made afresh for a draw gets a null view of the kind
+/// the shader reads where the title's record there is of the other kind
+/// ([`kind_mismatch`]; `VICTORY_KIND_NULL=0`: the title's view whatever it
+/// is, as before).
+pub(crate) fn kind_null() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_KIND_NULL").is_none_or(|v| v != "0"))
+}
+
+/// Whether `view` is a buffer's (a constant buffer view counts as one);
+/// `None`: a sampler.
+pub(crate) fn buffer_kind(view: &View) -> Option<bool> {
+    Some(match view {
+        View::Constant(..) => true,
+        View::Sampler(_) | View::ConsoleSampler(_) => return None,
+        View::Shader(r, _) | View::Unordered(r, _, _) => {
+            crate::resource::buffer_bytes(*r as crate::object::This).is_some()
+        }
+        View::Placed(_, resource, _) => resource[0] == 1,
+    })
+}
+
+/// Whether `view` is not of the kind a shader reads through a console
+/// descriptor of `dwords` dwords (4: a buffer's, 8: a texture's): a
+/// texture's descriptor read as a buffer's is a wild address on RADV (the
+/// upper half of the image's slot: base 0 and a large size), a buffer's
+/// read as a texture's another. Constant buffer views count as buffers;
+/// samplers and other sizes are never a mismatch.
+pub(crate) fn kind_mismatch(view: &View, dwords: u8) -> bool {
+    let Some(buffer) = buffer_kind(view) else {
+        return false;
+    };
+    match dwords {
+        4 => !buffer,
+        8 => buffer,
+        _ => false,
+    }
+}
+
 /// Whether `view` is of a texture the title may fill itself: a texture it
 /// placed in memory, or a texture object.
 pub(crate) fn is_texture_view(view: &View) -> bool {
@@ -3211,6 +3258,7 @@ impl HostHeap {
                 let listed = Listed {
                     kind: crate::draw::view_kind(&view),
                     texture: is_texture_view(&view),
+                    buffer: buffer_kind(&view).unwrap_or(false),
                     ready: (0, 0, false),
                     tabled: None,
                 };
@@ -3404,6 +3452,17 @@ impl HostHeap {
                 self.at(index),
             )
         };
+        self.put(index);
+        self.clear_twin(index);
+        self.keep(index, None);
+    }
+
+    /// Makes slot `index` (a dynamic one) a texture view of nothing, for
+    /// shader reads or (`unordered`) unordered access: reads give zeros,
+    /// writes are dropped.
+    pub(crate) fn null_texture_at(&self, index: u32, unordered: bool) {
+        let null = if unordered { Null::Unordered(false, None) } else { Null::Plain };
+        null.write(self.at(index));
         self.put(index);
         self.clear_twin(index);
         self.keep(index, None);
@@ -5785,6 +5844,64 @@ mod tests {
         BORN_IN_TEST.set(None);
     }
 
+    /// A structured view of `bytes`, 16-byte elements (a buffer the title
+    /// placed in memory).
+    fn structured_view(bytes: &'static [u8; 4096]) -> View {
+        let address = bytes.as_ptr() as u64;
+        let resource = [1, 0, 0, 0, 4096, 0, 1, 0x1_0001, 0, 1, 0, 0, 0, 0];
+        let mut srv = [0; 16];
+        // Format unknown, a buffer, the default mapping; 256 elements of 16.
+        srv[..9].copy_from_slice(&[0, 1, 5768, 0, 0, 0, 256, 16, 0]);
+        (srv[10], srv[11]) = (address as u32, (address >> 32) as u32);
+        View::Placed(false, resource, srv)
+    }
+
+    /// A buffer view read as a texture or a texture view read as a buffer
+    /// is a mismatch; constant buffers are buffers, samplers never one.
+    #[test]
+    fn kinds_by_descriptor_size() {
+        static TEXTURE: [u8; 65536] = [0; 65536];
+        static BUFFER: [u8; 4096] = [0; 4096];
+        let (texture, _) = placed_record(&TEXTURE);
+        let buffer = structured_view(&BUFFER);
+        assert!(kind_mismatch(&texture, 4));
+        assert!(!kind_mismatch(&texture, 8));
+        assert!(!kind_mismatch(&buffer, 4));
+        assert!(kind_mismatch(&buffer, 8));
+        assert!(!kind_mismatch(&View::Constant(0x1000, 256), 4));
+        assert!(!kind_mismatch(&View::Sampler([0; 13]), 4));
+        assert_eq!(buffer_kind(&texture), Some(false));
+        assert_eq!(buffer_kind(&buffer), Some(true));
+        assert_eq!(buffer_kind(&View::ConsoleSampler(Default::default())), None);
+    }
+
+    /// The null views a table made afresh gets in place of a view of the
+    /// wrong kind hold nothing, where a view was before.
+    #[test]
+    fn a_slot_made_null_for_its_kind_holds_nothing() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        static TEXTURE: [u8; 65536] = [0; 65536];
+        let (texture, _) = placed_record(&TEXTURE);
+        let Some(index) = heap.dynamic(1) else { panic!("a dynamic slot") };
+        for unordered in [false, true] {
+            heap.make_at(index, &texture);
+            assert!(shown(&heap, index).is_some());
+            heap.null_texture_at(index, unordered);
+            assert_eq!(shown(&heap, index), None);
+            heap.make_at(index, &texture);
+            if unordered {
+                heap.null_raw_uav_at(index);
+            } else {
+                heap.null_raw_at(index);
+            }
+            assert_eq!(shown(&heap, index), None);
+        }
+        heap.release(index, 1);
+        assert_eq!(super::device_removed(), None);
+    }
+
     /// A clear held back and then a make of the slot: the make stands,
     /// whether it is written at once (`VICTORY_DEFER_SLOT_CLEARS=1`) or
     /// held back too (`=2`, needed by a draw: a settle is asked for).
@@ -6821,6 +6938,8 @@ mod tests {
 pub(crate) struct Listed {
     pub(crate) kind: Option<victory_shader::native::ResourceType>,
     pub(crate) texture: bool,
+    /// A buffer's view ([`buffer_kind`]).
+    pub(crate) buffer: bool,
     /// Read at this epoch of the list ([`crate::host::HostList::epoch`]) with
     /// this depth target tested: up to date; and whether it is that target's.
     pub(crate) ready: (u64, usize, bool),

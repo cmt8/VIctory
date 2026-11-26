@@ -9822,6 +9822,16 @@ impl Meter {
                         u8::from(crate::descriptor::host::defer_new_views())
                     );
                 }
+                {
+                    let [fresh, in_place] = [0, 1].map(|i| crate::descriptor::host::KIND_MISMATCHES[i].load(Ordering::Relaxed));
+                    if fresh + in_place > 0 {
+                        tracing::info!(
+                            "table entries whose view was not of the kind the shader reads there (VICTORY_KIND_NULL={}), since the \
+                             start: {fresh} in tables made afresh (null instead), {in_place} read in place in the title's slot",
+                            u8::from(crate::descriptor::host::kind_null())
+                        );
+                    }
+                }
                 tracing::info!("textures shown, since the start (crate::texlate): {}", crate::texlate::line());
                 if let Some(line) = crate::texstore::line() {
                     tracing::info!("{line}");

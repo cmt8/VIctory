@@ -3465,6 +3465,15 @@ impl State {
         // (Read in the title's own slot: a view held back for it is needed
         // before the next submission.)
         if let Some(view) = host.mirror_required(index, handle, true) {
+            // Counted only: the title's slot is read in place by others too.
+            if matches!(u.kind, ResourceType::Srv | ResourceType::Uav | ResourceType::Cbv)
+                && crate::descriptor::host::kind_mismatch(&view, u.dwords)
+            {
+                let n = crate::descriptor::host::KIND_MISMATCHES[1].fetch_add(1, Ordering::Relaxed);
+                if n == 0 {
+                    tracing::warn!(index, dwords = u.dwords, ?view, "a title slot read in place holds a view of another kind than the shader reads");
+                }
+            }
             readable(list, u.kind, &view);
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
@@ -3648,14 +3657,26 @@ impl State {
             let recording = self.recording;
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
+            let kind_null = crate::descriptor::host::kind_null();
             for k in 0..n {
                 let index = first + k;
+                // What the shader reads there, if it names the slot: only
+                // buffers' descriptors, or only textures'.
+                let read = if kind_null && group.entry(k).is_some() { read_as(&group.entries, k) } else { None };
                 // A view this list has made before: its descriptor copied,
                 // and nothing more if nothing changed in the list since.
                 if list_views
                     && let Some(words) = crate::descriptor::record_at(table + u64::from(k) * 32)
                     && let Some(mut listed) = host.make_listed(recording, words, index)
                 {
+                    if let Some((as_buffer, unordered)) = read
+                        && as_buffer != listed.buffer
+                    {
+                        // (As below; the slot is this list's, which is not
+                        // sent yet.)
+                        null_of_kind(host, index, as_buffer, unordered);
+                        continue;
+                    }
                     let kind = group
                         .entry(k)
                         .map(|u| u.kind)
@@ -3694,6 +3715,21 @@ impl State {
                 }
                 let used = group.entry(k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
+                    Some(view)
+                        if read.is_some_and(|(as_buffer, _)| {
+                            crate::descriptor::host::kind_mismatch(&view, if as_buffer { 4 } else { 8 })
+                        }) =>
+                    {
+                        // A texture view where the shader reads a buffer: its
+                        // descriptor's upper half read as a buffer's is
+                        // address 0 with a large size on RADV (a page
+                        // fault); a buffer view where it reads a texture is
+                        // no image's descriptor either. The console read
+                        // whatever the first dwords said. Read as nothing
+                        // instead.
+                        let (as_buffer, unordered) = read.unwrap_or_default();
+                        null_of_kind(host, index, as_buffer, unordered);
+                    }
                     Some(View::Constant(address, size)) => {
                         // Renderer port 5: title memory in place is the
                         // card's to read where it is; nothing is copied.
@@ -4347,6 +4383,40 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
 
 /// Gets what a shader reads or writes through a view ready: buffer data
 /// copied, textures moved to the state they need.
+/// What the shader reads at table slot `k` by the used-resource
+/// `entries` there, if they agree: only through console buffer descriptors
+/// (4 dwords: constant, shader-resource or unordered buffers; true) or
+/// only through texture descriptors (8 dwords; false), and whether any is
+/// unordered access. `None`: none is there, or both kinds are.
+fn read_as(entries: &[UsedResource], k: u32) -> Option<(bool, bool)> {
+    let mut read: Option<(bool, bool)> = None;
+    for u in entries.iter().filter(|u| u.table_offset_dwords / 8 == k) {
+        let as_buffer = match (u.kind, u.dwords) {
+            (ResourceType::Srv | ResourceType::Uav | ResourceType::Cbv, 4) => true,
+            (ResourceType::Srv | ResourceType::Uav, 8) => false,
+            _ => return None,
+        };
+        let unordered = u.kind == ResourceType::Uav;
+        match &mut read {
+            Some((was, _)) if *was != as_buffer => return None,
+            Some((_, any)) => *any |= unordered,
+            None => read = Some((as_buffer, unordered)),
+        }
+    }
+    read
+}
+
+/// Dynamic slot `index` reads nothing, as the kind of view the shader
+/// reads there (`crate::descriptor::host::kind_mismatch`).
+fn null_of_kind(host: &crate::descriptor::host::HostHeap, index: u32, as_buffer: bool, unordered: bool) {
+    crate::descriptor::host::KIND_MISMATCHES[0].fetch_add(1, Ordering::Relaxed);
+    match (as_buffer, unordered) {
+        (true, true) => host.null_raw_uav_at(index),
+        (true, false) => host.null_raw_at(index),
+        (false, unordered) => host.null_texture_at(index, unordered),
+    }
+}
+
 pub(crate) fn view_kind(view: &View) -> Option<ResourceType> {
     match view {
         View::Shader(..) | View::Placed(false, ..) => Some(ResourceType::Srv),
