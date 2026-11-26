@@ -1193,6 +1193,11 @@ pub(crate) struct HostTexture {
     /// The texture's flags (asked once: the runtime takes 100 ns to say, and
     /// every texture of every draw is asked about).
     flags: u32,
+    /// The submissions begun (`crate::host::submissions`) when it was
+    /// made: a title slot must not show it while one of those may still
+    /// run (`crate::descriptor::host::defer_new_views`; a list sent before
+    /// the card's memory for it was there page-faults reading it).
+    pub(crate) born_after: u64,
 }
 
 /// What a host copy was filled with last: the first level of it and the
@@ -2399,6 +2404,7 @@ impl HostTexture {
             prefill: Default::default(),
             prefilled: Default::default(),
             flags,
+            born_after: crate::host::submissions().0,
         }
     }
 
@@ -2426,6 +2432,7 @@ impl HostTexture {
             prefill: Default::default(),
             prefilled: Default::default(),
             flags,
+            born_after: crate::host::submissions().0,
         }
     }
 }
@@ -2496,6 +2503,26 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
         return None;
     }
     hosted(this, true).map(|made| made.0)
+}
+
+/// The submissions begun when the host copy of `this` (or its twins, the
+/// newest of them) was made ([`HostTexture::born_after`]); 0 if none is
+/// made.
+#[cfg(windows)]
+pub(crate) fn host_born_after(this: This) -> u64 {
+    if this.is_null() {
+        return 0;
+    }
+    hosted(this, false).map_or(0, |(host, twin)| {
+        let mut born = host.born_after;
+        if let Some(twin) = twin {
+            born = born.max(twin.colour.born_after);
+            if let Some(plane) = &twin.plane {
+                born = born.max(plane.born_after);
+            }
+        }
+        born
+    })
 }
 
 /// A title texture's host copy if it is made; not made here.

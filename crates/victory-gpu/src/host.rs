@@ -9814,6 +9814,14 @@ impl Meter {
                         crate::descriptor::host::defer_slot_clears()
                     );
                 }
+                {
+                    let [held, made] = [0, 1].map(|i| crate::descriptor::host::DEFERRED_VIEWS[i].load(Ordering::Relaxed));
+                    tracing::info!(
+                        "title slots whose view was of a host resource made while submissions begun before it ran \
+                         (VICTORY_DEFER_NEW_VIEWS={}), since the start: {held} held back, {made} made once those had finished",
+                        u8::from(crate::descriptor::host::defer_new_views())
+                    );
+                }
                 tracing::info!("textures shown, since the start (crate::texlate): {}", crate::texlate::line());
                 if let Some(line) = crate::texstore::line() {
                     tracing::info!("{line}");

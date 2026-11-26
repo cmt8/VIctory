@@ -289,6 +289,83 @@ enum Pending {
 pub(crate) static HELD_CLEARS: [std::sync::atomic::AtomicU64; 4] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Title-slot views of a host resource made while submissions begun before
+/// it might still run, since the start: `[held back, made once those had
+/// finished]`.
+pub(crate) static DEFERRED_VIEWS: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether a title slot waits to show a host resource (a texture's host
+/// copy or twin, a buffer's or constant buffer's host copy) until every
+/// submission begun before the resource was made has finished
+/// (`VICTORY_DEFER_NEW_VIEWS=0`: made at once, as before). Lists already
+/// sent read title slots by index; one that finds a view of memory the
+/// card did not have when it was sent page-faults (the device losses
+/// `crate::pool::begun_before` tells of: [`show_new_later`] holds back
+/// textures made in a pool block, this every host resource a title slot
+/// is made from, by [`HostHeap::mirror`], the flips and the remakes).
+/// Slots a list makes for itself (dynamic ones) are read by that list
+/// alone, which is sent after what they show was made.
+pub(crate) fn defer_new_views() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DEFER_NEW_VIEWS").is_none_or(|v| v != "0"))
+}
+
+/// What [`make_checked`] did: made the view (of the resource to hold),
+/// could not (`None`), or left the slot alone because the host resource
+/// was made after the submissions it was to be older than (those begun
+/// then: due when as many have finished).
+enum Make {
+    Made(Kept),
+    None,
+    Deferred(u64),
+}
+
+thread_local! {
+    /// The submissions finished a host resource must not be newer than,
+    /// while this thread is in [`make_checked`]; and the newest it found.
+    static BORN_CHECK: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    static BORN_FOUND: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Tests: when every host resource counts as made.
+    #[cfg(test)]
+    static BORN_IN_TEST: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether the host resource a view is about to be made of, made when
+/// `born` submissions had begun, is too new for the slot
+/// ([`make_checked`]): nothing is written then.
+fn too_new(born: u64) -> bool {
+    #[cfg(test)]
+    let born = BORN_IN_TEST.get().unwrap_or(born);
+    match BORN_CHECK.get() {
+        Some(done) if born > done => {
+            BORN_FOUND.set(BORN_FOUND.get().max(born));
+            true
+        }
+        _ => false,
+    }
+}
+
+/// [`make_twinned`]; with `max_born` (the submissions finished) a view of
+/// a host resource made after more than those had begun is not made:
+/// nothing is written at `at` or `twin` ([`defer_new_views`]).
+fn make_checked(
+    view: &View,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    twin: Option<D3D12_CPU_DESCRIPTOR_HANDLE>,
+    max_born: Option<u64>,
+) -> Make {
+    BORN_FOUND.set(0);
+    BORN_CHECK.set(max_born);
+    let kept = make_twinned(view, at, twin);
+    BORN_CHECK.set(None);
+    match (kept, BORN_FOUND.replace(0)) {
+        (Some(kept), _) => Make::Made(kept),
+        (None, 0) => Make::None,
+        (None, born) => Make::Deferred(born),
+    }
+}
+
 /// What waits for the submissions on the card before it touches a title
 /// slot that shows a host resource (`VICTORY_DEFER_SLOT_CLEARS`): 0
 /// nothing (written at once, as before), 1 (the default) making it null, 2
@@ -2329,12 +2406,14 @@ impl HostHeap {
         if starts.is_empty() {
             return 0;
         }
-        let slots: Vec<u32> = {
+        let slots: Vec<(u64, u32)> = {
             let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
-            starts.iter().flat_map(|&start| placed.slots_at(start)).collect()
+            starts.iter().flat_map(|&start| placed.slots_at(start).into_iter().map(move |slot| (start, slot))).collect()
         };
         let mut remade = 0;
-        for slot in slots {
+        let max_born = defer_new_views().then(|| self.finished());
+        let mut later = Vec::new();
+        for (start, slot) in slots {
             let _made = self.made.lock(slot);
             let Some(key) = self.made.get(slot).filter(|&key| key != 0) else {
                 continue;
@@ -2342,11 +2421,26 @@ impl HostHeap {
             let Some(view) = view_at(key as u32, (key >> 32) as u32) else {
                 continue;
             };
-            if let Some(kept) = make(&view, self.at(slot)) {
-                self.put(slot);
-                self.keep(slot, kept);
-                remade += 1;
+            match make_checked(&view, self.at(slot), None, max_born) {
+                Make::Made(kept) => {
+                    self.put(slot);
+                    self.keep(slot, kept);
+                    remade += 1;
+                }
+                Make::None => {}
+                // Of a host copy made since: the texture's slots are made
+                // again when the submissions begun before it have finished
+                // ([`defer_new_views`]).
+                Make::Deferred(born) => {
+                    if !later.contains(&(born, start)) {
+                        later.push((born, start));
+                    }
+                }
             }
+        }
+        if !later.is_empty() {
+            DEFERRED_VIEWS[0].fetch_add(later.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            RESHOWN_AFTER.lock().unwrap_or_else(|e| e.into_inner()).append(&mut later);
         }
         remade
     }
@@ -2532,6 +2626,7 @@ impl HostHeap {
             }
         }
         let mut flipped = 0;
+        let max_born = defer_new_views().then(|| self.finished());
         for f in ready {
             let _made = self.made.lock(f.index);
             let Some(shown) = self.made.get(f.index) else {
@@ -2560,7 +2655,19 @@ impl HostHeap {
                     continue;
                 }
             }
-            if let Some(kept) = make(&view, self.at(f.index)) {
+            let kept = match make_checked(&view, self.at(f.index), None, max_born) {
+                Make::Made(kept) => Some(kept),
+                Make::None => None,
+                // Of a host copy made since (the texture was made again
+                // with more levels, say): when the submissions begun
+                // before that have finished ([`defer_new_views`]).
+                Make::Deferred(born) => {
+                    DEFERRED_VIEWS[0].fetch_add(1, Relaxed);
+                    FLIPS.lock().unwrap_or_else(|e| e.into_inner()).push(Flip { after: born, ..f });
+                    continue;
+                }
+            };
+            if let Some(kept) = kept {
                 #[cfg(feature = "diagnostics")]
                 note_before(f.index, shown, if f.late.is_some() { "shown after its upload" } else { "flip" });
                 self.put(f.index);
@@ -2780,7 +2887,11 @@ impl HostHeap {
                     // (`mirror_in` takes the slot's lock itself.)
                     drop(slot);
                     self.mirror_in(index, m.handle, m.for_draw, m.required, true);
-                    HELD_CLEARS[3].fetch_add(1, Relaxed);
+                    if m.replace {
+                        HELD_CLEARS[3].fetch_add(1, Relaxed);
+                    } else {
+                        DEFERRED_VIEWS[1].fetch_add(1, Relaxed);
+                    }
                     self.made.lock(index)
                 }
                 None => slot,
@@ -3700,32 +3811,60 @@ impl HostHeap {
                 note_before(index, shown, if later { "null, waits" } else { "at once" });
             }
             self.quick_is(index, 0);
-            self.made.set(index, if later { 0 } else { key });
-            let kept = if later {
-                None
-            } else {
-                make_twinned(&view, self.at(index), self.twin(index))
-            };
-            match kept {
-                Some(kept) => {
-                    self.put(index);
-                    self.twin_made(index, twinned(&view));
-                    self.keep(index, kept);
-                }
-                // (A sampler the host cannot make: the slot as it was.)
-                None if self.sampler => {
-                    self.twin_made(index, false);
-                    self.keep(index, None);
-                }
+            if later {
+                self.made.set(index, 0);
                 // Null of the view's kind: when nothing sent may still read
                 // what the slot shows ([`HostHeap::clear`]).
-                None => self.clear(index, Null::of(&view)),
+                self.clear(index, Null::of(&view));
+            } else {
+                let max_born = (!self.sampler && defer_new_views()).then(|| self.finished());
+                match make_checked(&view, self.at(index), self.twin(index), max_born) {
+                    // Of a host resource made while submissions begun
+                    // before it may still run ([`defer_new_views`]): the
+                    // slot, what it holds and what it is made from stay as
+                    // they are until those have finished
+                    // ([`HostHeap::flush_deferred`]).
+                    Make::Deferred(born) => {
+                        if self.held_mirror(index).is_none() {
+                            DEFERRED_VIEWS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        self.hold(index, born, Pending::Mirror(Remirror { handle, for_draw, required, replace: false }));
+                        drop(held);
+                        self.unmake_stale(index, stale);
+                        return Some(view);
+                    }
+                    Make::Made(kept) => {
+                        self.made.set(index, key);
+                        self.put(index);
+                        self.twin_made(index, twinned(&view));
+                        self.keep(index, kept);
+                    }
+                    // (A sampler the host cannot make: the slot as it was.)
+                    Make::None if self.sampler => {
+                        self.made.set(index, key);
+                        self.twin_made(index, false);
+                        self.keep(index, None);
+                    }
+                    Make::None => {
+                        self.made.set(index, key);
+                        self.clear(index, Null::of(&view));
+                    }
+                }
             }
             self.quick_is(index, if later { 0 } else { key });
             drop(held);
             self.unmake_stale(index, stale);
         }
         Some(view)
+    }
+
+    /// The submissions finished (tests: by the card they set).
+    fn finished(&self) -> u64 {
+        #[cfg(test)]
+        if let Some((_, finished, _)) = *self.card.lock().unwrap_or_else(|e| e.into_inner()) {
+            return finished;
+        }
+        crate::host::submissions().1
     }
 
     /// Whether submission `after` may still be on the card (tests: by the
@@ -4268,6 +4407,9 @@ fn buffer_srv(
     if desc.Shader4ComponentMapping != D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING {
         desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     }
+    if too_new(shadow.born_after()) {
+        return None;
+    }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -4389,6 +4531,9 @@ fn buffer_uav(
             width,
             "unordered buffer view the host would refuse left null"
         );
+        return None;
+    }
+    if too_new(shadow.born_after()) {
         return None;
     }
     let host = host()?;
@@ -4640,6 +4785,9 @@ fn make_twinned(
         &View::Constant(address, size) => {
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
+            if too_new(shadow.born_after()) {
+                return None;
+            }
             if crate::port_cbv::on() {
                 // Renderer port 5: shaders read constant buffers as raw bytes
                 // through the twin; a constant buffer view there would be read
@@ -4696,6 +4844,9 @@ fn make_twinned(
                 }
                 let mut desc = desc.as_ref().map(srv_desc);
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
+                    return None;
+                }
+                if too_new(copy.born_after) {
                     return None;
                 }
                 // Levels on demand (`crate::tiles`): a texture made level by
@@ -4797,6 +4948,9 @@ fn make_twinned(
                 None => texture,
             };
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
+                return None;
+            }
+            if too_new(crate::resource::host_born_after(resource)) {
                 return None;
             }
             // SAFETY: a live texture and a slot of our heap.
@@ -5571,6 +5725,64 @@ mod tests {
         assert_eq!(heap.mirror(1, handle, false), None);
         assert_eq!(shown(&heap, 1), None);
         assert!(heap.deferred.lock().unwrap().is_empty());
+    }
+
+    /// A title slot is not made from a host resource made while a
+    /// submission begun before it may still run: it goes on showing (and
+    /// holding) what it showed, and is made once those have finished. A
+    /// draw that reads it in place asks for a settle. `finished` in
+    /// between: not yet.
+    #[test]
+    fn a_view_of_a_host_copy_made_under_a_running_submission_waits_for_it() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        static OLD: [u8; 65536] = [0; 65536];
+        static NEW: [u8; 65536] = [1; 65536];
+        let (old, record) = placed_record(&OLD);
+        let (new, new_record) = placed_record_wide(&NEW, 128);
+        let handle = descriptor(record);
+        let other = descriptor(new_record);
+        set_card(&heap, ON_CARD, ON_CARD, 1);
+        assert_eq!(heap.mirror(1, handle, true), Some(old));
+        let before = shown(&heap, 1);
+        assert!(before.is_some(), "made: older than what finished");
+        // Whatever is made from here on is made while ON_CARD + 1 runs.
+        BORN_IN_TEST.set(Some(ON_CARD + 1));
+        set_card(&heap, ON_CARD + 1, ON_CARD, 1);
+        // A slot that shows nothing stays null and unmade.
+        assert_eq!(heap.mirror(2, other, true), Some(new.clone()));
+        assert!(!heap.made(2));
+        assert_eq!(shown(&heap, 2), None);
+        assert!(!heap.has_required_deferred(ON_CARD), "not read in place by a draw");
+        // One that shows another texture goes on showing it.
+        rewrite(handle, new_record);
+        assert_eq!(heap.mirror_required(1, handle, true), Some(new.clone()));
+        assert_eq!(shown(&heap, 1), before, "the old view, and its texture held");
+        assert!(heap.has_required_deferred(ON_CARD), "a draw reads it in place");
+        // Asked again: held once each.
+        assert_eq!(heap.mirror(1, handle, true), Some(new.clone()));
+        assert_eq!(heap.deferred.lock().unwrap().len(), 2);
+        assert_eq!(heap.flush_deferred(ON_CARD), 0);
+        assert_eq!(shown(&heap, 1), before);
+        // The submission has finished.
+        set_card(&heap, ON_CARD + 1, ON_CARD + 1, 1);
+        assert!(!heap.has_required_deferred(ON_CARD + 1));
+        assert_eq!(heap.flush_deferred(ON_CARD + 1), 2);
+        assert!(heap.made(1) && heap.made(2));
+        let after = shown(&heap, 1);
+        assert!(after.is_some() && after != before);
+        assert_eq!(shown(&heap, 2), after, "both show the new texture");
+        assert!(heap.deferred.lock().unwrap().is_empty());
+        assert_eq!(super::device_removed(), None);
+        // A dynamic slot is the list's own: made at once.
+        set_card(&heap, ON_CARD + 2, ON_CARD + 1, 1);
+        BORN_IN_TEST.set(Some(ON_CARD + 2));
+        let Some(index) = heap.dynamic(1) else { panic!("a dynamic slot") };
+        heap.make_at(index, &new);
+        assert_eq!(shown(&heap, index), after);
+        heap.release(index, 1);
+        BORN_IN_TEST.set(None);
     }
 
     /// A clear held back and then a make of the slot: the make stands,
