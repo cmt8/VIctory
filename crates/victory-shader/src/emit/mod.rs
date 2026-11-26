@@ -123,7 +123,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use compute_wave::{compute_wave_32, host_min_wave_set, set_host_min_wave};
+pub use compute_wave::{compute_wave_32, host_min_wave_set, named, set_host_min_wave, wave_kept};
 pub use lower::{host_settings, set_host_max_wave, set_host_rdna, set_thread_max_wave};
 pub use rect::rect_list_gs;
 pub use shader::{
@@ -577,17 +577,46 @@ pub(crate) fn emit_sized(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
+    let waves = native.stage == HwStage::Cs && compute_wave_32();
+    // `VICTORY_WAVE_WHY=1`: what each compute program was taken as (one line)
+    let say = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
+        if let (true, crate::native::StageIo::Cs(cs)) = (compute_wave::why(), &native.io) {
+            let declares = match r {
+                Ok((_, wave)) => format!("declares {wave:?}"),
+                Err(e) => format!("not translated: {e}"),
+            };
+            eprintln!(
+                "WAVE-FORM {} console wave{} group={:?} lds={}: {what}, {declares}",
+                compute_wave::name(),
+                if native.wave64 { 64 } else { 32 },
+                cs.threads,
+                cs.lds_bytes(),
+            );
+        }
+    };
+    if waves && !compute_wave::takes(native.wave64) {
+        // (`VICTORY_COMPUTE_WAVE=pin` or `=forms`: this kind is left as it was)
+        let before = compute_wave::without(|| emit_forms(c, native, p, st, io, res));
+        say("as before (VICTORY_COMPUTE_WAVE leaves its kind)", &before);
+        return before;
+    }
     let sized = emit_forms(c, native, p, st, io, res);
-    if native.stage == HwStage::Cs && native.wave64 && compute_wave_32() {
+    if waves && native.wave64 {
         if let Ok((_, wave)) = &sized
             && *wave != Some(64)
         {
+            say("for host waves of 32", &sized);
             return sized;
         }
         let before = compute_wave::without(|| emit_forms(c, native, p, st, io, res));
         if before.is_ok() || sized.is_err() {
+            say("as before (no exact form for host waves of 32)", &before);
             return before;
         }
+    }
+    if waves {
+        let what = if native.wave64 { "its form for host waves of 32 (it has no other)" } else { "its console wave declared" };
+        say(what, &sized);
     }
     sized
 }
@@ -621,9 +650,10 @@ fn emit_forms(
         let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
         let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
             if why {
+                let name = compute_wave::name();
                 match r {
-                    Ok((_, wave)) => eprintln!("WAVE64-RETRY {what}: wave {wave:?}"),
-                    Err(e) => eprintln!("WAVE64-RETRY {what}: {e}"),
+                    Ok((_, wave)) => eprintln!("WAVE64-RETRY {name} {what}: wave {wave:?}"),
+                    Err(e) => eprintln!("WAVE64-RETRY {name} {what}: {e}"),
                 }
             }
         };

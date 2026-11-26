@@ -858,3 +858,45 @@ fn each_form_declares_its_wave() {
     assert_eq!(declared(SUM64, true, 128, Form::Waves32), Some(32));
     assert_eq!(declared(BRANCH64, true, 128, Form::Waves32), None);
 }
+
+/// `VICTORY_COMPUTE_WAVE=pin` and `=forms` (no device needed): with `pin` the console
+/// wave32 programs declare their wave as with the whole switch and the console wave64
+/// programs are what they were before it; with `forms` the other way round.
+#[test]
+fn the_switch_can_leave_one_kind_of_program_as_before() {
+    let declared = |words: &[u32], wave64: bool, threads: u32, only: Option<bool>| {
+        let was = compute_wave::TEST_ONLY.replace(only);
+        let r = translated(words, wave64, threads, false, Form::Waves32);
+        compute_wave::TEST_ONLY.set(was);
+        r.unwrap_or_else(|e| panic!("{only:?}: {e}")).1
+    };
+    let before = |words: &[u32], wave64: bool, threads: u32| {
+        translated(words, wave64, threads, false, Form::Host64).unwrap_or_else(|e| panic!("{e}")).1
+    };
+    let (pin, forms) = (Some(false), Some(true));
+    // console wave32 programs: without wave operations, and with
+    assert_eq!(before(BRANCH32, false, 64), None);
+    assert_eq!(declared(BRANCH32, false, 64, None), Some(32));
+    assert_eq!(declared(BRANCH32, false, 64, pin), Some(32));
+    assert_eq!(declared(BRANCH32, false, 64, forms), None);
+    for only in [None, pin, forms] {
+        assert_eq!(declared(FIRST32, false, 64, only), Some(32), "{only:?}");
+    }
+    // console wave64 programs
+    for words in [BALLOT64, FIRST64, SUM64] {
+        assert_eq!(before(words, true, 128), Some(64));
+        assert_eq!(declared(words, true, 128, None), Some(32));
+        assert_eq!(declared(words, true, 128, pin), Some(64));
+        assert_eq!(declared(words, true, 128, forms), Some(32));
+    }
+    // ... and the code is the one of before, not only the wave
+    let code = |form: Form, only: Option<bool>| {
+        let was = compute_wave::TEST_ONLY.replace(only);
+        let r = translated(BALLOT64, true, 128, false, form);
+        compute_wave::TEST_ONLY.set(was);
+        r.expect("translated").0.dxil
+    };
+    assert!(code(Form::Waves32, pin) == code(Form::Host64, None));
+    assert!(code(Form::Waves32, forms) == code(Form::Waves32, None));
+    assert!(code(Form::Waves32, forms) != code(Form::Host64, None));
+}

@@ -1990,7 +1990,25 @@ impl<'a> Lower<'a> {
                         }
                     }
                     why.sort_unstable();
-                    eprintln!("WAVE64-WHY group={group} lds={} [{}]", s.lds_dwords > 0, why.join(", "));
+                    let name = super::compute_wave::name();
+                    eprintln!("WAVE64-WHY {name} group={group} lds={} [{}]", s.lds_dwords > 0, why.join(", "));
+                }
+                // ... and which form for host waves of 32 it takes, where it takes one
+                if wave == 32 && super::compute_wave::why() {
+                    eprintln!(
+                        "WAVE64-AS32 {} group={group} lds={}: {}{}{}{}",
+                        super::compute_wave::name(),
+                        cs.lds_bytes() > 0,
+                        match &exchange {
+                            Some(_) if LOCAL_WAVES.get() => "each host wave on its own",
+                            Some((_, true, _)) => "one host wave, nothing to exchange",
+                            Some(_) => "two host waves that exchange",
+                            None => "halves that cross nothing",
+                        },
+                        if split_lds { ", a barrier before each LDS access" } else { "" },
+                        if lds_meet.is_some() { ", LDS in lane branches met at their edges" } else { "" },
+                        if LOCAL_ANY.get() { ", every mask per host wave" } else { "" },
+                    );
                 }
             }
             if wave == 32 && x.native.wave64 {
