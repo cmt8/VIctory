@@ -388,7 +388,9 @@ impl Hub {
         hub.poll();
         std::thread::spawn(move || {
             loop {
-                std::thread::sleep(POLL);
+                // 125 times a second: under Wine without a wineserver
+                // request each (`victory_gpu::quiet_sleep`).
+                victory_gpu::quiet_sleep(POLL.as_millis() as u32);
                 hub.poll();
             }
         });

@@ -97,6 +97,8 @@ mod watch;
 mod texback;
 
 #[cfg(windows)]
+pub use coarse::quiet_sleep;
+#[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
 pub use inplace::{
