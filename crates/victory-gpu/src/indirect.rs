@@ -4,9 +4,18 @@
 //! billion vertices or a dispatch past the host's limits runs until the
 //! host resets the display driver. So active records are copied and clamped
 //! on the GPU into a device-local scratch buffer, just before execution, by a
-//! compute shader of ours (HLSL compiled by the system's compiler; a 5.1
-//! shader with its root signature inside), leaving the title's argument and
-//! count buffers untouched.
+//! compute shader of ours (HLSL compiled by the system's compiler as a 5.1
+//! shader; its root signature is made beside it), leaving the title's
+//! argument and count buffers untouched.
+//!
+//! The sources keep to what Wine's compiler (`D3DCompile` under Wine:
+//! vkd3d-shader's) builds as well as Microsoft's: Wine's gives writable
+//! buffers no methods but `Store*` (no `Load*`, `Interlocked*` only as
+//! functions on a UAV's element), stops at `[allow_uav_condition]` and
+//! ignores `[RootSignature]`. So the budget is a structured buffer of
+//! `uint` (root UAVs can be either kind), the clamped records are written
+//! with `Store*`, and the root signatures are serialized here
+//! (`crate::host::root_of`; `VICTORY_OWN_ROOTS=0`: from the blob).
 //!
 //! The scratch buffer is left readable as indirect arguments after a clamp
 //! and stays so until the next clamp into it, which moves it straight back
@@ -60,7 +69,10 @@ ByteAddressBuffer count_buf : register(t1);
 RWByteAddressBuffer dst_args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
-RWByteAddressBuffer budget : register(u1);
+// In words (Wine's compiler has Interlocked* only as functions, not as
+// methods of a byte address buffer): 0 the list's work, 1 and 2 the mesh
+// diagnostics, 3 and 4 the refused records and the largest cost.
+RWStructuredBuffer<uint> budget : register(u1);
 static const uint BUDGET = 1u << 27;
 // The vertices or indices an instance from which a draw record runs empty.
 static const uint MOST_DRAW = 1u << 23;
@@ -161,8 +173,9 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         // (`rest`).
         // Only the group's own records are walked (one, clamped alone).
         uint before;
-        budget.InterlockedOr(0, 0, before);
-        [allow_uav_condition]
+        InterlockedOr(budget[0], 0, before);
+        // (No [allow_uav_condition]: Wine's compiler stops at it, not yet
+        // implemented, and Microsoft's builds the loop without it.)
         while (before < BUDGET) {
             uint next = before;
             for (uint j = 0; j < n; j++) {
@@ -173,7 +186,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             }
             if (next == before) break;
             uint prev;
-            budget.InterlockedCompareExchange(0, before, next, prev);
+            InterlockedCompareExchange(budget[0], before, next, prev);
             if (prev == before) break;
             before = prev;
         }
@@ -195,17 +208,17 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         // the largest cost there was (small ones are not told).
         uint told;
         if (refused > 0) {
-            budget.InterlockedAdd(12, refused, told);
+            InterlockedAdd(budget[3], refused, told);
         }
         if (biggest >= (1u << 22)) {
-            budget.InterlockedMax(16, biggest, told);
+            InterlockedMax(budget[4], biggest, told);
         }
     }
     GroupMemoryBarrierWithGroupSync();
     if (gi == 0 && kind > 2 && n > 0) {
         uint was;
-        budget.InterlockedMax(4, largest_asked, was);
-        budget.InterlockedAdd(8, all_asked, was);
+        InterlockedMax(budget[1], largest_asked, was);
+        InterlockedAdd(budget[2], all_asked, was);
     }
     if (!active) {
         return;
@@ -303,9 +316,40 @@ fn rest() -> u32 {
     u32::from(std::env::var("VICTORY_INDIRECT_REST").map_or(true, |v| v != "0"))
 }
 
+/// The clamp's root signature, as [`record_clamp_as`] binds it (the
+/// `[RootSignature]` of [`SOURCE`]): the record's six constants at b0, the
+/// source arguments and the count as root SRVs (t0, t1), the clamped
+/// arguments and the budget as root UAVs (u0, u1).
+fn clamp_params() -> [D3D12_ROOT_PARAMETER1; 5] {
+    use crate::host::{root_constants, root_view};
+    [
+        root_constants(0, 6),
+        root_view(D3D12_ROOT_PARAMETER_TYPE_SRV, 0),
+        root_view(D3D12_ROOT_PARAMETER_TYPE_SRV, 1),
+        root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 0),
+        root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 1),
+    ]
+}
+
 /// The clamp compiled from `source` (ours, or in the benchmark the one it
-/// replaced).
+/// replaced), with the clamp's root signature ([`clamp_params`]).
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
+    make_rooted(device, source, &clamp_params(), "argument clamp")
+}
+
+/// The batched clamp ([`batch::SOURCE`]) and its root signature.
+fn make_batch_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
+    make_rooted(device, batch::SOURCE, &batch::params(), "batched argument clamp")
+}
+
+/// `source` compiled with the clamps' settings, and its root signature of
+/// `params` (`crate::host::root_of`: Wine's compiler puts none in the blob).
+fn make_rooted(
+    device: &ID3D12Device,
+    source: &str,
+    params: &[D3D12_ROOT_PARAMETER1],
+    what: &str,
+) -> windows::core::Result<Clamp> {
     let source = &format!("#define WIDEST {}u\n#define REST {}\n{source}", widest(amd(device)), rest());
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
@@ -334,16 +378,16 @@ fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp
                     errors.GetBufferSize(),
                 )
             };
-            tracing::warn!("argument clamp: {}", String::from_utf8_lossy(text));
+            tracing::warn!("{what}: {}", String::from_utf8_lossy(text));
         }
         return Err(e);
     }
     let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
+    // SAFETY: the blob's own bytes.
     unsafe {
         let bytes =
             std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
+        let root = crate::host::root_of(device, bytes, params, what)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE {
@@ -556,7 +600,7 @@ fn batch_clamp() -> Option<&'static Clamp> {
     static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
     CLAMP
         .get_or_init(|| {
-            let made = host().ok_or_else(windows::core::Error::empty).and_then(|h| make_from(&h.device, batch::SOURCE));
+            let made = host().ok_or_else(windows::core::Error::empty).and_then(|h| make_batch_for(&h.device));
             match made {
                 Ok(c) => Some(c),
                 Err(e) => {
@@ -612,7 +656,7 @@ pub(crate) fn open_batch(
 /// replayer.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn batch_for(device: &ID3D12Device) -> windows::core::Result<(ID3D12RootSignature, ID3D12PipelineState)> {
-    make_from(device, batch::SOURCE).map(|c| (c.root, c.pso))
+    make_batch_for(device).map(|c| (c.root, c.pso))
 }
 
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
@@ -637,14 +681,17 @@ pub(crate) mod tests {
     use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
     use windows::core::Interface;
 
+    /// In a form Wine's compiler builds too (`Interlocked*` as functions on
+    /// a structured buffer's word; its root signature made in code,
+    /// [`compile_uav_cs`]).
     const WORKER_CS: &str = r#"
 #define RS "UAV(u0)"
-RWByteAddressBuffer hits : register(u0);
+RWStructuredBuffer<uint> hits : register(u0);
 [RootSignature(RS)]
 [numthreads(1, 1, 1)]
 void main() {
     uint prev;
-    hits.InterlockedAdd(0, 1, prev);
+    InterlockedAdd(hits[0], 1, prev);
 }
 "#;
 
@@ -712,7 +759,7 @@ void main() {
                 let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
                 let event = CreateEventW(None, false, false, None).ok()?;
                 let clamp = make_for(&device).expect("clamp shader must compile on WARP");
-                let worker = compile_cs(&device, WORKER_CS).expect("worker shader must compile");
+                let worker = compile_uav_cs(&device, WORKER_CS).expect("worker shader must compile");
                 Some(Self {
                     device,
                     queue,
@@ -845,6 +892,26 @@ void main() {
                 self.list.Reset(&self.allocator, None).unwrap();
             }
         }
+    }
+
+    /// [`compile_cs`] of a shader whose root signature is one root UAV at
+    /// u0 (`"UAV(u0)"`), made in code (`crate::host::root_of`).
+    fn compile_uav_cs(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
+        let params = [crate::host::root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 0)];
+        let code = crate::host::compile(source, s!("main"), s!("cs_5_1"))?;
+        let root = crate::host::root_of(device, &code, &params, "test worker")?;
+        // SAFETY: the compiled bytes and our root signature.
+        let pso = unsafe {
+            device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: code.as_ptr().cast(),
+                    BytecodeLength: code.len(),
+                },
+                ..Default::default()
+            })?
+        };
+        Ok(Clamp { root, pso })
     }
 
     fn compile_cs(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
@@ -2673,7 +2740,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             return;
         };
         let _ = host.log_messages();
-        let worker = compile_cs(&host.device, WORKER_CS).expect("worker shader must compile");
+        let worker = compile_uav_cs(&host.device, WORKER_CS).expect("worker shader must compile");
         const KIND_DISPATCH: u32 = 2;
         const STRIDE: u32 = 12;
         let signature = {
@@ -2859,7 +2926,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         let Ok(list) = host.new_list() else {
             return;
         };
-        let worker = compile_cs(&host.device, WORKER_CS).expect("worker shader must compile");
+        let worker = compile_uav_cs(&host.device, WORKER_CS).expect("worker shader must compile");
         const KIND_DISPATCH: u32 = 2;
         const STRIDE: u32 = 12;
         const STEP: u32 = 32;
@@ -2965,15 +3032,15 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
     fn card_runs_wide_indirect_dispatches() {
         const CS: &str = r#"
 #define RS "UAV(u0)"
-RWByteAddressBuffer seen : register(u0);
+RWStructuredBuffer<uint> seen : register(u0);
 [RootSignature(RS)]
 [numthreads(1, 1, 1)]
 void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
     uint was;
-    seen.InterlockedAdd(0, 1, was);
-    seen.InterlockedMax(4, group.x, was);
-    seen.InterlockedMax(8, thread.x, was);
-    seen.InterlockedAdd(16 + group.x * 4, 1, was);
+    InterlockedAdd(seen[0], 1, was);
+    InterlockedMax(seen[1], group.x, was);
+    InterlockedMax(seen[2], thread.x, was);
+    InterlockedAdd(seen[4 + group.x], 1, was);
 }
 "#;
         let Some(mut gpu) = WarpHarness::on(false) else {
@@ -2982,8 +3049,8 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
         if !amd(&gpu.device) || widest(true) == 65_535 {
             return;
         }
-        let worker = compile_cs(&gpu.device, CS).expect("the worker must compile");
-        let pass = make_from(&gpu.device, batch::SOURCE).expect("the batched clamp must compile");
+        let worker = compile_uav_cs(&gpu.device, CS).expect("the worker must compile");
+        let pass = make_batch_for(&gpu.device).expect("the batched clamp must compile");
         let sig = gpu.signature(2, 12);
         for asked in [67_440u32, 115_200, 1 << 20, (1 << 20) + 1] {
             let runs = if asked > 1 << 20 { 65_535 } else { asked };
@@ -3071,7 +3138,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
-        let pass = make_from(&warp.device, batch::SOURCE).expect("the batched clamp must compile on WARP");
+        let pass = make_batch_for(&warp.device).expect("the batched clamp must compile on WARP");
         let kinds = [0u32, 1, 2, 10];
         let values = [0u32, 1, 3, 100, 65_535, 65_536, 1 << 20, (1 << 23) - 1, 1 << 23, 1 << 24, (1 << 26) + 1, u32::MAX];
         // Every kind with many records, in two sources.
@@ -3152,7 +3219,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
-        let pass = make_from(&warp.device, batch::SOURCE).expect("the batched clamp must compile on WARP");
+        let pass = make_batch_for(&warp.device).expect("the batched clamp must compile on WARP");
         const BUDGET: u32 = 1 << 27;
         // 2^26 vertices each, as much as a draw is let run: two fill it.
         for (times, records, filled) in [(1u32, 3u64, 2usize), (2, 1, 1), (1, 1, 1), (3, 1, 0)] {
@@ -3210,7 +3277,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
         let Ok(list) = host.new_list() else {
             return;
         };
-        let worker = compile_cs(&host.device, WORKER_CS).expect("worker shader must compile");
+        let worker = compile_uav_cs(&host.device, WORKER_CS).expect("worker shader must compile");
         let signature = one_argument(&host.device, 2, 12);
         let mut sources = Vec::new();
         for first in [1u32, 100] {
@@ -3272,7 +3339,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
             return;
         };
         const EXECUTIONS: u32 = 2355;
-        let pass = make_from(&gpu.device, batch::SOURCE).expect("the batched clamp must compile");
+        let pass = make_batch_for(&gpu.device).expect("the batched clamp must compile");
         let sig = gpu.signature(2, 12);
         let groups: Vec<u32> = vec![1; 2048];
         let src = dispatch_records(&gpu, &groups, 32);

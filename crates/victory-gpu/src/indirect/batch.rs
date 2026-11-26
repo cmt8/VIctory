@@ -40,7 +40,10 @@ ByteAddressBuffer src3 : register(t3);
 // record's offset in the source; its place in the scratch buffer; nothing.
 ByteAddressBuffer jobs : register(t4);
 RWByteAddressBuffer dst_args : register(u0);
-RWByteAddressBuffer budget : register(u1);
+// In words (Wine's compiler has Interlocked* only as functions, not as
+// methods of a byte address buffer): 0 the list's work, 1 and 2 the mesh
+// diagnostics, 3 and 4 the refused records and the largest cost.
+RWStructuredBuffer<uint> budget : register(u1);
 static const uint BUDGET = 1u << 27;
 static const uint GROUPS = 1u << 20;
 groupshared uint costs[64];
@@ -117,8 +120,9 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     uint n = count > first ? min(64u, count - first) : 0u;
     if (gi == 0 && n > 0) {
         uint before;
-        budget.InterlockedOr(0, 0, before);
-        [allow_uav_condition]
+        InterlockedOr(budget[0], 0, before);
+        // (No [allow_uav_condition]: Wine's compiler stops at it, not yet
+        // implemented, and Microsoft's builds the loop without it.)
         while (before < BUDGET) {
             uint next = before;
             for (uint j = 0; j < n; j++) {
@@ -129,7 +133,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             }
             if (next == before) break;
             uint prev;
-            budget.InterlockedCompareExchange(0, before, next, prev);
+            InterlockedCompareExchange(budget[0], before, next, prev);
             if (prev == before) break;
             before = prev;
         }
@@ -151,17 +155,17 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         // the largest cost there was (small ones are not told).
         uint told;
         if (refused > 0) {
-            budget.InterlockedAdd(12, refused, told);
+            InterlockedAdd(budget[3], refused, told);
         }
         if (biggest >= (1u << 22)) {
-            budget.InterlockedMax(16, biggest, told);
+            InterlockedMax(budget[4], biggest, told);
         }
     }
     GroupMemoryBarrierWithGroupSync();
     if (gi == 0 && n > 0 && all_asked > 0) {
         uint was;
-        budget.InterlockedMax(4, largest_asked, was);
-        budget.InterlockedAdd(8, all_asked, was);
+        InterlockedMax(budget[1], largest_asked, was);
+        InterlockedAdd(budget[2], all_asked, was);
     }
     if (!active) {
         return;
@@ -178,6 +182,16 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     }
 }
 "#;
+
+/// The pass's root signature, as [`record`] binds it (the `[RootSignature]`
+/// of [`SOURCE`]): the sources and the table of jobs as root SRVs (t0-t4),
+/// the clamped records and the budget as root UAVs (u0, u1).
+pub(super) fn params() -> [D3D12_ROOT_PARAMETER1; SOURCES + 3] {
+    use crate::host::root_view;
+    let srv = |register| root_view(D3D12_ROOT_PARAMETER_TYPE_SRV, register);
+    let uav = |register| root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, register);
+    [srv(0), srv(1), srv(2), srv(3), srv(4), uav(0), uav(1)]
+}
 
 /// The words of a record of `kind` (PC argument numbering).
 pub(crate) fn words(kind: u32) -> Option<u32> {

@@ -1824,6 +1824,62 @@ pub(crate) fn root_view(kind: D3D12_ROOT_PARAMETER_TYPE, register: u32) -> D3D12
     }
 }
 
+/// One range of `count` descriptors (`kind`) from `t`/`u`/`b<register>`,
+/// with a root signature string's defaults (appended, no flags: in version
+/// 1.1 static descriptors, data static while set for views read, volatile
+/// for views written).
+pub(crate) fn root_range(kind: D3D12_DESCRIPTOR_RANGE_TYPE, register: u32, count: u32) -> D3D12_DESCRIPTOR_RANGE1 {
+    D3D12_DESCRIPTOR_RANGE1 {
+        RangeType: kind,
+        NumDescriptors: count,
+        BaseShaderRegister: register,
+        RegisterSpace: 0,
+        Flags: D3D12_DESCRIPTOR_RANGE_FLAG_NONE,
+        OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
+    }
+}
+
+/// A descriptor table of `ranges`, which must live until the root signature
+/// is made ([`root_signature`]).
+pub(crate) fn root_table(ranges: &[D3D12_DESCRIPTOR_RANGE1]) -> D3D12_ROOT_PARAMETER1 {
+    D3D12_ROOT_PARAMETER1 {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+            DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                NumDescriptorRanges: ranges.len() as u32,
+                pDescriptorRanges: ranges.as_ptr(),
+            },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    }
+}
+
+/// Whether the root signatures of our own shaders are made in code
+/// ([`root_signature`]) rather than taken from their blobs
+/// (`VICTORY_OWN_ROOTS=0`: from the blob, as before). Microsoft's compiler
+/// puts a `[RootSignature]` into the blob; Wine's, which is `D3DCompile`
+/// under Wine, ignores the attribute (`W5302`), so there is none to take.
+pub(crate) fn own_roots() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_OWN_ROOTS").is_none_or(|v| v != "0"))
+}
+
+/// The root signature of a shader of ours compiled to `code`: made of
+/// `params` ([`own_roots`]), or the one its blob carries.
+pub(crate) fn root_of(
+    device: &ID3D12Device,
+    code: &[u8],
+    params: &[D3D12_ROOT_PARAMETER1],
+    what: &str,
+) -> windows::core::Result<ID3D12RootSignature> {
+    if own_roots() {
+        root_signature(device, params, what)
+    } else {
+        // SAFETY: a compiled shader's bytes.
+        unsafe { device.CreateRootSignature(0, code) }
+    }
+}
+
 impl PlanePass {
     /// The root signature and pipeline for a twin of 16-bit steps (`steps`)
     /// or of floats and the depth format `format`.
