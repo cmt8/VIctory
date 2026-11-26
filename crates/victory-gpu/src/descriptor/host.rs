@@ -232,6 +232,87 @@ pub(crate) struct HostHeap {
     /// another's view made stale stays, which says only "may"): a write of
     /// any other view needs nothing of `placed` ([`spans_quick`]).
     spanned: Slots,
+    /// Title slots whose write waits for submissions on the card: a slot
+    /// made null while one that may read it is there
+    /// ([`defer_slot_clears`]), and with `VICTORY_DEFER_SLOT_CLEARS=2` one
+    /// made from another view then. One entry a slot; the newest request
+    /// wins ([`HostHeap::hold`]). Locked inside a slot's lock ([`Made`]),
+    /// never around one.
+    deferred: Mutex<std::collections::BTreeMap<u32, Held>>,
+    /// How many entries `deferred` has (changed under its lock): a write
+    /// of a slot asks it only when there are any.
+    held: std::sync::atomic::AtomicU32,
+    /// Tests: submissions begun (with those queued) and finished, and the
+    /// `VICTORY_DEFER_SLOT_CLEARS` mode, in place of the process's
+    /// ([`HostHeap::card`]).
+    #[cfg(test)]
+    card: Mutex<Option<(u64, u64, u8)>>,
+}
+
+/// A write of a title slot held back from the live heap
+/// ([`HostHeap::deferred`]).
+#[derive(Clone, Copy, Debug, Default)]
+struct Held {
+    /// Due once the submissions finished are this many or more.
+    after: u64,
+    /// The slot is made again from the title's record (whatever it holds
+    /// by then); newer than `clear` when both are there.
+    mirror: Option<Remirror>,
+    /// The slot is made null, unless something was made in it since: the
+    /// null view, and what `made` held for the slot when it was asked for.
+    clear: Option<(Null, u64)>,
+}
+
+/// [`Held::mirror`]: the title's descriptor, and as for
+/// [`HostHeap::mirror_in`] whether for a draw and needed before the next
+/// submission; `replace`: held back because the slot showed another view
+/// (`VICTORY_DEFER_SLOT_CLEARS=2`), not for a new host resource.
+#[derive(Clone, Copy, Debug)]
+struct Remirror {
+    handle: u64,
+    for_draw: bool,
+    required: bool,
+    replace: bool,
+}
+
+/// What [`HostHeap::hold`] holds back.
+enum Pending {
+    Mirror(Remirror),
+    Clear(Null, u64),
+}
+
+/// Of title slots that showed a host resource and would have been made
+/// null (or, with `VICTORY_DEFER_SLOT_CLEARS=2`, from another view) while
+/// a submission that may read them was on the card, since the last frame
+/// start: `[clears held back, replacements held back, clears published,
+/// replacements published]`.
+pub(crate) static HELD_CLEARS: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// What waits for the submissions on the card before it touches a title
+/// slot that shows a host resource (`VICTORY_DEFER_SLOT_CLEARS`): 0
+/// nothing (written at once, as before), 1 (the default) making it null, 2
+/// that and making it from another view in [`HostHeap::mirror`] (not the
+/// neutral texture of [`show_new_later`], nor a view shown after its
+/// upload: [`HostHeap::texture_slots_flip`]).
+///
+/// vkd3d-proton writes a slot as a plain copy into the mapped heap
+/// (2576c0b4: `d3d12_desc_create_cbv_heap` builds the descriptor on the
+/// stack and copies it; `CopyDescriptorsSimple`, by which this tree puts a
+/// descriptor made beside the heap into it ([`staged`]), is a copy of the
+/// slot's bytes too), so a shader running then may read half the old
+/// descriptor and half the new: a buffer whose address is already 0 and
+/// whose size is not yet (fork run b6: a scalar read of GPU address 0 at
+/// the gameplay scene's teardown, a ring reset on RADV). And a list sent
+/// before the title cleared the slot may read it by rights.
+/// (After the fork's ba28ff617.)
+pub(crate) fn defer_slot_clears() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_DEFER_SLOT_CLEARS").as_deref() {
+        Ok("0") => 0,
+        Ok("2") => 2,
+        _ => 1,
+    })
 }
 
 /// Whether a slot's write of no placed texture view leaves `placed` alone
@@ -1772,6 +1853,10 @@ impl HostHeap {
                 spans
             },
             spanned: Slots::new((count + extra) as usize),
+            deferred: Mutex::default(),
+            held: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(test)]
+            card: Mutex::new(None),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -2534,13 +2619,193 @@ impl HostHeap {
         if key == 0 {
             return;
         }
-        match view_at(key as u32, (key >> 32) as u32) {
-            Some(view) => null_for(&view, self.at(index)),
-            None => null_view(self.at(index)),
+        let null = view_at(key as u32, (key >> 32) as u32).map_or(Null::Plain, |view| Null::of(&view));
+        self.clear(index, null);
+    }
+
+    /// Makes title slot `index` read nothing (`null`), under its lock
+    /// ([`Made`]); what `made` holds for it from now on is set already. A
+    /// slot that shows a host resource while a submission that may read it
+    /// is on the card (or sent by the title and not begun) goes on showing
+    /// it, its raw twin too, and holding the resource, until those have
+    /// finished: the null is written by the first
+    /// [`HostHeap::flush_deferred`] after, unless the slot was written
+    /// since ([`defer_slot_clears`]). Never needed before a submission: a
+    /// slot goes null because what it showed went or was replaced, and
+    /// nothing should read it then.
+    fn clear(&self, index: u32, null: Null) {
+        if !self.sampler && index < self.count && self.showing(index) {
+            let (started, finished, mode) = self.card();
+            if mode >= 1 && finished < started {
+                let made_now = self.made.get(index).unwrap_or(0);
+                self.hold(index, started, Pending::Clear(null, made_now));
+                HELD_CLEARS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
         }
+        self.write_null(index, null);
+    }
+
+    /// Writes `null` into host slot `index` now; its raw twin is a null
+    /// view too, and the slot holds nothing.
+    fn write_null(&self, index: u32, null: Null) {
+        null.write(self.at(index));
         self.put(index);
         self.clear_twin(index);
         self.keep(index, None);
+    }
+
+    /// Whether host slot `index` shows a host resource (it holds one).
+    fn showing(&self, index: u32) -> bool {
+        self.kept
+            .get(index as usize)
+            .is_some_and(|slot| slot.lock().unwrap_or_else(|e| e.into_inner()).is_some())
+    }
+
+    /// Submissions that may read a slot written now (those begun, and
+    /// those the title sent that the host has not begun:
+    /// `crate::queue::queued`, as `crate::host::retire_resource` counts
+    /// them), those finished (read first: one that starts and finishes
+    /// between the two reads counts as on the card), and the
+    /// `VICTORY_DEFER_SLOT_CLEARS` mode.
+    fn card(&self) -> (u64, u64, u8) {
+        #[cfg(test)]
+        if let Some(card) = *self.card.lock().unwrap_or_else(|e| e.into_inner()) {
+            return card;
+        }
+        let finished = crate::host::submissions().1;
+        let queued = crate::queue::queued();
+        (crate::host::submissions().0 + queued, finished, defer_slot_clears())
+    }
+
+    /// Holds back a write of title slot `index` until the submissions
+    /// finished reach `after`; under the slot's lock. The newest request
+    /// wins: a clear drops a remirror held before it; a remirror after a
+    /// clear keeps the clear, to be written if the remirror makes nothing
+    /// in the slot.
+    fn hold(&self, index: u32, after: u64, what: Pending) {
+        let mut held = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = held.entry(index).or_default();
+        entry.after = entry.after.max(after);
+        match what {
+            Pending::Clear(null, made) => {
+                entry.mirror = None;
+                entry.clear = Some((null, made));
+            }
+            Pending::Mirror(new) => {
+                entry.mirror = Some(match entry.mirror {
+                    Some(old) => Remirror {
+                        handle: new.handle,
+                        for_draw: old.for_draw | new.for_draw,
+                        required: old.required | new.required,
+                        replace: old.replace | new.replace,
+                    },
+                    None => new,
+                });
+            }
+        }
+        self.held.store(held.len() as u32, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether a remirror of title slot `index` is held back.
+    fn held_mirror(&self, index: u32) -> Option<Remirror> {
+        if self.held.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            return None;
+        }
+        self.deferred.lock().unwrap_or_else(|e| e.into_inner()).get(&index).and_then(|held| held.mirror)
+    }
+
+    /// Title slot `index` was written now, under its lock: a clear held
+    /// back for it is older than what it shows, and is dropped. (A
+    /// remirror held back stays: it makes the slot from what the title's
+    /// record holds then, which is what a write since made it from, or
+    /// newer.)
+    fn written_now(&self, index: u32) {
+        if index >= self.count || self.held.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            return;
+        }
+        let mut held = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(held) = held.get_mut(&index) {
+            held.clear = None;
+        }
+    }
+
+    /// Whether any held-back title-slot view is needed by a draw before
+    /// the next submission runs (a view a draw reads in the title's own
+    /// slot).
+    pub(crate) fn has_required_deferred(&self, finished: u64) -> bool {
+        if self.held.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            return false;
+        }
+        let held = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+        held.values().any(|held| held.after > finished && held.mirror.is_some_and(|m| m.required))
+    }
+
+    /// Publishes the held-back writes of title slots whose `after <=
+    /// finished`, in the order asked for: a remirror (made from what the
+    /// title's record holds now), then a clear held before it if the
+    /// remirror made nothing in the slot. Each under its slot's lock, taken
+    /// before the entry is: a write of the slot in between drops the entry
+    /// ([`HostHeap::written_now`]). Returns how many slots it published.
+    ///
+    /// Locks: a slot's lock, then that of the held-back writes, never the
+    /// other way; one slot's lock at a time.
+    pub(crate) fn flush_deferred(&self, finished: u64) -> usize {
+        use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+        if self.held.load(Acquire) == 0 {
+            return 0;
+        }
+        let due: Vec<u32> = {
+            let held = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+            held.iter().filter(|(_, h)| h.after <= finished).map(|(&index, _)| index).collect()
+        };
+        let mut published = 0;
+        for index in due {
+            let slot = self.made.lock(index);
+            let taken = {
+                let mut held = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+                let taken = match held.get(&index) {
+                    Some(h) if h.after <= finished => held.remove(&index),
+                    _ => None,
+                };
+                self.held.store(held.len() as u32, Release);
+                taken
+            };
+            let Some(held) = taken else {
+                continue;
+            };
+            published += 1;
+            let slot = match held.mirror {
+                Some(m) => {
+                    // (`mirror_in` takes the slot's lock itself.)
+                    drop(slot);
+                    self.mirror_in(index, m.handle, m.for_draw, m.required, true);
+                    HELD_CLEARS[3].fetch_add(1, Relaxed);
+                    self.made.lock(index)
+                }
+                None => slot,
+            };
+            let Some((null, was)) = held.clear else {
+                continue;
+            };
+            if self.made.get(index) != Some(was) {
+                // Made since: the newer write stands.
+                continue;
+            }
+            {
+                // The remirror was held back again, or the slot was cleared
+                // again meanwhile: the clear waits with that.
+                let mut again = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(again) = again.get_mut(&index) {
+                    again.clear.get_or_insert((null, was));
+                    continue;
+                }
+            }
+            self.write_null(index, null);
+            HELD_CLEARS[2].fetch_add(1, Relaxed);
+            drop(slot);
+        }
+        published
     }
 
     /// The slots [`HostHeap::note_buffer`] found stale for slot `index`, with
@@ -3152,6 +3417,7 @@ impl HostHeap {
     /// `index`.
     fn put(&self, index: u32) {
         self.copy_to(index, 0);
+        self.written_now(index);
     }
 
     /// The raw twin this thread made last goes to that of slot `index`.
@@ -3257,6 +3523,19 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        self.mirror_in(index, handle, for_draw, false, false)
+    }
+
+    /// [`HostHeap::mirror`] for a draw that reads the slot in place through
+    /// a table: a view held back for it is needed before the next
+    /// submission runs ([`HostHeap::has_required_deferred`]).
+    pub(crate) fn mirror_required(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        self.mirror_in(index, handle, for_draw, true, false)
+    }
+
+    /// [`HostHeap::mirror`]; `publishing`: from [`HostHeap::flush_deferred`],
+    /// what was held back is written now.
+    fn mirror_in(&self, index: u32, handle: u64, for_draw: bool, required: bool, publishing: bool) -> Option<View> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -3295,7 +3574,11 @@ impl HostHeap {
             if shown != 0 {
                 self.quick_is(index, 0);
                 self.made.set(index, 0);
-                self.make_null(index);
+                if self.sampler {
+                    self.make_null(index);
+                } else {
+                    self.clear(index, Null::Plain);
+                }
                 let _ = self.note_buffer(index, None, false);
             } else if for_draw {
                 // Left for later and stale since: out of the sets and the stride table.
@@ -3357,7 +3640,7 @@ impl HostHeap {
                 && !self.sampler
                 && show_new_later()
                 && is_texture_view(&view)
-                && let Some(after) = begun_before(&view)
+                && let Some(after) = begun_before(&view).filter(|&after| self.on_card(after))
             {
                 // Asked again (each draw that reads the slot, each pass)
                 // while it waits: nothing more to do.
@@ -3390,6 +3673,28 @@ impl HostHeap {
                 self.unmake_stale(index, stale);
                 return Some(view);
             }
+            // `VICTORY_DEFER_SLOT_CLEARS=2`: a replacement of what the slot
+            // shows waits too, as a clear does ([`HostHeap::clear`]).
+            if !publishing && !later && !self.sampler && self.showing(index) {
+                let (started, finished, mode) = self.card();
+                if mode >= 2 && finished < started {
+                    let ask = Remirror { handle, for_draw, required, replace: true };
+                    match self.held_mirror(index) {
+                        // (Asked again while it waits: no later for that.)
+                        Some(old) if old.handle == handle => {
+                            let after = self.deferred.lock().unwrap_or_else(|e| e.into_inner()).get(&index).map_or(0, |h| h.after);
+                            self.hold(index, after, Pending::Mirror(ask));
+                        }
+                        _ => {
+                            self.hold(index, started, Pending::Mirror(ask));
+                            HELD_CLEARS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    drop(held);
+                    self.unmake_stale(index, stale);
+                    return Some(view);
+                }
+            }
             #[cfg(feature = "diagnostics")]
             if !self.sampler && is_texture_view(&view) {
                 note_before(index, shown, if later { "null, waits" } else { "at once" });
@@ -3401,19 +3706,37 @@ impl HostHeap {
             } else {
                 make_twinned(&view, self.at(index), self.twin(index))
             };
-            if kept.is_none() && !self.sampler {
-                null_for(&view, self.at(index));
+            match kept {
+                Some(kept) => {
+                    self.put(index);
+                    self.twin_made(index, twinned(&view));
+                    self.keep(index, kept);
+                }
+                // (A sampler the host cannot make: the slot as it was.)
+                None if self.sampler => {
+                    self.twin_made(index, false);
+                    self.keep(index, None);
+                }
+                // Null of the view's kind: when nothing sent may still read
+                // what the slot shows ([`HostHeap::clear`]).
+                None => self.clear(index, Null::of(&view)),
             }
-            if kept.is_some() || !self.sampler {
-                self.put(index);
-            }
-            self.twin_made(index, kept.is_some() && twinned(&view));
-            self.keep(index, kept.flatten());
             self.quick_is(index, if later { 0 } else { key });
             drop(held);
             self.unmake_stale(index, stale);
         }
         Some(view)
+    }
+
+    /// Whether submission `after` may still be on the card (tests: by the
+    /// card they set, [`HostHeap::card`]).
+    fn on_card(&self, after: u64) -> bool {
+        #[cfg(test)]
+        if let Some((_, finished, _)) = *self.card.lock().unwrap_or_else(|e| e.into_inner()) {
+            return after > finished;
+        }
+        let _ = after;
+        true
     }
 
     /// Whether slot `index` was made from no record: what [`HostHeap::mirror`]
@@ -4935,54 +5258,83 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
 /// cannot make: unordered access (to a buffer or a 2D texture) or a shader
 /// view. Writes to it are dropped, reads give zeros.
 fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
-    let Some(host) = host() else { return };
-    let is_buffer = |r: &usize| crate::resource::buffer_bytes(*r as crate::object::This).is_some();
-    // Unordered views: whether a buffer, and the title's view dimension.
-    let (buffer, dimension) = match view {
-        View::Unordered(r, _, desc) => (
-            is_buffer(r) || desc.is_some_and(|d| d[1] == 1),
-            desc.map(|d| d[1]),
-        ),
-        View::Placed(true, resource, desc) => (resource[0] == 1, Some(desc[1])),
-        // Shader views of buffers read nothing through a null buffer view:
-        // a null 2D view where the shader expects a buffer is a mismatch
-        // the hardware does not survive in general (GPU-based validation
-        // reports it).
-        View::Shader(r, desc) if is_buffer(r) || desc.is_some_and(|d| d[1] == 1) => {
-            return null_buffer_view(at);
+    Null::of(view).write(at);
+}
+
+/// The null view [`null_for`] writes for a view, told while the view is
+/// there to look at: a clear held back ([`HostHeap::clear`]) is written
+/// after the title may have released what the view named.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Null {
+    /// [`null_view`]: a 2D texture view.
+    Plain,
+    /// [`null_buffer_view`].
+    Buffer,
+    /// A constant buffer view at address 0.
+    Constant,
+    /// [`null_like`]: a texture view of the title's dimension.
+    Like([u32; 10]),
+    /// An unordered view: of a buffer or not, and the title's view
+    /// dimension.
+    Unordered(bool, Option<u32>),
+}
+
+impl Null {
+    fn of(view: &View) -> Null {
+        let is_buffer = |r: &usize| crate::resource::buffer_bytes(*r as crate::object::This).is_some();
+        match view {
+            View::Unordered(r, _, desc) => Null::Unordered(
+                is_buffer(r) || desc.is_some_and(|d| d[1] == 1),
+                desc.map(|d| d[1]),
+            ),
+            View::Placed(true, resource, desc) => Null::Unordered(resource[0] == 1, Some(desc[1])),
+            // Shader views of buffers read nothing through a null buffer
+            // view: a null 2D view where the shader expects a buffer is a
+            // mismatch the hardware does not survive in general (GPU-based
+            // validation reports it).
+            View::Shader(r, desc) if is_buffer(r) || desc.is_some_and(|d| d[1] == 1) => Null::Buffer,
+            View::Placed(false, resource, _) if resource[0] == 1 => Null::Buffer,
+            // Textures: a null view of the title's dimension (1D, arrays,
+            // 3D, cubes), not always 2D.
+            View::Shader(_, Some(desc)) => Null::Like(*desc),
+            View::Placed(false, _, desc) => Null::Like(desc[..10].try_into().unwrap_or([0; 10])),
+            View::Constant(..) => Null::Constant,
+            _ => Null::Plain,
         }
-        View::Placed(false, resource, _) if resource[0] == 1 => return null_buffer_view(at),
-        // Textures: a null view of the title's dimension (1D, arrays, 3D,
-        // cubes), not always 2D.
-        View::Shader(_, Some(desc)) => return null_like(desc, at),
-        View::Placed(false, _, desc) => {
-            return null_like(desc[..10].try_into().unwrap_or(&[0; 10]), at);
-        }
-        View::Constant(..) => {
-            let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
-            // SAFETY: a slot of our heap; a zero location makes a null view.
-            return unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
-        }
-        _ => return null_view(at),
-    };
-    let desc = if buffer {
-        D3D12_UNORDERED_ACCESS_VIEW_DESC {
-            Format: DXGI_FORMAT_R32_UINT,
-            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
-            ..Default::default()
-        }
-    } else {
-        null_uav_desc(dimension)
-    };
-    // SAFETY: a slot of our heap; a null resource is allowed with a desc.
-    unsafe {
-        host.device.CreateUnorderedAccessView(
-            None::<&ID3D12Resource>,
-            None::<&ID3D12Resource>,
-            Some(&desc),
-            at,
-        )
-    };
+    }
+
+    fn write(self, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+        let Some(host) = host() else { return };
+        let (buffer, dimension) = match self {
+            Null::Unordered(buffer, dimension) => (buffer, dimension),
+            Null::Buffer => return null_buffer_view(at),
+            Null::Like(desc) => return null_like(&desc, at),
+            Null::Constant => {
+                let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
+                // SAFETY: a slot of our heap; a zero location makes a null view.
+                return unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
+            }
+            Null::Plain => return null_view(at),
+        };
+        let desc = if buffer {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_UINT,
+                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                ..Default::default()
+            }
+        } else {
+            null_uav_desc(dimension)
+        };
+        // SAFETY: a slot of our heap; a null resource is allowed with a desc.
+        unsafe {
+            host.device.CreateUnorderedAccessView(
+                None::<&ID3D12Resource>,
+                None::<&ID3D12Resource>,
+                Some(&desc),
+                at,
+            )
+        };
+    }
 }
 
 /// A null texture UAV of the title's view dimension (1D, 1D or 2D arrays,
@@ -5116,6 +5468,194 @@ mod tests {
         // SAFETY: live heap query.
         assert_eq!(unsafe { full.heap.GetDesc().NumDescriptors }, 2048);
         assert_eq!(full.count, 2047);
+    }
+
+    /// Submissions the held-back tests say started and finished: far past
+    /// any this process makes, so that host copies made now are older.
+    const ON_CARD: u64 = 1 << 40;
+
+    /// A view of a 64x64 BC7 texture placed in `bytes`, and the title's
+    /// record of it.
+    fn placed_record(bytes: &'static [u8; 65536]) -> (View, [u32; 3]) {
+        placed_record_wide(bytes, 64)
+    }
+
+    /// The same of a texture `width` wide: of another shape than one 64
+    /// wide, which a slot does not go on showing in its place
+    /// ([`keep_shown`]).
+    fn placed_record_wide(bytes: &'static [u8; 65536], width: u32) -> (View, [u32; 3]) {
+        let address = bytes.as_ptr() as u64;
+        let resource = [3, 0, 0, 0, width, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0];
+        let mut srv = [0; 16];
+        srv[..6].copy_from_slice(&[98, 4, 5768, 0, 0, 1]);
+        (srv[10], srv[11]) = (address as u32, (address >> 32) as u32);
+        let view = View::Placed(false, resource, srv);
+        let record = record_of(&view);
+        (view, record)
+    }
+
+    /// The title's record of `view` (the same words while the view is in
+    /// use).
+    fn record_of(view: &View) -> [u32; 3] {
+        let [entry, generation] = super::super::words_for(view.clone());
+        [super::super::VIEW_TAG, entry, generation]
+    }
+
+    /// A title descriptor holding `record`: its handle (left to the test
+    /// process, as title memory is).
+    fn descriptor(record: [u32; 3]) -> u64 {
+        Box::into_raw(Box::new(record)) as u64
+    }
+
+    /// The title rewrites its descriptor at `handle` with `record`.
+    fn rewrite(handle: u64, record: [u32; 3]) {
+        // SAFETY: a record of [`descriptor`]'s, nothing borrows it.
+        unsafe { (handle as *mut [u32; 3]).write(record) };
+    }
+
+    fn set_card(heap: &HostHeap, started: u64, finished: u64, mode: u8) {
+        *heap.card.lock().unwrap() = Some((started, finished, mode));
+    }
+
+    /// The host resource host slot `index` holds.
+    fn shown(heap: &HostHeap, index: u32) -> Option<usize> {
+        heap.kept_in(index).as_ref().map(|r| windows::core::Interface::as_raw(r) as usize)
+    }
+
+    /// A slot made null while a submission that may read it is on the card
+    /// goes on showing (and holding) its host resource until that
+    /// submission has finished; the null is published at the first flush
+    /// after, never before.
+    #[test]
+    fn a_slot_made_null_under_a_running_submission_waits_for_it() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        static BYTES: [u8; 65536] = [0; 65536];
+        let (view, record) = placed_record(&BYTES);
+        let handle = descriptor(record);
+        set_card(&heap, ON_CARD, ON_CARD, 1);
+        assert_eq!(heap.mirror(1, handle, true), Some(view.clone()));
+        let before = shown(&heap, 1);
+        assert!(before.is_some(), "made");
+        // Submission ON_CARD + 1 runs; the title releases what the slot showed.
+        set_card(&heap, ON_CARD + 1, ON_CARD, 1);
+        rewrite(handle, [0; 3]);
+        assert_eq!(heap.mirror(1, handle, false), None);
+        assert!(!heap.made(1), "null as far as the next write is concerned");
+        assert_eq!(shown(&heap, 1), before, "still shown, and held");
+        // Asked again (a draw's table): held once.
+        assert_eq!(heap.mirror(1, handle, true), None);
+        assert_eq!(heap.deferred.lock().unwrap().len(), 1);
+        assert!(!heap.has_required_deferred(ON_CARD), "a clear never waits for a settle");
+        // Not before the submission that ran has finished.
+        assert_eq!(heap.flush_deferred(ON_CARD), 0);
+        assert_eq!(shown(&heap, 1), before);
+        assert_eq!(heap.flush_deferred(ON_CARD + 1), 1);
+        assert_eq!(shown(&heap, 1), None, "published, the resource let go");
+        assert!(heap.deferred.lock().unwrap().is_empty());
+        assert_eq!(super::device_removed(), None);
+        // With nothing on the card a clear is written at once.
+        rewrite(handle, record);
+        assert_eq!(heap.mirror(1, handle, true), Some(view));
+        set_card(&heap, ON_CARD + 1, ON_CARD + 1, 1);
+        rewrite(handle, [0; 3]);
+        assert_eq!(heap.mirror(1, handle, false), None);
+        assert_eq!(shown(&heap, 1), None);
+        assert!(heap.deferred.lock().unwrap().is_empty());
+        // `VICTORY_DEFER_SLOT_CLEARS=0`: at once whatever runs, as before.
+        rewrite(handle, record);
+        assert!(heap.mirror(1, handle, true).is_some());
+        set_card(&heap, ON_CARD + 2, ON_CARD + 1, 0);
+        rewrite(handle, [0; 3]);
+        assert_eq!(heap.mirror(1, handle, false), None);
+        assert_eq!(shown(&heap, 1), None);
+        assert!(heap.deferred.lock().unwrap().is_empty());
+    }
+
+    /// A clear held back and then a make of the slot: the make stands,
+    /// whether it is written at once (`VICTORY_DEFER_SLOT_CLEARS=1`) or
+    /// held back too (`=2`, needed by a draw: a settle is asked for).
+    #[test]
+    fn a_held_clear_then_a_make_ends_as_the_make() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        static OLD: [u8; 65536] = [0; 65536];
+        static NEW: [u8; 65536] = [1; 65536];
+        let (old, record) = placed_record(&OLD);
+        // (Of another shape: the slot is not left showing the old one.)
+        let (new, new_record) = placed_record_wide(&NEW, 128);
+        let handle = descriptor(record);
+        for mode in [1, 2] {
+            rewrite(handle, record);
+            set_card(&heap, ON_CARD, ON_CARD, mode);
+            assert_eq!(heap.mirror(1, handle, true), Some(old.clone()));
+            let before = shown(&heap, 1);
+            assert!(before.is_some());
+            // The title writes another placed texture's view: a view of
+            // memory is made for a draw, so the slot is to be null till then.
+            set_card(&heap, ON_CARD + 1, ON_CARD, mode);
+            rewrite(handle, new_record);
+            assert_eq!(heap.mirror(1, handle, false), Some(new.clone()));
+            assert_eq!(shown(&heap, 1), before, "mode {mode}: the clear is held");
+            // A draw reads it through a table.
+            assert_eq!(heap.mirror_required(1, handle, true), Some(new.clone()));
+            if mode == 1 {
+                // Made at once, as before.
+                assert!(heap.made(1));
+                assert_ne!(shown(&heap, 1), before);
+                assert!(!heap.has_required_deferred(ON_CARD));
+            } else {
+                // Held as the newest write, needed before the next submission.
+                assert!(!heap.made(1));
+                assert_eq!(shown(&heap, 1), before);
+                assert!(heap.has_required_deferred(ON_CARD));
+                assert_eq!(heap.flush_deferred(ON_CARD), 0);
+            }
+            let made_new = shown(&heap, 1);
+            assert_eq!(heap.flush_deferred(ON_CARD + 1), 1);
+            assert!(heap.made(1), "mode {mode}: the make stands");
+            let after = shown(&heap, 1);
+            assert!(after.is_some() && after != before);
+            if mode == 1 {
+                assert_eq!(after, made_new, "the clear did not touch the slot made since");
+            }
+            assert!(heap.deferred.lock().unwrap().is_empty());
+            assert_eq!(super::device_removed(), None);
+        }
+    }
+
+    /// `VICTORY_DEFER_SLOT_CLEARS=2`: a replacement held back and then a
+    /// clear of the slot: the clear stands, and nothing waits for a
+    /// settle any more.
+    #[test]
+    fn a_held_replacement_then_a_clear_ends_null() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        static OLD: [u8; 65536] = [0; 65536];
+        static NEW: [u8; 65536] = [1; 65536];
+        let (old, record) = placed_record(&OLD);
+        let (_, new_record) = placed_record(&NEW);
+        let handle = descriptor(record);
+        set_card(&heap, ON_CARD, ON_CARD, 2);
+        assert_eq!(heap.mirror(1, handle, true), Some(old));
+        let before = shown(&heap, 1);
+        set_card(&heap, ON_CARD + 1, ON_CARD, 2);
+        rewrite(handle, new_record);
+        assert!(heap.mirror_required(1, handle, true).is_some());
+        assert!(heap.has_required_deferred(ON_CARD));
+        assert_eq!(shown(&heap, 1), before);
+        // The title releases it before the submission that needed it.
+        rewrite(handle, [0; 3]);
+        assert_eq!(heap.mirror(1, handle, false), None);
+        assert!(!heap.has_required_deferred(ON_CARD));
+        assert_eq!(shown(&heap, 1), before);
+        assert_eq!(heap.flush_deferred(ON_CARD + 1), 1);
+        assert!(!heap.made(1));
+        assert_eq!(shown(&heap, 1), None);
+        assert_eq!(super::device_removed(), None);
     }
 
     /// A view of a host copy that begins at a later level shows the same

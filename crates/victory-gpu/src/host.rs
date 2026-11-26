@@ -6104,6 +6104,15 @@ impl Host {
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }
         let behind = late && flying();
+        // Title-slot writes held back while earlier submissions may read
+        // what the slots show (`crate::descriptor::host::HostHeap::clear`):
+        // a settle first if a draw of this submission reads one in place,
+        // then those whose submissions have finished are written, before
+        // this one counts as started.
+        if behind && crate::descriptor::has_required_deferred_views() {
+            self.settle(&mut submitted, WHY_SYNC);
+        }
+        crate::descriptor::flush_deferred_views();
         stage.next("submit: gathering what to ask about");
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it (with the relay).
@@ -9795,6 +9804,16 @@ impl Meter {
                     u8::from(crate::descriptor::host::show_new_later()),
                     crate::descriptor::host::NEW_LATER.load(Ordering::Relaxed)
                 );
+                {
+                    let [held, replaced, cleared, remade] =
+                        [0, 1, 2, 3].map(|i| crate::descriptor::host::HELD_CLEARS[i].load(Ordering::Relaxed));
+                    tracing::info!(
+                        "slots that showed a host resource and were to read nothing while submissions that may read them ran \
+                         (VICTORY_DEFER_SLOT_CLEARS={}), since the start: {held} clears held back, {cleared} written once those had \
+                         finished; {replaced} replacements held back, {remade} made",
+                        crate::descriptor::host::defer_slot_clears()
+                    );
+                }
                 tracing::info!("textures shown, since the start (crate::texlate): {}", crate::texlate::line());
                 if let Some(line) = crate::texstore::line() {
                     tracing::info!("{line}");

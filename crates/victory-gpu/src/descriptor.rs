@@ -131,6 +131,38 @@ const SHADER_VISIBLE: u32 = 1;
 /// descriptors, and by [`sync_heaps`]), alone only where heaps come and go.
 static SHADER_HEAPS: std::sync::RwLock<Vec<(u64, u64, usize)>> = std::sync::RwLock::new(Vec::new());
 
+/// Whether any shader-visible heap holds back a title-slot view that a
+/// draw reads in place before the next submission runs
+/// (`host::HostHeap::has_required_deferred`).
+#[cfg(windows)]
+pub(crate) fn has_required_deferred_views() -> bool {
+    let finished = crate::host::submissions().1;
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    heaps.iter().any(|&(_, _, h)| {
+        // SAFETY: registered heaps are live (removed in `Drop`, under the
+        // lock held here).
+        let heap = unsafe { &*(h as *const Heap) };
+        heap.host.get().and_then(Option::as_ref).is_some_and(|host| host.has_required_deferred(finished))
+    })
+}
+
+/// Publishes the held-back title-slot writes that are due
+/// (`host::HostHeap::flush_deferred`): clears (and replacements) asked
+/// for while submissions that have finished since were on the card.
+#[cfg(windows)]
+pub(crate) fn flush_deferred_views() {
+    let finished = crate::host::submissions().1;
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    for &(_, _, h) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed in `Drop`, under the
+        // lock held here).
+        let heap = unsafe { &*(h as *const Heap) };
+        if let Some(Some(host)) = heap.host.get() {
+            host.flush_deferred(finished);
+        }
+    }
+}
+
 /// Makes the host descriptor for what the title wrote at `handle`, if it
 /// is in a shader-visible heap. Keeps `SHADER_HEAPS` locked for the duration
 /// so `Heap::drop` cannot free the heap concurrently.
