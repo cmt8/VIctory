@@ -1882,6 +1882,10 @@ impl State {
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         let frame = crate::frame::current();
         if FRAME.swap(frame, Ordering::Relaxed) == frame {
+            // Counted (the frame line's "kinds per frame"): a list that may
+            // pick a slot whose buffer view waits to be made reads no
+            // buffer there. (The frame's first list: after its pass.)
+            crate::descriptor::host::indexed_list();
             return Some(gpu);
         }
         let started = std::time::Instant::now();
@@ -1994,6 +1998,7 @@ impl State {
         }
         // All the spans in under one lock of the list: some 4,600 a frame.
         crate::shadow::Shadow::refresh_many(list, eligible);
+        crate::descriptor::host::indexed_list();
         let textures = std::time::Instant::now();
         self.heap_textures(list, heap, host);
         let texture_us = textures.elapsed().as_micros() as u64;

@@ -39,7 +39,8 @@ use crate::shadow::Shadow;
 /// copy holds the same when our list runs: every flight that may write a
 /// byte of the source writes it through that one host copy ([`holder`]),
 /// they are all ahead of our list on the queue, nothing else of theirs
-/// writes title memory there (a bottom-of-pipe write, a read-back), and
+/// writes title memory there (a bottom-of-pipe write, a read-back, a
+/// texture copied back), and
 /// the title's own bytes are brought up to date by a refresh, prepared as
 /// any list's (also under flights' declared writes, `stale_under_flights`,
 /// which settles if it cannot). Nothing of this submission writes the
@@ -113,25 +114,28 @@ pub(super) struct Air {
     /// landed declared.
     back: Vec<Declared>,
     /// Title memory those flights write outside host copies when they land:
-    /// bottom-of-pipe writes and read-backs.
+    /// bottom-of-pipe writes, read-backs and textures copied back.
     title: Vec<(usize, usize)>,
-    /// One of them copies a texture back; where to is not looked at here.
-    textures: bool,
     /// Copies done on the card in the air: the destination's host copy (by
     /// address), from, to.
     copied: Vec<(usize, usize, usize)>,
 }
 
 /// The title memory a flight writes when it lands outside host copies:
-/// its lists' read-backs; whether it copies a texture back.
-fn landing_title(flight: &Flight, out: &mut Vec<(usize, usize)>) -> bool {
-    let mut textures = false;
+/// its lists' read-backs, and the title memory of the textures it copies
+/// back (`crate::texback::land` writes exactly [`crate::texback::Back::range`]).
+///
+/// A texture copied back counted as a write anywhere: the water's height
+/// and displacement maps are copied back by nearly every flight, so the
+/// boat scene's one copy a frame out of memory flights write (2 KiB at
+/// 0xe011e0000+64K) was refused for it 0.3 to 1 times a frame in run h2
+/// and waited for instead, 25 to 90 ms of the submitting thread a frame.
+fn landing_title(flight: &Flight, out: &mut Vec<(usize, usize)>) {
     for &i in &flight.order {
         let deferred = flight.lists[i].host().deferred();
         out.extend(deferred.backs.iter().map(|&(_, at, [row, rows, pitch])| (at, at + rows.saturating_sub(1) * pitch + row)));
-        textures |= !deferred.texture_backs.is_empty();
+        out.extend(deferred.texture_backs.iter().map(crate::texback::Back::range));
     }
-    textures
 }
 
 impl Air {
@@ -140,7 +144,6 @@ impl Air {
             written: line.written.clone(),
             back: line.in_hand_back.clone(),
             title: line.in_hand_title.clone(),
-            textures: line.in_hand_textures,
             copied: line.copied.clone(),
         };
         air.title.extend(line.in_hand.iter().map(|&(at, _, n)| (at, at + n)));
@@ -148,7 +151,7 @@ impl Air {
             match item {
                 Late::Run(flight) => {
                     air.back.extend(flight.back.iter().cloned());
-                    air.textures |= landing_title(flight, &mut air.title);
+                    landing_title(flight, &mut air.title);
                 }
                 &Late::Write(at, _, n) => air.title.push((at, at + n)),
                 Late::Signal(..) => {}
@@ -173,22 +176,19 @@ impl Air {
 }
 
 /// What the line notes of flights being landed, for [`Air::of`]: their
-/// declared ranges, the title memory they write outside host copies, and
-/// whether one copies a texture back. Called by the thread that lands
+/// declared ranges and the title memory they write outside host copies.
+/// Called by the thread that lands
 /// flights as it takes them, under the line's lock.
 pub(super) fn in_hand(line: &mut Line, items: &[Late]) {
     line.in_hand_back.clear();
     line.in_hand_title.clear();
-    line.in_hand_textures = false;
     if !on() {
         return;
     }
     for item in items {
         if let Late::Run(flight) = item {
             line.in_hand_back.extend(flight.back.iter().cloned());
-            let mut title = Vec::new();
-            line.in_hand_textures |= landing_title(flight, &mut title);
-            line.in_hand_title.extend(title);
+            landing_title(flight, &mut line.in_hand_title);
         }
     }
 }
@@ -303,7 +303,7 @@ pub(super) fn take(
     if from.in_place() || from.offset_in(src as u64).is_none() || from.left(src as u64) < len as u64 {
         return Err(SOURCE);
     }
-    if air.textures || air.title.iter().any(|&(a, b)| a < end && src < b) {
+    if air.title.iter().any(|&(a, b)| a < end && src < b) {
         return Err(TITLE);
     }
     // The submission's steps, and the host copies it brings up to date or

@@ -3243,12 +3243,10 @@ struct Line {
     /// from, to.
     copied: Vec<(usize, usize, usize)>,
     /// With [`card_copy::on`] and [`relay`], of the flights being landed:
-    /// their declared ranges, the title memory they write outside host
-    /// copies, and whether one copies a texture back
-    /// ([`card_copy::in_hand`]).
+    /// their declared ranges and the title memory they write outside host
+    /// copies, textures copied back among it ([`card_copy::in_hand`]).
     in_hand_back: Vec<Declared>,
     in_hand_title: Vec<(usize, usize)>,
-    in_hand_textures: bool,
 }
 
 // SAFETY: D3D12 objects (free-threaded) and host lists nothing records
@@ -3267,7 +3265,6 @@ static LINE: Mutex<Line> = Mutex::new(Line {
     copied: Vec::new(),
     in_hand_back: Vec::new(),
     in_hand_title: Vec::new(),
-    in_hand_textures: false,
 });
 /// Told when a flight joins [`LINE`] or it is poked.
 static LINE_MOVED: std::sync::Condvar = std::sync::Condvar::new();
@@ -6499,14 +6496,12 @@ impl Host {
                 copied,
                 in_hand_back,
                 in_hand_title,
-                in_hand_textures,
                 ..
             } = &mut *line;
             kept.extend(landed);
             in_hand.clear();
             in_hand_back.clear();
             in_hand_title.clear();
-            *in_hand_textures = false;
             // What is still in the air, from the flights that are.
             written.clear();
             copied.clear();
