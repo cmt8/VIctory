@@ -65,9 +65,11 @@ pub(crate) struct HostHeap {
     /// ([`HostHeap::before_write`], [`HostHeap::after_write`]).
     strides: Option<(ID3D12Resource, u64, usize)>,
     /// View heaps, per title slot (up to `SLOT_STRIDES_COUNT`): the
-    /// `strides` dword as last written (bits 0 to 30), and bit 31 while
-    /// the host slot shows a texture's descriptor ([`SHOWS_IMAGE`]). Read
-    /// here, not in the upload buffer, which is slow to read.
+    /// `strides` dword as last written (a stride in bits 0 to 29, or bit 30
+    /// for the mark of a constant buffer view, [`SHOWS_CONSTANT`]), and bit
+    /// 31 while the host slot shows a texture's descriptor
+    /// ([`SHOWS_IMAGE`]). Read here, not in the upload buffer, which is slow
+    /// to read.
     shown: Vec<std::sync::atomic::AtomicU32>,
     /// View heaps: the title address of the buffer view at each title slot,
     /// two dwords per slot, for shaders that read a descriptor's address out
@@ -965,13 +967,33 @@ enum Shows {
     Buffer(u32),
     /// A null buffer view: reads give zeros, whatever the table says.
     NullBuffer,
-    /// Anything else (a constant buffer's view, a null texture view, a
-    /// buffer view without a stride): the table says no buffer.
+    /// A constant buffer's view (not a null one): the table holds its mark
+    /// (`victory_shader::emit::SLOT_STRIDE_CONSTANT`, with
+    /// [`victory_shader::emit::constant_marks`]).
+    Constant,
+    /// Anything else (a null constant buffer or texture view, a buffer view
+    /// without a stride, a sampler): the table says no buffer.
     Other,
 }
 
 /// Bit of [`HostHeap::shown`]: the host slot shows a texture's descriptor.
 const SHOWS_IMAGE: u32 = 1 << 31;
+/// Bit of [`HostHeap::shown`]: the stride table holds the mark of a
+/// constant buffer view for the slot.
+const SHOWS_CONSTANT: u32 = 1 << 30;
+/// Bits of [`HostHeap::shown`] that hold a stride.
+const STRIDE_BITS: u32 = SHOWS_CONSTANT - 1;
+
+/// Constant-buffer marks in the stride table since the last frame line:
+/// `[set (a constant buffer view written where the slot was not marked),
+/// cleared (anything else written over a marked slot), of those cleared
+/// for a texture's view]`. Shaders that pick a slot by index read it as a
+/// constant buffer only while it is marked; a slot that now shows a
+/// texture was read as one before the marks (its image descriptor as a
+/// buffer's: base 0 on RADV, a page fault). Counted only while the table
+/// follows the host slots.
+pub(crate) static CONSTANT_MARKS: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Whether the stride table follows the host slots
 /// ([`HostHeap::before_write`]). On by default; `VICTORY_STRIDE_FOLLOWS_SLOT=0`:
@@ -987,7 +1009,8 @@ fn stride_follows_slot() -> bool {
 /// texture object is the texture's whatever its description says).
 fn shows_of(view: &View) -> Shows {
     let buffer = match view {
-        View::Constant(..) | View::Sampler(_) | View::ConsoleSampler(_) => return Shows::Other,
+        View::Constant(..) => return Shows::Constant,
+        View::Sampler(_) | View::ConsoleSampler(_) => return Shows::Other,
         View::Shader(r, _) | View::Unordered(r, _, _) => {
             crate::resource::buffer_bytes(*r as crate::object::This).is_some()
         }
@@ -1925,20 +1948,45 @@ impl HostHeap {
     /// clear held for the card (`VICTORY_DEFER_SLOT_CLEARS`), a view of a
     /// new host copy held (`VICTORY_DEFER_NEW_VIEWS`), and a buffer view
     /// made only when a draw or the pass over buffer views reads it.
+    ///
+    /// The mark of a constant buffer view goes the same way: it leaves the
+    /// table before the slot is written with anything but a constant
+    /// buffer view (a stride stays for a buffer view, the mark for a
+    /// constant buffer's). A shader that picks a slot by index reads it as
+    /// a constant buffer only while it is marked, and before the marks did
+    /// wherever the table said 0, a texture's slot too (its image
+    /// descriptor's upper half, where vkd3d-proton puts a constant buffer's
+    /// descriptor too).
     fn before_write(&self, index: u32, shows: Shows) {
-        if !stride_follows_slot() || matches!(shows, Shows::Buffer(_) | Shows::NullBuffer) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !stride_follows_slot() {
             return;
         }
         let (Some((_, _, data)), Some(word)) = (&self.strides, self.shown.get(index as usize)) else {
             return;
         };
-        let was = word.load(std::sync::atomic::Ordering::Relaxed);
+        let was = word.load(Relaxed);
         if was & !SHOWS_IMAGE == 0 {
             return;
         }
+        let marked = was & SHOWS_CONSTANT != 0;
+        let stays = match shows {
+            Shows::Buffer(_) | Shows::NullBuffer => !marked,
+            Shows::Constant => marked && victory_shader::emit::constant_marks(),
+            Shows::Image | Shows::Other => false,
+        };
+        if stays {
+            return;
+        }
+        if marked {
+            CONSTANT_MARKS[1].fetch_add(1, Relaxed);
+            if shows == Shows::Image {
+                CONSTANT_MARKS[2].fetch_add(1, Relaxed);
+            }
+        }
         // SAFETY: inside the mapping (`shown` is no longer than the table).
         unsafe { (*data as *mut u32).add(index as usize).write_volatile(0) };
-        word.store(was & SHOWS_IMAGE, std::sync::atomic::Ordering::Relaxed);
+        word.store(was & SHOWS_IMAGE, Relaxed);
         // The 0 is in memory before the runtime writes the descriptor
         // (its stores into the mapped heap are write-combining and
         // non-temporal ones, which a plain store does not order).
@@ -1946,8 +1994,9 @@ impl HostHeap {
     }
 
     /// After host slot `index` was written with something that `shows`: a
-    /// buffer view's stride goes into the stride table once its descriptor
-    /// is in memory; [`HostHeap::shown`] notes whether a texture is shown.
+    /// buffer view's stride (a constant buffer view's mark) goes into the
+    /// stride table once its descriptor is in memory; [`HostHeap::shown`]
+    /// notes whether a texture is shown.
     fn after_write(&self, index: u32, shows: Shows) {
         use std::sync::atomic::Ordering::Relaxed;
         let (Some((_, _, data)), Some(word)) = (&self.strides, self.shown.get(index as usize)) else {
@@ -1961,11 +2010,29 @@ impl HostHeap {
             Shows::Other | Shows::NullBuffer => {
                 word.fetch_and(!SHOWS_IMAGE, Relaxed);
             }
-            Shows::Buffer(_) if !stride_follows_slot() => {
+            Shows::Buffer(_) | Shows::Constant if !stride_follows_slot() => {
                 word.fetch_and(!SHOWS_IMAGE, Relaxed);
             }
+            Shows::Constant if !victory_shader::emit::constant_marks() => {
+                word.fetch_and(!SHOWS_IMAGE, Relaxed);
+            }
+            Shows::Constant => {
+                if word.load(Relaxed) & SHOWS_CONSTANT == 0 {
+                    // The descriptor is in memory before the mark says it
+                    // is there.
+                    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+                    // SAFETY: inside the mapping, as above.
+                    unsafe {
+                        (*data as *mut u32)
+                            .add(index as usize)
+                            .write_volatile(victory_shader::emit::SLOT_STRIDE_CONSTANT)
+                    };
+                    CONSTANT_MARKS[0].fetch_add(1, Relaxed);
+                }
+                word.store(SHOWS_CONSTANT, Relaxed);
+            }
             Shows::Buffer(stride) => {
-                let stride = stride & !SHOWS_IMAGE;
+                let stride = stride & STRIDE_BITS;
                 if word.load(Relaxed) & !SHOWS_IMAGE != stride {
                     // The descriptor is in memory before the stride says
                     // it is there.
@@ -2205,15 +2272,23 @@ impl HostHeap {
         // and the host slot may go on showing what it showed for a while (a
         // clear held for the card, a view of a new host copy held, a buffer
         // view made only when a draw or the pass over buffer views reads
-        // it). Here only with `VICTORY_STRIDE_FOLLOWS_SLOT=0`, as before.
+        // it). Here only with `VICTORY_STRIDE_FOLLOWS_SLOT=0`, as before
+        // (a constant buffer view's mark too, with the marks on).
         let stride = view.and_then(view_stride);
         if !stride_follows_slot()
             && let Some((_, _, data)) = &self.strides
             && index < victory_shader::emit::SLOT_STRIDES_COUNT
         {
+            let entry = match (stride, view) {
+                (Some(stride), _) => stride,
+                (None, Some(View::Constant(..))) if victory_shader::emit::constant_marks() => {
+                    victory_shader::emit::SLOT_STRIDE_CONSTANT
+                }
+                _ => 0,
+            };
             // SAFETY: inside the mapping; shaders read it while we write (a
             // dword, either value is one the slot had).
-            unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
+            unsafe { (*data as *mut u32).add(index as usize).write_volatile(entry) };
         }
         let range = view.and_then(buffer_range);
         if let Some((_, _, data)) = &self.views
@@ -4905,6 +4980,61 @@ mod tests {
         assert_eq!(heap.mirror(1, handle, true), Some(texture));
         assert!(heap.shows_image(1));
         assert_eq!(heap.stride_shown(1), 0);
+        assert_eq!(super::device_removed(), None);
+    }
+
+    /// The mark of a constant buffer view (`SLOT_STRIDE_CONSTANT`) is in
+    /// the stride table only while the host slot shows a constant buffer
+    /// view: set once its descriptor is written, gone before a buffer's,
+    /// a null view or a texture's is written over it, kept for another
+    /// constant buffer view. Shaders that pick a slot by index read it as
+    /// a constant buffer only where it is; they read a slot with 0 there
+    /// (a texture's) as one before, its image descriptor as a buffer's.
+    #[test]
+    fn the_constant_buffer_mark_follows_the_host_slot() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        if heap.strides.is_none() || !stride_follows_slot() {
+            return;
+        }
+        assert_eq!(shows_of(&View::Constant(0x1000, 256)), Shows::Constant);
+        assert_eq!(Null::Constant.shows(), Shows::Other);
+        let on = victory_shader::emit::constant_marks();
+        let mark = if on { victory_shader::emit::SLOT_STRIDE_CONSTANT } else { 0 };
+        let write = |shows| {
+            heap.before_write(2, shows);
+            heap.after_write(2, shows);
+        };
+        write(Shows::Constant);
+        assert_eq!(heap.stride_shown(2), mark, "a constant buffer view is marked");
+        heap.before_write(2, Shows::Constant);
+        assert_eq!(heap.stride_shown(2), mark, "and stays so for another");
+        heap.after_write(2, Shows::Constant);
+        heap.before_write(2, Shows::Buffer(16));
+        assert_eq!(heap.stride_shown(2), 0, "no mark before a buffer view is written");
+        heap.after_write(2, Shows::Buffer(16));
+        assert_eq!(heap.stride_shown(2), 16);
+        write(Shows::Constant);
+        assert_eq!(heap.stride_shown(2), mark, "the stride gone, the mark there");
+        write(Shows::NullBuffer);
+        assert_eq!(heap.stride_shown(2), 0, "a null buffer view is no constant buffer");
+        write(Shows::Constant);
+        // The title's texture over it, mirrored: the mark goes first.
+        static TEXTURE: [u8; 65536] = [0; 65536];
+        let (texture, record) = placed_record(&TEXTURE);
+        let for_texture = CONSTANT_MARKS[2].load(Relaxed);
+        set_card(&heap, ON_CARD, ON_CARD, 1);
+        assert_eq!(heap.mirror(2, descriptor(record), true), Some(texture));
+        assert!(heap.shows_image(2));
+        assert_eq!(heap.stride_shown(2), 0, "no mark while the texture is shown");
+        assert_eq!(CONSTANT_MARKS[2].load(Relaxed) > for_texture, on, "counted");
+        write(Shows::Constant);
+        assert!(!heap.shows_image(2));
+        assert_eq!(heap.stride_shown(2), mark);
+        write(Shows::Other);
+        assert_eq!(heap.stride_shown(2), 0, "a null constant buffer view is not marked");
         assert_eq!(super::device_removed(), None);
     }
 

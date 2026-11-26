@@ -140,7 +140,16 @@ A buffer a shader reads from the view heap at an index it computes reads
 the host's null buffer view where the heap's stride table says the slot
 holds no buffer view (a texture view read as a buffer descriptor is a wild
 address); `VICTORY_BUFFER_GUARD=0` turns that off (part of the shader
-cache key).
+cache key). The stride table says what the host slot shows, not what the
+title last wrote (`VICTORY_STRIDE_FOLLOWS_SLOT=0`: what the title wrote,
+as before), and marks a slot that shows a constant buffer view: a scalar
+load through such a descriptor reads the slot as a constant buffer only
+where it is marked, raw where it has a stride, and zeros elsewhere (a
+texture's slot read as a constant buffer was its image descriptor read as
+a buffer's, a page fault at a small address on RADV);
+`VICTORY_CONSTANT_MARKS=0` reads every slot without a stride as a
+constant buffer, as before (part of the shader cache key). The frame
+log's "kinds per frame" line counts the marks set and cleared.
 A draw or dispatch whose root descriptor (title memory's directory, the
 view heap's address or stride table, a root constant buffer, a root view
 outside title memory) has nothing to bind is dropped, named in the drop

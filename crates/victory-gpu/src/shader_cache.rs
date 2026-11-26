@@ -82,6 +82,9 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_FIRSTLANE_OWN",
                     "VICTORY_HALF_SUM_PRESENT",
                     "VICTORY_BUFFER_GUARD",
+                    // Constant buffers read by index only where marked
+                    // (`victory_shader::emit::constant_marks`).
+                    "VICTORY_CONSTANT_MARKS",
                     "VICTORY_EARLY_DEPTH",
                     // The node tests miss unless the structure builder runs
                     // (`victory_shader::emit::bvh_miss`).

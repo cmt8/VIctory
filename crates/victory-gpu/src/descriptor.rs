@@ -301,15 +301,22 @@ fn held_line(frames: f64) {
     }
     let over = host::BUFFERS_OVER_IMAGES.swap(0, Relaxed);
     let [fresh, in_place] = [0, 1].map(|i| host::KIND_MISMATCHES[i].swap(0, Relaxed));
-    if over + fresh + in_place > 0 {
+    let [marked, unmarked, by_texture] = [0, 1, 2].map(|i| host::CONSTANT_MARKS[i].swap(0, Relaxed));
+    if over + fresh + in_place + marked + unmarked > 0 {
         tracing::info!(
             "kinds per frame: {:.1} title buffer views written where the host slot still showed a texture (shaders \
              that pick buffers by index read no buffer there until it is made; before, the texture's descriptor as a \
              buffer's); table entries a shader reads as a buffer that held a texture view or the other way round: \
-             {:.1} in tables made afresh (made null), {:.1} read in place",
+             {:.1} in tables made afresh (made null), {:.1} read in place; constant buffer marks \
+             (VICTORY_CONSTANT_MARKS): {:.1} set (a constant buffer view written over a slot not marked), {:.1} cleared \
+             (another view written over a marked slot), {:.1} of them for a texture (shaders that pick a slot by index \
+             read zeros there; before, the texture's descriptor as a constant buffer's)",
             over as f64 / frames,
             fresh as f64 / frames,
             in_place as f64 / frames,
+            marked as f64 / frames,
+            unmarked as f64 / frames,
+            by_texture as f64 / frames,
         );
     }
     let [clears, replaces, cleared, replaced] = [0, 1, 2, 3].map(|i| host::HELD_CLEARS[i].swap(0, Relaxed));
