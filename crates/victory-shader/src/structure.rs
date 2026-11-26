@@ -455,6 +455,15 @@ impl Structured {
     }
 }
 
+/// Whether a wave64 lane mask parked as two scalar words and restored by
+/// `s_mov_b32` copies is taken for the mask it came from (`Lanes::mask`;
+/// DexNom 76749ce5). `VICTORY_MASK_COPIES`: on, `=0` as before, for A/B
+/// runs. Part of the translation: the shader cache keys on it.
+fn mask_copies() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MASK_COPIES").is_none_or(|v| v != "0"))
+}
+
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
     structure_wide(program, &HashSet::new())
@@ -912,7 +921,8 @@ impl<'a> Lanes<'a> {
         // dword at a time. The spill pass turns these into scalar moves.
         // Recover the original lane predicate only when the two words
         // still come from the same known mask, in their original order.
-        if self.p.wave64 {
+        // (`VICTORY_MASK_COPIES=0`: not recovered, as before.)
+        if self.p.wave64 && mask_copies() {
             let source = (self.move_source(k.0), self.move_source(k.1));
             if source != k && let Some(&m) = self.masks.get(&source) {
                 self.masks.insert(k, m);

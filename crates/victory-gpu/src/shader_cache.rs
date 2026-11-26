@@ -137,6 +137,8 @@ fn build() -> [u8; 32] {
             // Compute programs in waves of 32 on a host of 32 and 64
             // (`victory_shader::emit::compute_wave_32`, also below).
             "VICTORY_COMPUTE_WAVE",
+            // Wave64 masks restored through scalar copies (structure.rs).
+            "VICTORY_MASK_COPIES",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
