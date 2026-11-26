@@ -589,6 +589,67 @@ pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && skipped_shader(pipeline(this)).is_some()
 }
 
+/// Since the start: draws of the title's decoration bake
+/// (`crate::draw::BAKE_PIXEL_SHADERS`) dropped, and of them those whose
+/// host pipeline was still being made. The bake runs once for a
+/// character and its textures keep what it left for the run: a bake draw
+/// dropped (a cold shader cache: pipelines past the frame's wait budget)
+/// leaves its corner of the target as it was.
+#[cfg(windows)]
+pub(crate) static BAKE_DROPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Since the start: dispatches dropped while their pipeline was being made
+/// (the first 32 are said with their compute shader).
+#[cfg(windows)]
+pub(crate) static MADE_LATE_DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A draw or dispatch of `this` was dropped: counted in [`BAKE_DROPS`] if
+/// it is one of the decoration bake's, and in [`MADE_LATE_DISPATCHES`] if
+/// it is a dispatch whose pipeline is still being made; each said the
+/// first few times.
+#[cfg(windows)]
+fn bake_dropped(this: This) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if this.is_null() {
+        return;
+    }
+    let p = pipeline(this);
+    let making = make::being_made(&p.host);
+    // Compute programs dropped while being made, the first few: what they
+    // would have written (a bake's compression into block-compressed
+    // texels, copied into a character's texture after: "HERO LEAD") keeps
+    // what its memory held before.
+    if making && p.shaders.iter().all(|s| s.stage == "compute") {
+        let n = MADE_LATE_DISPATCHES.fetch_add(1, Relaxed) + 1;
+        if n <= 32 {
+            let hashes: Vec<&str> = p.shaders.iter().map(|s| s.hash.as_str()).collect();
+            tracing::warn!(
+                pipeline = ?this,
+                frame = crate::frame::current(),
+                compute_shader = ?hashes,
+                so_far = n,
+                "a dispatch is dropped while its pipeline is being made: what it would have written keeps what was there"
+            );
+        }
+    }
+    let Some(bake) = p.shaders.iter().find(|s| crate::draw::BAKE_PIXEL_SHADERS.contains(&s.hash.as_str())) else {
+        return;
+    };
+    let n = BAKE_DROPS[0].fetch_add(1, Relaxed) + 1;
+    if making {
+        BAKE_DROPS[1].fetch_add(1, Relaxed);
+    }
+    if n <= 8 {
+        tracing::warn!(
+            pipeline = ?this,
+            pixel_shader = %bake.hash,
+            being_made = making,
+            so_far = n,
+            "a draw of the title's decoration bake is dropped: what it would have baked stays out of the character's textures"
+        );
+    }
+}
+
 /// Counts a draw or dispatch of `this` intentionally skipped or dropped
 /// for want of a host pipeline ([`drop_reasons`]).
 #[cfg(windows)]
@@ -600,6 +661,7 @@ pub(crate) fn note_drop(this: This) {
 /// pipeline (the draw was dropped for something else).
 #[cfg(windows)]
 pub(crate) fn note_drop_or(this: This, other: Option<&str>) {
+    bake_dropped(this);
     if !drop_reasons() {
         return;
     }

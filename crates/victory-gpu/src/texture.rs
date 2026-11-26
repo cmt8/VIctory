@@ -318,6 +318,9 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     // A source the host copied into (not one it renders to or writes in
     // shaders): copied once per write of it, not once per list. The
     // placed view's host copy keeps what the last copy put there.
+    if title_written(from) {
+        copied_out_of(source);
+    }
     let tick = title_written(from).then(|| host_write_tick(source)).flatten();
     if let Some(tick) = tick
         && through.copied.load(std::sync::atomic::Ordering::Relaxed) == tick
@@ -785,6 +788,17 @@ pub(crate) fn let_go_idle() {
     });
     if went > 0 {
         crate::host::trail(|| format!("sweep: {went} staging buffers of textures let go ({} KiB), held by no list", bytes >> 10));
+    }
+}
+
+/// A copy (the title's, or an alias copy) reads title texture `resource`,
+/// whose upload was just asked for: counted if its host copy has still
+/// not been given anything to hold (it reads what its memory held when it
+/// was made, and the copy's destination is taken as written from then on:
+/// `crate::descriptor::host::UNWRITTEN`).
+pub(crate) fn copied_out_of(resource: This) {
+    if !crate::resource::host_written_to(resource) {
+        crate::descriptor::host::UNWRITTEN[5].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

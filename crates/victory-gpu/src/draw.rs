@@ -121,7 +121,7 @@ fn early_budgets() -> (u64, u64) {
 /// `PS_BakeDecorations_*`), by the first 16 hex digits of their hash as the
 /// frame listings print it. They draw into a 256x256 corner of 2048x2048
 /// targets and name no texture in a table.
-const BAKE_PIXEL_SHADERS: [&str; 4] =
+pub(crate) const BAKE_PIXEL_SHADERS: [&str; 4] =
     ["c0a7fe77b1862e10", "0d1575a396dfe513", "b7cfd8dda91ebb6b", "280967ad158cee0b"];
 
 /// Since the start: early runs of the texture pass, and those of them
@@ -2513,6 +2513,11 @@ impl State {
             let tabled = crate::texture::is_staged(resource);
             if let Some(view) = &view {
                 readable(list, sampled.kind, view);
+                // Made now if it was left null until its upload was
+                // recorded (`HostHeap::remake_written`).
+                if let Some(handle) = heap.handle(index) {
+                    host.remake_written(index, handle, false);
+                }
             }
             // A texture view the host refuses removes the device: name it.
             static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -3060,6 +3065,7 @@ impl State {
                 crate::descriptor::host::KIND_MISMATCHES[1].fetch_add(1, Ordering::Relaxed);
             }
             readable(list, u.kind, &view);
+            host.remake_written(index, handle, true);
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
@@ -3307,15 +3313,19 @@ impl State {
                         }
                     }
                     Some(view) => {
-                        match halved(self, slot, k * 8) {
-                            Some(shown) => host.make_at(index, &shown),
-                            None => host.make_at(index, &view),
-                        }
+                        // What it reads is made ready first (a texture's
+                        // upload recorded), so that the slot is made with a
+                        // host copy that has been written
+                        // (`descriptor::host::unwritten_null`).
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
                         if let Some(kind) = kind {
                             readable(list, kind, &view);
+                        }
+                        match halved(self, slot, k * 8) {
+                            Some(shown) => host.make_at(index, &shown),
+                            None => host.make_at(index, &view),
                         }
                         // The title's slot is a table's: out of the queue
                         // of textures picked by index if the draw read it

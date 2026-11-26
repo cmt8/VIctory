@@ -328,6 +328,30 @@ fn held_line(frames: f64) {
             while_null as f64 / frames,
         );
     }
+    let unwritten = host::UNWRITTEN.each_ref().map(|c| c.swap(0, Relaxed));
+    let shown_anyway = host::UNWRITTEN_SHOWN.swap(0, Relaxed);
+    if unwritten.iter().any(|&n| n > 0) || shown_anyway > 0 {
+        let [sync, read, published, fresh, remade, copied] = unwritten;
+        let bakes = &crate::pipeline::BAKE_DROPS;
+        tracing::info!(
+            "unwritten host copies per frame: slots that would have shown a texture's host copy no list had written \
+             into, made null instead (VICTORY_UNWRITTEN_NULL=0: shown, {:.1}): {:.1} as the title wrote the view, {:.1} \
+             by the texture pass or a draw reading the slot in place, {:.1} held views published, {:.1} tables made \
+             afresh; {:.1} made right after their upload was recorded; copies out of such a texture {:.1}; since the \
+             start, draws of the decoration bake dropped {} ({} of them while their pipeline was being made), \
+             dispatches dropped while their pipeline was being made {}",
+            shown_anyway as f64 / frames,
+            sync as f64 / frames,
+            read as f64 / frames,
+            published as f64 / frames,
+            fresh as f64 / frames,
+            remade as f64 / frames,
+            copied as f64 / frames,
+            bakes[0].load(Relaxed),
+            bakes[1].load(Relaxed),
+            crate::pipeline::MADE_LATE_DISPATCHES.load(Relaxed),
+        );
+    }
     let [clears, replaces, cleared, replaced] = [0, 1, 2, 3].map(|i| host::HELD_CLEARS[i].swap(0, Relaxed));
     if clears + replaces + cleared + replaced > 0 {
         tracing::info!(
