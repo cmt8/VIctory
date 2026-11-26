@@ -2808,3 +2808,140 @@ fn a_format_load_read_as_halves_loads_the_integer() {
     }
     assert!(ran > 0, "no SM 6.6 device available");
 }
+
+/// A scalar word the program packs from a register that joins an EXEC
+/// mask and a number (s10: the initial EXEC, then on a path no lane skips
+/// a root constant) keeps the number's bits: `s_and_b32` / `s_or_b32` of it
+/// give the console's word, stored by lane 0. (DexNom's test from
+/// 5f4c3df44, carried on our line with packed_mask.rs as ffec19450. This
+/// tree refuses the program in its first lowering, at the mask with lanes
+/// elsewhere, and takes it in the retry `translate` makes for that refusal,
+/// with mask operations on numbers read as their numbers: as here.)
+#[test]
+fn a_packed_scalar_id_from_a_reused_mask_register_retains_all_bits() {
+    let words = [
+        0xBE84_0300,
+        0xBE85_0380, // s[4:5] = output table
+        0xF408_0402,
+        0xFA00_0000, // s[16:19] = output UAV
+        0xBE8A_037E, // s10 = initial exec
+        0xBE8C_3C0A, // s_and_saveexec_b32 s12, s10
+        0xBF88_0001, // s_cbranch_execz merge (never taken)
+        0xBE8A_0301, // s10 = packed scalar input
+        0xBEFE_030C, // merge: restore exec
+        0xD4C2_0006,
+        0x0002_0080, // v_cmp_eq_u32 s6, 0, v0
+        0xBE8E_3C06, // s_and_saveexec_b32 s14, s6
+        0xBF88_0007, // only lane zero uses the packed word
+        0x870B_FF0A,
+        0x001F_FFFF, // s11 = lower 21 bits
+        0x880D_FF0B,
+        0xDAE0_0000, // s13 = upper field | s11
+        0x7E02_020D, // v1 = s13
+        0xE070_1000,
+        0x8004_0100, // buffer_store_dword v1, v0, s[16:19]
+        0xBEFE_030E, // restore exec
+        S_ENDPGM,
+    ];
+    let root = |root, user_data, slot| RootParam {
+        root,
+        table_offset_dwords: 0,
+        sgprs: 1,
+        base_register: 0,
+        user_data,
+        slot,
+    };
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 256,
+        layout: vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }],
+        // Two user SGPRs, no LDS.
+        io: StageIo::Cs(ComputeIo { rsrc2: 2 << 1, threads: [1, 1, 1] }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, false, 256).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lowered = lower::with_mask_ops_on_numbers(|| lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    }))
+    .unwrap_or_else(|e| panic!("lower: {e}"));
+    let mut shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        root_indexed_views: Vec::new(),
+        half_views: lowered.half_views,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil).expect("DXIL validation failed");
+    }
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    };
+    use windows::Win32::Graphics::Direct3D12::{D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1};
+    let mut caps = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: a feature query with its own initialised structure.
+    unsafe {
+        host.device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut caps).cast(),
+                size_of_val(&caps) as u32,
+            )
+            .expect("wave caps")
+    };
+    if !(caps.WaveLaneCountMin..=caps.WaveLaneCountMax).contains(&32) {
+        eprintln!("packed ID execution needs a wave32 adapter; skipped");
+        return;
+    }
+    let (root, pso) = host.compute_pipeline(&shader).expect("compute_pipeline");
+    for value in [0, 0x0012_3456, 0xF123_FFFF] {
+        let mut data = vec![0; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if u.root == RootType::Constants {
+                data[u.index as usize] = value;
+            }
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(data))],
+                    views: &[View::RawUav(1)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("dispatch");
+        assert_eq!(out[0][0], 0xDAE0_0000 | (value & 0x001F_FFFF), "for {value:#x}");
+    }
+}
