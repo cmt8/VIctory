@@ -123,6 +123,9 @@ fn build() -> [u8; 32] {
             "VICTORY_MESH_OUTPUT_STRICT",
             "VICTORY_BVH_FENCES",
             "VICTORY_BVH_BOUNDS",
+            // Compute programs with wave operations declare the console's
+            // wave (`victory_shader::emit::wave_pin`).
+            "VICTORY_WAVE_PIN",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');

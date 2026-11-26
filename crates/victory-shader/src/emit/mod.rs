@@ -110,6 +110,8 @@ mod valu_tests;
 mod waterfall_tests;
 #[cfg(all(test, windows))]
 mod wave64_tests;
+#[cfg(all(test, windows))]
+mod wave_pin_tests;
 mod wave;
 
 use crate::dxbc::{Container, FourCC};
@@ -199,6 +201,27 @@ pub fn builder_fences() -> bool {
 pub fn builder_bounds() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_BOUNDS").is_none_or(|v| v != "0"))
+}
+
+/// Whether a compute program that uses the host's wave operations declares
+/// the console's wave size (`lower::wave_pin`): on RADV such a program
+/// otherwise runs in waves of 64 whatever the console's are.
+/// `VICTORY_WAVE_PIN`: on, `=0` declares only where the lowering did
+/// before, for A/B runs. Part of the translation: the shader cache keys on
+/// it.
+pub fn wave_pin() -> bool {
+    #[cfg(test)]
+    if let Some(on) = WAVE_PIN_TEST.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_PIN").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`wave_pin`] on its thread (`None`: the switch's).
+    pub(crate) static WAVE_PIN_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// The clean-up passes that run over a translated program before it is
