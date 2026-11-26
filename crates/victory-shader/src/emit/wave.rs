@@ -71,7 +71,7 @@ impl Op {
     }
 
     /// Counting a lane twice changes the result.
-    fn counts(self) -> bool {
+    pub(super) fn counts(self) -> bool {
         matches!(self, Op::AddU | Op::AddF | Op::AddH | Op::Xor)
     }
 }

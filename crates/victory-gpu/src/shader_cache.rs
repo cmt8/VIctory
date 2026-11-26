@@ -70,6 +70,10 @@ fn build() -> &'static [u8; 32] {
                 // executable had cached with the switch unset.
                 bytes.extend_from_slice(&victory_shader::emit::host_max_wave_set().to_le_bytes());
                 bytes.extend_from_slice(&victory_shader::emit::view_heap_limit().to_le_bytes());
+                // Whether compute programs take waves of 32 (`VICTORY_COMPUTE_WAVE`,
+                // listed below too), which depends on the host's narrowest wave as well.
+                bytes.extend_from_slice(&victory_shader::emit::host_min_wave_set().to_le_bytes());
+                bytes.push(u8::from(victory_shader::emit::compute_wave_32()));
                 for name in [
                     "VICTORY_WAVE_WIDE",
                     "VICTORY_WAVE_DEEP_SKIPS",
@@ -88,6 +92,7 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_EARLY_DEPTH",
                     "VICTORY_HALF_BITS",
                     "VICTORY_WAVE_PIN",
+                    "VICTORY_COMPUTE_WAVE",
                     // (Only the report of the halves; served from the
                     // cache, a program would not be counted.)
                     "VICTORY_HALF_REPORT",

@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::UserData;
+use super::compute_wave::lanes_wave;
 use super::bitcode::{Attr, Bin, Cast, Rmw, Tag, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
@@ -34,6 +35,8 @@ pub use halves::take_half_report;
 mod coherent;
 #[path = "wave_pin.rs"]
 mod wave_pin;
+#[path = "wave64_halves.rs"]
+mod wave64_halves;
 #[path = "packed_mask.rs"]
 mod packed_mask;
 
@@ -1235,7 +1238,8 @@ impl<'a> Lower<'a> {
                     || reads_mask_as_data(x.st, i)
             }) || lane_constant_masks(x.st)
                 // (a branch the wave takes together asks the wave)
-                || !x.st.wide.is_empty();
+                || !x.st.wide.is_empty()
+                || wave64_halves::first_lane_crosses(x);
             let mut wave = if x.native.wave64 { 64 } else { 32 };
             let group = cs.threads.iter().product::<u32>();
             let one_wave = group <= wave;
@@ -1247,7 +1251,7 @@ impl<'a> Lower<'a> {
             // `v_readlane`, `v_writelane`, `ds_(b)permute`, masks as numbers or lane-constant
             // masks), nor when LDS may be shared within the console wave without barriers (a
             // group over 32 threads with LDS): those still need 64-lane waves.
-            if wave == 64 && host_max_wave() == 32 && (console_lanes || one_wave && s.lds_dwords > 0) {
+            if wave == 64 && lanes_wave() == 32 && (console_lanes || one_wave && s.lds_dwords > 0) {
                 let crosses = insts().any(|i| {
                     let n = i.name();
                     n.starts_with("v_mbcnt")
@@ -1256,7 +1260,8 @@ impl<'a> Lower<'a> {
                         || n.starts_with("ds_bpermute")
                         || reads_mask_as_data(x.st, i)
                 }) || lane_constant_masks(x.st)
-                    || !x.st.wide.is_empty();
+                    || !x.st.wide.is_empty()
+                    || wave64_halves::first_lane_crosses(x);
                 if !crosses && (s.lds_dwords == 0 || group <= 32) {
                     wave = 32;
                 } else {
@@ -1928,6 +1933,7 @@ impl<'a> Lower<'a> {
                     let rb = bits(self, r);
                     let c = self.cur;
                     let (lo, hi) = self.exchange_halves(c, rb);
+                    let hi = if op.counts() { hi } else { self.missing_upper(c, hi, Some(rb)) };
                     let (lo, hi) = (back(self, lo), back(self, hi));
                     match op {
                         Op::AddU | Op::AddF => self.s.m.bin(c, Bin::Add, lo, hi),
@@ -3790,7 +3796,7 @@ impl<'a> Lower<'a> {
         let hi = self.s.m.load(at, p1);
         // the slots are written again only after every thread read them
         self.group_sync(at);
-        (lo, hi)
+        (lo, self.missing_upper(at, hi, None))
     }
 
     /// The first of the two exchange dwords of this thread's console wave (made in the entry
