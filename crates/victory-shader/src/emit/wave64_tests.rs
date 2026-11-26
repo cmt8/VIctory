@@ -1377,3 +1377,92 @@ fn both_host_waves_observe_the_lds_flag_after_the_join() {
     }
     eprintln!("all 14 flag dispatches passed on a 32-lane hardware adapter");
 }
+
+/// `native` by the whole path a title's program takes ([`super::emit_sized`]) with
+/// `VICTORY_COMPUTE_WAVE` on a host that runs waves of 32 and of 64 (AMD under RADV): the
+/// shader and the wave it declares.
+fn in_compute_waves_of_32(native: &NativeProgram) -> (HostShader, Option<u32>) {
+    let p = crate::spill::build(native).expect("build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, native).expect("io::raise");
+    let c = crate::dxbc::Container {
+        digest: [0; 16],
+        version: (1, 0),
+        parts: Vec::new(),
+    };
+    let host_was = lower::TEST_HOST_WAVE.replace(Some(64));
+    let mode_was = super::compute_wave::TEST.replace(Some(true));
+    let r = super::emit_sized(&c, native, &p, &st, &io, &res);
+    lower::TEST_HOST_WAVE.set(host_was);
+    super::compute_wave::TEST.set(mode_was);
+    r.expect("emit")
+}
+
+/// `native` with its `buffer_store_dword` (MUBUF opcode 0x1C) made a `buffer_atomic_add`
+/// (0x32): the groups of a dispatch then leave the sum of what each would store.
+fn adding(mut native: NativeProgram) -> NativeProgram {
+    for w in native.code.chunks_exact_mut(4) {
+        let v = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+        if v >> 26 == 0x38 && v >> 18 & 0x7F == 0x1C {
+            w.copy_from_slice(&(v & !(0x7F << 18) | 0x32 << 18).to_le_bytes());
+        }
+    }
+    native
+}
+
+/// The flag programs as `VICTORY_COMPUTE_WAVE` translates them on a host of 32- and 64-lane
+/// waves, where they declare `WaveSize(32)` and run as two host waves that meet at the edges
+/// of the branch ([`both_host_waves_observe_the_lds_flag_after_the_join`] runs only on a host
+/// of 32-lane waves): one group, and every group of a dispatch of many, each adding what it
+/// would store.
+#[test]
+fn the_lds_flag_form_gives_the_consoles_result_in_declared_waves_of_32() {
+    const GROUPS: u32 = 4096;
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for second in [None, Some(1)] {
+        for groups in [1, GROUPS] {
+            let native = if groups == 1 { flag_program(second) } else { adding(flag_program(second)) };
+            let (shader, declared) = in_compute_waves_of_32(&native);
+            assert_eq!(declared, Some(32), "second {second:?}, {groups} groups");
+            if let Ok(mut validator) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+                let mut dxil = shader.dxil.clone();
+                validator.validate(&mut dxil).expect("DXIL validation failed");
+            }
+            let Ok(host) = Host::new(false) else {
+                eprintln!("no SM 6.6 hardware device; not run");
+                return;
+            };
+            let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+                eprintln!("the hardware device does not take WaveSize(32); not run");
+                return;
+            };
+            for active in [0, 1, 31, 32, 33, 63, 64] {
+                for skip in [0, 1] {
+                    let mut ud = vec![0; shader.user_data_dwords() as usize];
+                    for u in &shader.user_data {
+                        if let (RootType::Constants, 0, d @ 0..=1) = (u.root, u.slot, u.dword) {
+                            ud[u.index as usize] = [active, skip][d as usize];
+                        }
+                    }
+                    let out = host
+                        .dispatch(&root, &pso, &Dispatch {
+                            roots: vec![(0, Root::Constants(ud))],
+                            views: &[View::RawUav(64)],
+                            samplers: &[],
+                            groups: [groups, 1, 1],
+                        })
+                        .expect("dispatch");
+                    assert_eq!(
+                        out[0],
+                        [groups * (1 + u32::from(active != 0)); 64],
+                        "second {second:?}, {active} active lanes, skip {skip}, {groups} groups"
+                    );
+                    ran += 1;
+                }
+            }
+        }
+    }
+    eprintln!("ran on the hardware device: {ran} flag dispatches exact in declared waves of 32");
+}
