@@ -71,6 +71,11 @@ pub(crate) struct HostHeap {
     /// ([`SHOWS_IMAGE`]). Read here, not in the upload buffer, which is slow
     /// to read.
     shown: Vec<std::sync::atomic::AtomicU32>,
+    /// View heaps, per title slot (as `shown`): 0, or one more than the
+    /// frame (its low 32 bits) in which the title wrote a buffer view there
+    /// while the host slot showed a texture, until the buffer view is made
+    /// (the slot reads no buffer meanwhile: [`NULL_WAITS`]).
+    nulled: Vec<std::sync::atomic::AtomicU32>,
     /// View heaps: the title address of the buffer view at each title slot,
     /// two dwords per slot, for shaders that read a descriptor's address out
     /// of a table at an index they compute
@@ -562,6 +567,18 @@ pub(crate) static AWAY_KEPT: [std::sync::atomic::AtomicU64; 2] =
 /// memory, not the title's pages; when the time is up the slot goes null
 /// the usual way, held back while submissions that may read it are on the
 /// card (`VICTORY_DEFER_SLOT_CLEARS`).
+/// Whether the host texture a slot made from record `key` shows has been
+/// given anything to hold by a list (an upload, a copy:
+/// `crate::resource::host_written_to`), for [`HostHeap::texture_slot_gone`].
+fn shows_written(key: u64) -> bool {
+    view_at(key as u32, (key >> 32) as u32).is_some_and(|view| {
+        match placed_texture(&view).unwrap_or(view) {
+            View::Shader(texture, _) => crate::resource::host_written_to(texture as crate::object::This),
+            _ => false,
+        }
+    })
+}
+
 #[cfg_attr(test, allow(dead_code))]
 fn texture_away_ms() -> u64 {
     static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -1030,6 +1047,30 @@ fn shows_of(view: &View) -> Shows {
 /// read no buffer now.
 pub(crate) static BUFFERS_OVER_IMAGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Of those slots ([`BUFFERS_OVER_IMAGES`], [`HostHeap::nulled`]), for the
+/// frame line: `[buffer views made since the last line, the frames they
+/// waited in all, the most frames one waited, slots written with something
+/// else before their buffer view was made, slots waiting now (not reset by
+/// the line)]`. A shader that picks buffers by an index it computes reads
+/// the null buffer view at such a slot for as long as it waits.
+pub(crate) static NULL_WAITS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// Lists that run shaders picking buffers by an index they compute
+/// (`draw.rs` `heap_buffers`, once per list), since the last frame line:
+/// `[all of them, those recorded while a slot of [`NULL_WAITS`] waited]`.
+pub(crate) static INDEXED_LISTS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// A list that runs shaders picking buffers by an index they compute is
+/// recorded ([`INDEXED_LISTS`]): counted, and apart if a title slot waits
+/// for its buffer view now ([`HostHeap::nulled`]).
+pub(crate) fn indexed_list() {
+    use std::sync::atomic::Ordering::Relaxed;
+    INDEXED_LISTS[0].fetch_add(1, Relaxed);
+    if NULL_WAITS[4].load(Relaxed) > 0 {
+        INDEXED_LISTS[1].fetch_add(1, Relaxed);
+    }
+}
+
 /// Table entries whose view is not of the kind the shader reads there (a
 /// buffer view where it reads a texture's descriptor, or a texture view
 /// where it reads a buffer's), since the last frame line: `[in tables made
@@ -1300,6 +1341,9 @@ impl HostHeap {
             freed: std::sync::Condvar::new(),
             strides,
             shown: (0..if sampler { 0 } else { count.min(victory_shader::emit::SLOT_STRIDES_COUNT) })
+                .map(|_| std::sync::atomic::AtomicU32::new(0))
+                .collect(),
+            nulled: (0..if sampler { 0 } else { count.min(victory_shader::emit::SLOT_STRIDES_COUNT) })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
             views,
@@ -1872,7 +1916,14 @@ impl HostHeap {
         let wait = self.away_ms.lock().unwrap_or_else(|e| e.into_inner()).unwrap_or(0);
         #[cfg(not(test))]
         let wait = texture_away_ms();
-        if wait > 0 {
+        // Only a texture that holds what a list wrote into it is shown on.
+        // A slot is made from a placed view when the title writes it, often
+        // before the texture's pages are mapped, and the upload waits for
+        // them: shown on, its host copy held whatever its memory on the
+        // card held before (block-compressed noise), for the wait and for
+        // good where the character bake read it through the slot. Such a
+        // slot is made null at the first look, as before the wait was.
+        if wait > 0 && shows_written(key) {
             let now = crate::host::now_ms();
             let mut away = self.away.lock().unwrap_or_else(|e| e.into_inner());
             match away.get(&index) {
@@ -2015,6 +2066,7 @@ impl HostHeap {
         let (Some((_, _, data)), Some(word)) = (&self.strides, self.shown.get(index as usize)) else {
             return;
         };
+        self.null_wait_ends(index, shows);
         match shows {
             // (The dword is 0 since `before_write`.)
             Shows::Image => {
@@ -2878,8 +2930,47 @@ impl HostHeap {
     /// wrote the buffer view `view` there and the host slot still shows a
     /// texture.
     fn note_withheld(&self, index: u32, view: &View) {
+        use std::sync::atomic::Ordering::Relaxed;
         if view_stride(view).is_some_and(|s| s > 0) && self.shows_image(index) {
-            BUFFERS_OVER_IMAGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            BUFFERS_OVER_IMAGES.fetch_add(1, Relaxed);
+            // From this frame on the slot reads no buffer until its view is
+            // made (`null_wait_ends`); a later write of the same kind keeps
+            // the first frame.
+            let since = (crate::frame::current() as u32).wrapping_add(1).max(1);
+            if let Some(word) = self.nulled.get(index as usize)
+                && word.compare_exchange(0, since, Relaxed, Relaxed).is_ok()
+            {
+                NULL_WAITS[4].fetch_add(1, Relaxed);
+            }
+        }
+    }
+
+    /// Host slot `index` was written with something that `shows`: a slot
+    /// that waited for its buffer view ([`HostHeap::nulled`]) has it now
+    /// (a buffer view), or never will (anything but a null buffer view,
+    /// which is what such a slot shows while it waits).
+    fn null_wait_ends(&self, index: u32, shows: Shows) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if matches!(shows, Shows::NullBuffer) {
+            return;
+        }
+        let Some(word) = self.nulled.get(index as usize) else { return };
+        // (A plain load first: nearly every slot written waits for nothing.)
+        if word.load(Relaxed) == 0 {
+            return;
+        }
+        let since = word.swap(0, Relaxed);
+        if since == 0 {
+            return;
+        }
+        NULL_WAITS[4].fetch_sub(1, Relaxed);
+        if matches!(shows, Shows::Buffer(_)) {
+            let frames = u64::from((crate::frame::current() as u32).wrapping_sub(since - 1));
+            NULL_WAITS[0].fetch_add(1, Relaxed);
+            NULL_WAITS[1].fetch_add(frames, Relaxed);
+            NULL_WAITS[2].fetch_max(frames, Relaxed);
+        } else {
+            NULL_WAITS[3].fetch_add(1, Relaxed);
         }
     }
 
@@ -4987,12 +5078,17 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         let handle = title.as_ptr() as u64;
         assert_eq!(heap.mirror(slot, handle, false), Some(view.clone()));
         let (_, write) = heap.texture_slots_due(u64::MAX, 1).0[0];
-        assert_eq!(heap.mirror(slot, handle, true), Some(view));
+        assert_eq!(heap.mirror(slot, handle, true), Some(view.clone()));
         let key = u64::from(generation) << 32 | u64::from(entry);
         let shown = |heap: &HostHeap| {
             heap.made.lock().unwrap()[slot as usize] == key && heap.kept.lock().unwrap()[slot as usize].is_some()
         };
         assert!(shown(&heap));
+        // Its host texture has been uploaded (only such a one is shown on:
+        // `a_slot_never_written_is_not_shown_on_after_its_memory_went`).
+        let Some(View::Shader(texture, _)) = placed_texture(&view) else { panic!("a placed texture") };
+        crate::resource::note_written(texture as crate::object::This);
+        assert!(shows_written(key));
 
         *heap.away_ms.lock().unwrap() = Some(3_600_000);
         assert!(!heap.texture_slot_gone(slot, write), "made null at the first look");
@@ -5008,6 +5104,38 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         std::thread::sleep(std::time::Duration::from_millis(80));
         assert!(heap.texture_slot_gone(slot, write));
         assert_eq!(heap.made.lock().unwrap()[slot as usize], 0);
+    }
+
+    /// A made slot whose host texture no list has written into yet (its
+    /// view written before its memory was mapped) is made null at the
+    /// first look that finds the memory away, whatever the wait: its host
+    /// copy holds what its memory on the card held before.
+    #[test]
+    fn a_slot_never_written_is_not_shown_on_after_its_memory_went() {
+        let Some(heap) = HostHeap::new(false, 8) else { return };
+        let slot = 2;
+        // Bytes of their own: the texture made for a placed view is found
+        // by address, and the test above writes into its own.
+        static BYTES: [u8; 65536] = [0; 65536];
+        let address = BYTES.as_ptr() as u64;
+        let resource = [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0];
+        let mut srv = [0; 16];
+        srv[..6].copy_from_slice(&[98, 4, 5768, 0, 0, 1]);
+        (srv[10], srv[11]) = (address as u32, (address >> 32) as u32);
+        let view = View::Placed(false, resource, srv);
+        let [entry, generation] = super::super::words_for(view.clone());
+        let title = [super::super::VIEW_TAG, entry, generation];
+        let handle = title.as_ptr() as u64;
+        assert_eq!(heap.mirror(slot, handle, false), Some(view.clone()));
+        let (_, write) = heap.texture_slots_due(u64::MAX, 1).0[0];
+        assert_eq!(heap.mirror(slot, handle, true), Some(view));
+        let key = u64::from(generation) << 32 | u64::from(entry);
+        assert!(heap.kept.lock().unwrap()[slot as usize].is_some(), "made, never uploaded");
+        assert!(!shows_written(key));
+        *heap.away_ms.lock().unwrap() = Some(3_600_000);
+        assert!(heap.texture_slot_gone(slot, write), "made null at the first look");
+        assert_eq!(heap.made.lock().unwrap()[slot as usize], 0);
+        assert!(heap.away.lock().unwrap().is_empty());
     }
 
     /// Memory the runtime maps under a slot's texture makes the slot due
@@ -5408,6 +5536,46 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_eq!(heap.stride_shown(2), mark);
         write(Shows::Other);
         assert_eq!(heap.stride_shown(2), 0, "a null constant buffer view is not marked");
+        assert_eq!(super::device_removed(), None);
+    }
+
+    /// A slot the title writes a buffer view to while its host slot shows a
+    /// texture is noted as reading no buffer from then on: through its held
+    /// clear (a null buffer view) until the buffer view is made, or until
+    /// something else is written there.
+    #[test]
+    fn a_buffer_view_over_a_shown_texture_waits_until_it_is_made() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        if heap.strides.is_none() {
+            return;
+        }
+        let waits = |heap: &HostHeap| heap.nulled[1].load(std::sync::atomic::Ordering::Relaxed) != 0;
+        static TEXTURE: [u8; 65536] = [0; 65536];
+        static BUFFER: [u8; 4096] = [0; 4096];
+        let (texture, record) = placed_record(&TEXTURE);
+        let buffer = structured_view(&BUFFER);
+        let handle = descriptor(record);
+        set_card(&heap, ON_CARD, ON_CARD, 1);
+        assert_eq!(heap.mirror(1, handle, true), Some(texture.clone()));
+        assert!(!waits(&heap), "a texture waits for nothing");
+        set_card(&heap, ON_CARD + 1, ON_CARD, 1);
+        rewrite(handle, record_of(&buffer));
+        assert_eq!(heap.mirror(1, handle, false), Some(buffer.clone()));
+        assert!(heap.shows_image(1));
+        assert!(waits(&heap), "the buffer view over the shown texture waits");
+        // Its held clear, a null buffer view, is still no buffer.
+        assert_eq!(heap.flush_deferred(ON_CARD + 1), 1);
+        assert!(waits(&heap), "a null buffer view is what it shows while it waits");
+        set_card(&heap, ON_CARD + 1, ON_CARD + 1, 1);
+        assert_eq!(heap.mirror(1, handle, true), Some(buffer));
+        let made = shown(&heap, 1).is_some();
+        assert_eq!(waits(&heap), !made, "made: {made}");
+        // Something else written there ends any wait.
+        rewrite(handle, record);
+        assert_eq!(heap.mirror(1, handle, true), Some(texture));
+        assert!(!waits(&heap));
         assert_eq!(super::device_removed(), None);
     }
 
