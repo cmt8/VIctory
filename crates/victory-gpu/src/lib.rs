@@ -40,6 +40,8 @@ pub mod framelog;
 #[cfg(windows)]
 mod grave;
 #[cfg(windows)]
+mod heap;
+#[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod indirect;
