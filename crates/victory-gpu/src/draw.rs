@@ -1303,6 +1303,22 @@ impl State {
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
         self.host_heaps_set = false;
+        // A table with a constant buffer view reads the scratch memory of
+        // the host list it was made in, which that list fills when it is
+        // sent and uses again once it has run: the part before may have,
+        // while this one still reads it (constants of another recording;
+        // and what the title wrote to them since is not seen). Those are
+        // made afresh in this part, from its own scratch. The others stay
+        // (their slots hold what they show), and are gone through again
+        // for this host list whatever its epoch says. The dynamic slots of
+        // all stay the list's until its state goes.
+        if cut_tables() {
+            self.fresh_tables.retain(|_, table| !table.constants);
+            for table in self.fresh_tables.values_mut() {
+                table.epoch = 0;
+                table.ready.clear();
+            }
+        }
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
@@ -3641,7 +3657,8 @@ impl State {
                 made.push((slot, u32::MAX));
                 continue;
             };
-            self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
+            self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new(), constants: false });
+            let mut constants = false;
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of
@@ -3737,6 +3754,7 @@ impl State {
                         null_of_kind(host, index, as_buffer, unordered);
                     }
                     Some(View::Constant(address, size)) => {
+                        constants = true;
                         // Renderer port 5: title memory in place is the
                         // card's to read where it is; nothing is copied.
                         if crate::port_cbv::in_place_on() {
@@ -3792,6 +3810,9 @@ impl State {
                         }
                     }
                 }
+            }
+            if constants && let Some(known) = self.fresh_tables.get_mut(&key) {
+                known.constants = true;
             }
             made.push((slot, first * 32));
         }
@@ -4514,6 +4535,17 @@ struct FreshTable {
     /// tested depth target.
     epoch: u64,
     ready: Vec<((usize, usize, bool, usize), bool)>,
+    /// Whether an entry is a constant buffer view: its bytes are in the
+    /// scratch memory of the host list it was made in, filled when that
+    /// list is sent ([`State::replay`]).
+    constants: bool,
+}
+
+/// Whether the part of a list after a cut makes afresh the tables that hold
+/// constant buffer views (`VICTORY_CUT_TABLES=0`: it reads those the part
+/// before made, as before).
+fn cut_tables() -> bool {
+    crate::toggled!("VICTORY_CUT_TABLES")
 }
 
 /// Whether a table a list reads again, with nothing changed in the list
@@ -4921,5 +4953,52 @@ mod record_hash_tests {
         // (One record of zeros is among the above.)
         let zeros: Vec<u64> = (2..100).map(|n| of(&vec![[0; 3]; n])).collect();
         assert!(zeros.iter().all(|h| seen.insert(*h)));
+    }
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::{FreshTable, State};
+
+    /// The part of a list after a cut forgets the tables whose constant
+    /// buffer views read the part before's scratch memory, keeps the
+    /// others, and gives back no dynamic slot.
+    #[test]
+    fn replay_evicts_cbv_fresh_tables_while_keeping_non_cbv_and_dynamic_slots() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        if !super::cut_tables() {
+            return;
+        }
+        let list = host.new_list().expect("host list");
+        let mut state = State::default();
+        let cbv_key = (0x1000, 4, 0xAAAA);
+        let srv_key = (0x2000, 4, 0xBBBB);
+        let table = |first, constants| FreshTable { first, epoch: 7, ready: vec![((1, 1, false, 0), false)], constants };
+        state.fresh_tables.insert(cbv_key, table(10, true));
+        state.fresh_tables.insert(srv_key, table(14, false));
+        // Pretend dynamic slots belong to Part 1 (cleared before Drop so
+        // `Drop` does not call `release_dynamic` on a fake heap pointer).
+        state.dynamic.push((0xDEAD, 10, 4));
+        state.dynamic.push((0xDEAD, 14, 4));
+
+        state.replay(&list);
+
+        assert!(
+            !state.fresh_tables.contains_key(&cbv_key),
+            "CBV-backed fresh_tables entry must be evicted on cut/replay"
+        );
+        let kept = state.fresh_tables.get(&srv_key).expect("non-CBV fresh_tables entry may stay cached across replay");
+        assert_eq!((kept.first, kept.constants), (14, false));
+        assert!(kept.epoch == 0 && kept.ready.is_empty(), "and is gone through again for the new host list");
+        assert_eq!(
+            state.dynamic.len(),
+            2,
+            "Part 1 dynamic slots must stay retained until final state drop"
+        );
+
+        state.dynamic.clear();
+        list.close();
     }
 }
