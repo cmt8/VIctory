@@ -4642,6 +4642,11 @@ mod tests {
     #[test]
     fn a_slot_shows_its_texture_on_for_a_while_after_its_memory_went() {
         let Some(heap) = HostHeap::new(false, 8) else { return };
+        // Nothing on the card: the process's own submission counts, which
+        // the tests running beside this one move, would hold the view of
+        // a host copy made after the last finished one back
+        // (`VICTORY_DEFER_NEW_VIEWS`), and the slot would show nothing.
+        set_card(&heap, ON_CARD, ON_CARD, 1);
         let slot = 1;
         static BYTES: [u8; 65536] = [0; 65536];
         let address = BYTES.as_ptr() as u64;
