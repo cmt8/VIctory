@@ -2626,7 +2626,8 @@ fn a_format_load_read_as_halves_loads_the_integer() {
     beside.extend_from_slice(&mubuf_idxen(LOAD_FORMAT_X, 3, 0, 8));
     beside.push(half);
     beside.push(vop2(V_ADD_F32, 2, vgpr(3), 2));
-    assert!(lowered(&beside).half_views.is_empty());
+    let beside_shader = lowered(&beside);
+    assert!(beside_shader.half_views.is_empty());
     // Behind a branch, as the head program has it: where the lanes meet
     // again the loaded value goes on through a phi, and a later write of
     // v1 under EXEC reads it only to keep it in the lanes it leaves alone.
@@ -2714,6 +2715,47 @@ fn a_format_load_read_as_halves_loads_the_integer() {
                 "{label}, {name}: the half read as an integer's bits"
             );
         }
+        // A half read through a place that names nothing (beside a whole
+        // float read there) keeps the float path: a float-typed load of the
+        // R16_UINT view, whose low half the program takes as the half. What
+        // the device gives is the integer's bits (v3, a denormal, adds
+        // nothing to 1.0), as the "halves report" lines with format_floats
+        // rely on; a device that converted the integer (15360.0) or gave 0
+        // would show here.
+        let (root, pso) = host
+            .compute_pipeline(&beside_shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; beside_shader.user_data_dwords().max(1) as usize];
+        for u in &beside_shader.user_data {
+            ud[u.index as usize] = match (u.root, u.slot) {
+                (RootType::Table, 1) => 0,
+                other => panic!("unexpected user data {other:?}"),
+            };
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[
+                        View::Buffer {
+                            data: &data,
+                            stride: Stride::Format(DXGI_FORMAT_R16_UINT, 2),
+                        },
+                        View::RawUav(1),
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        eprintln!("{label}: a half by way of a float-typed load of an R16_UINT view gave {:#010x}", out[0][0]);
+        assert_eq!(
+            out[0][0],
+            1.0f32.to_bits(),
+            "{label}: a half through the float path of an R16_UINT view"
+        );
         ran += 1;
     }
     assert!(ran > 0, "no SM 6.6 device available");
