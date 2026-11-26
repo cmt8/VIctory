@@ -4268,10 +4268,29 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
             // calls; both mappings hold `BYTES` bytes; the views are of
             // live buffers, in slots of the heap made above; an open list.
             unsafe {
-                let root: ID3D12RootSignature = host
-                    .device
-                    .CreateRootSignature(0, &code)
-                    .expect("a root signature");
+                // The source's `RS`, made here: Wine's compiler does not
+                // embed a `[RootSignature]` (`crate::host::root_signature`).
+                let range = [D3D12_DESCRIPTOR_RANGE1 {
+                    RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+                    NumDescriptors: 2,
+                    BaseShaderRegister: 0,
+                    RegisterSpace: 0,
+                    Flags: D3D12_DESCRIPTOR_RANGE_FLAG_NONE,
+                    OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
+                }];
+                let table = D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                            NumDescriptorRanges: 1,
+                            pDescriptorRanges: range.as_ptr(),
+                        },
+                    },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                };
+                let root: ID3D12RootSignature =
+                    crate::host::root_signature(&host.device, &[table], "halves test")
+                        .expect("a root signature");
                 let pso: ID3D12PipelineState = host
                     .device
                     .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
