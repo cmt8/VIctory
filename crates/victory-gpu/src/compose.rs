@@ -76,6 +76,20 @@ fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
     code.ok_or_else(windows::core::Error::empty)
 }
 
+/// The root signature of [`SOURCE`]'s `RS`, made in code (Wine's compiler,
+/// `D3DCompile` under Wine, ignores `[RootSignature]`): the two planes in
+/// a table the pixel stage sees (t0, t1), a linear sampler clamped in u and
+/// v (s0).
+fn root(device: &ID3D12Device, code: &[u8]) -> windows::core::Result<ID3D12RootSignature> {
+    use crate::host::{root_range, root_sampler, root_table};
+    let planes = [root_range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 0, 2)];
+    let mut table = root_table(&planes);
+    table.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    let clamp = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    let sampler = root_sampler(0, D3D12_FILTER_MIN_MAG_MIP_LINEAR, [clamp, clamp, D3D12_TEXTURE_ADDRESS_MODE_WRAP]);
+    crate::host::root_of_with(device, code, &[table], &[sampler], "plane compose")
+}
+
 impl Composer {
     pub(crate) fn new(host: &Host, format: DXGI_FORMAT) -> windows::core::Result<Self> {
         let (vs, ps) = (
@@ -88,7 +102,7 @@ impl Composer {
                 std::slice::from_raw_parts(b.GetBufferPointer().cast::<u8>(), b.GetBufferSize())
             };
             let device = &host.device;
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes(&vs))?;
+            let root = root(device, bytes(&vs))?;
             let code = |b: &ID3DBlob| D3D12_SHADER_BYTECODE {
                 pShaderBytecode: b.GetBufferPointer(),
                 BytecodeLength: b.GetBufferSize(),

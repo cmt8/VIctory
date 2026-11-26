@@ -83,10 +83,17 @@ fn pass(host: &Host) -> Option<&'static Pass> {
     static PASS: OnceLock<Option<Pass>> = OnceLock::new();
     PASS.get_or_init(|| {
         let code = compile(SCATTER, windows::core::s!("main"), windows::core::s!("cs_5_1")).ok()?;
-        // SAFETY: the code lives through the calls; the root signature is
-        // inside it.
+        // The root signature of `RS`, made in code (Wine's compiler,
+        // `D3DCompile` under Wine, ignores `[RootSignature]`): the part's two
+        // constants, the pairs as a root SRV, the card's copy as a root UAV.
+        let params = [
+            super::root_constants(0, 2),
+            super::root_view(D3D12_ROOT_PARAMETER_TYPE_SRV, 0),
+            super::root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 0),
+        ];
+        let root = super::root_of(&host.device, &code, &params, "changed words sent to the card").ok()?;
+        // SAFETY: the code lives through the calls.
         unsafe {
-            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code).ok()?;
             let pso: ID3D12PipelineState = host
                 .device
                 .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
@@ -335,5 +342,49 @@ impl Own {
     /// The memory, to be kept until the submission has run.
     pub(super) fn memory(self) -> Memory {
         self.memory
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The pass that writes changed words into a copy on the card builds and
+    /// writes each pair's word at its byte (its root signature made in code:
+    /// under Wine the blob has none, and the pass was not made).
+    #[test]
+    fn the_scatter_writes_each_pair_where_it_says() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let pass = pass(host).expect("the scatter must build");
+        let (pairs, pairs_ptr) = host.shared_buffer(256).expect("pairs");
+        let (card, card_ptr) = host.shared_buffer(256).expect("card copy");
+        // SAFETY: inside the mappings.
+        unsafe {
+            std::ptr::write_bytes(card_ptr, 0, 256);
+            // Three pairs from byte 16 of the pairs: (byte, word).
+            let words = pairs_ptr.cast::<u32>();
+            for (k, (at, word)) in [(0u32, 0x1111_1111u32), (12, 0x2222_2222), (200, 0x3333_3333)].into_iter().enumerate() {
+                words.add(4 + 2 * k).write_volatile(at);
+                words.add(5 + 2 * k).write_volatile(word);
+            }
+        }
+        let list = host.new_list().expect("a list");
+        // SAFETY: an open list, live buffers in the common state (promoted).
+        unsafe {
+            let l = &list.list;
+            l.SetComputeRootSignature(&pass.root);
+            l.SetPipelineState(&pass.pso);
+            l.SetComputeRoot32BitConstants(0, 2, [16u32, 3].as_ptr().cast(), 0);
+            l.SetComputeRootShaderResourceView(1, pairs.GetGPUVirtualAddress());
+            l.SetComputeRootUnorderedAccessView(2, card.GetGPUVirtualAddress());
+            l.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: the mapping; the list has run.
+        let read = |at: usize| unsafe { card_ptr.add(at).cast::<u32>().read_volatile() };
+        assert_eq!([read(0), read(4), read(12), read(200), read(204)], [0x1111_1111, 0, 0x2222_2222, 0x3333_3333, 0]);
     }
 }

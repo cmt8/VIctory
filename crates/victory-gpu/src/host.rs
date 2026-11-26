@@ -1795,6 +1795,16 @@ pub(crate) fn root_signature(
     params: &[D3D12_ROOT_PARAMETER1],
     what: &str,
 ) -> windows::core::Result<ID3D12RootSignature> {
+    root_signature_with(device, params, &[], what)
+}
+
+/// [`root_signature`] with immediate samplers.
+pub(crate) fn root_signature_with(
+    device: &ID3D12Device,
+    params: &[D3D12_ROOT_PARAMETER1],
+    samplers: &[D3D12_STATIC_SAMPLER_DESC],
+    what: &str,
+) -> windows::core::Result<ID3D12RootSignature> {
     use windows::Win32::Graphics::Direct3D::ID3DBlob;
     let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
         Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
@@ -1802,8 +1812,8 @@ pub(crate) fn root_signature(
             Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
                 NumParameters: params.len() as u32,
                 pParameters: params.as_ptr(),
-                NumStaticSamplers: 0,
-                pStaticSamplers: std::ptr::null(),
+                NumStaticSamplers: samplers.len() as u32,
+                pStaticSamplers: if samplers.is_empty() { std::ptr::null() } else { samplers.as_ptr() },
                 Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
             },
         },
@@ -1877,6 +1887,32 @@ pub(crate) fn root_range(kind: D3D12_DESCRIPTOR_RANGE_TYPE, register: u32, count
     }
 }
 
+/// An immediate sampler at `s<register>` of `filter` and the address modes
+/// `u`, `v`, `w`, with a root signature string's defaults for the rest
+/// (no bias, anisotropy 16, LESS_EQUAL, opaque white, every level, seen by
+/// every stage).
+pub(crate) fn root_sampler(
+    register: u32,
+    filter: D3D12_FILTER,
+    [u, v, w]: [D3D12_TEXTURE_ADDRESS_MODE; 3],
+) -> D3D12_STATIC_SAMPLER_DESC {
+    D3D12_STATIC_SAMPLER_DESC {
+        Filter: filter,
+        AddressU: u,
+        AddressV: v,
+        AddressW: w,
+        MipLODBias: 0.0,
+        MaxAnisotropy: 16,
+        ComparisonFunc: D3D12_COMPARISON_FUNC_LESS_EQUAL,
+        BorderColor: D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE,
+        MinLOD: 0.0,
+        MaxLOD: D3D12_FLOAT32_MAX,
+        ShaderRegister: register,
+        RegisterSpace: 0,
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    }
+}
+
 /// A descriptor table of `ranges`, which must live until the root signature
 /// is made ([`root_signature`]).
 pub(crate) fn root_table(ranges: &[D3D12_DESCRIPTOR_RANGE1]) -> D3D12_ROOT_PARAMETER1 {
@@ -1910,8 +1946,19 @@ pub(crate) fn root_of(
     params: &[D3D12_ROOT_PARAMETER1],
     what: &str,
 ) -> windows::core::Result<ID3D12RootSignature> {
+    root_of_with(device, code, params, &[], what)
+}
+
+/// [`root_of`] with immediate samplers.
+pub(crate) fn root_of_with(
+    device: &ID3D12Device,
+    code: &[u8],
+    params: &[D3D12_ROOT_PARAMETER1],
+    samplers: &[D3D12_STATIC_SAMPLER_DESC],
+    what: &str,
+) -> windows::core::Result<ID3D12RootSignature> {
     if own_roots() {
-        root_signature(device, params, what)
+        root_signature_with(device, params, samplers, what)
     } else {
         // SAFETY: a compiled shader's bytes.
         unsafe { device.CreateRootSignature(0, code) }
