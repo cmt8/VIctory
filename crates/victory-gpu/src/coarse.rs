@@ -25,8 +25,34 @@
 
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering::Relaxed};
 
-/// How often the ticking thread brings the clock up to date.
-pub(crate) const TICK_MS: u64 = 2;
+/// How often the ticking thread brings the clock up to date. Every reader
+/// counts in tenths of a second or more (`crate::host::moment`,
+/// `resource::room_lately`, the placeholder looks' 250 ms, the descriptor
+/// slots' seconds away), and every submission and frame ticks it as well:
+/// 10 ms is a tenth of the finest of them. It was 2 ms, 500 wakeups a
+/// second for nothing they could tell apart.
+pub(crate) const TICK_MS: u64 = 10;
+
+/// Sleeps `ms` milliseconds without a wineserver request under Wine.
+///
+/// `std::thread::sleep` waits on a high-resolution waitable timer it makes
+/// for each sleep, and under Wine a timer is a server object: making,
+/// setting and closing it are three wineserver requests a sleep
+/// (NtCreateTimer, NtSetTimer, NtClose), each a round trip through the one
+/// server thread that every thread's mapping and waiting also goes
+/// through. `Sleep` is `NtDelayExecution` not alertable, which Wine's Unix
+/// side waits out with `select` and no request (dlls/ntdll/unix/sync.c
+/// `NtDelayExecution`, the same in Proton Experimental's ValveSoftware/wine
+/// 5b557605 and Wine 11.22). Elsewhere `Sleep`'s default resolution is the
+/// system tick (15.6 ms), so the standard library's sleep stays.
+pub fn quiet_sleep(ms: u32) {
+    if crate::host::on_wine() {
+        // SAFETY: a plain call.
+        unsafe { windows_sys::Win32::System::Threading::Sleep(ms) };
+    } else {
+        std::thread::sleep(std::time::Duration::from_millis(ms.into()));
+    }
+}
 
 /// The clock: `crate::host::now_ms` as of the last tick, at least 1 once
 /// ticked.
@@ -91,7 +117,7 @@ fn start() -> u64 {
         up_to_date();
         let started = std::thread::Builder::new().name("victory-clock".into()).spawn(|| {
             loop {
-                std::thread::sleep(std::time::Duration::from_millis(TICK_MS));
+                quiet_sleep(TICK_MS as u32);
                 up_to_date();
             }
         });

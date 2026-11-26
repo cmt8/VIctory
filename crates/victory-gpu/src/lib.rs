@@ -97,6 +97,8 @@ mod watch;
 mod texback;
 
 #[cfg(windows)]
+pub use coarse::quiet_sleep;
+#[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
 pub use inplace::{
@@ -105,6 +107,7 @@ pub use inplace::{
 };
 #[cfg(windows)]
 pub use watch::{
-    kernel_write_refused, read_beside, title_memory_reading, title_memory_remapped,
-    title_memory_remapping, title_memory_written, writing as kernel_will_write,
+    Remapping, kernel_write_refused, read_beside, title_memory_gaps_met, title_memory_gaps_waited, title_memory_own_protections,
+    title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_written,
+    writing as kernel_will_write,
 };

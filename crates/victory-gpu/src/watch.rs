@@ -1626,7 +1626,175 @@ impl Drop for Remapping {
         if let Some(asked) = self.1 {
             crate::framelog::add(crate::framelog::T::RemapUs, asked.elapsed().as_micros() as u64);
         }
+        // Even again: the change is over (the lock is let go just after).
+        CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        CHANGING_HERE.with(|c| c.set(false));
     }
+}
+
+/// Changes of mapping begun and ended: odd while one is under way (the
+/// runtime holds [`MAPPING`] alone). Read by a fault in title memory that
+/// may have met one ([`came_back`]).
+static CHANGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    /// This thread holds a [`Remapping`]: a fault of its own in title
+    /// memory does not wait for its own change.
+    static CHANGING_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether a fault in title memory that met a change of mapping waits for
+/// it and goes on ([`came_back`]); the runtime says so
+/// ([`title_memory_gaps_waited`]).
+static GAPS_WAITED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Faults that met a change of mapping and went on after it, since the
+/// start ([`came_back`]).
+static GAPS_MET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The runtime says whether a thread whose access to title memory faults
+/// while it changes a mapping waits for the change and goes on
+/// (`xmem`'s `VICTORY_MAP_COALESCE`, on unless `=0`; off, such a fault goes
+/// on to the crash reporter, as before).
+///
+/// The console changes one page's mapping and no other's. Here a view
+/// cannot lose a page in its middle: the runtime unmaps it whole and maps
+/// what stays of it again (`xmem` `unmap`), and for that moment pages the
+/// title never gave up are a placeholder ("reserved, never committed").
+/// A read in place of ours waits for that under [`title_memory_reading`];
+/// a title thread cannot, so it waits in the fault handler instead. After
+/// avatarmanz 26d818c57 ("a title thread that uses a page while the runtime
+/// remaps another page of the same view waits for that in the fault
+/// handler").
+pub fn title_memory_gaps_waited(on: bool) {
+    GAPS_WAITED.store(on, std::sync::atomic::Ordering::Relaxed);
+    if on {
+        // The handler that waits (it is installed with the first guard
+        // otherwise).
+        install();
+    }
+}
+
+/// Faults in title memory that met a change of mapping and went on after
+/// it, since the start.
+pub fn title_memory_gaps_met() -> u64 {
+    GAPS_MET.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The protections of `[at, at + len)` that are the title's own: every
+/// run of 64 KiB blocks not read-write, as (address, bytes, protection),
+/// leaving out the blocks the guards made read-only (a copy took them and
+/// a write must fault; what the guards set is theirs to set again). Looked
+/// at under the guards' lock, so that no block is opened or guarded between
+/// the look at its protection and the look at the guards. The runtime keeps
+/// these across a view it maps again where the title changed nothing
+/// (`xmem`), and keeps a view as it is only where there are none.
+pub fn title_memory_own_protections(at: usize, len: usize) -> Vec<(usize, usize, u32)> {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE, VirtualQuery};
+    let end = at.saturating_add(len);
+    let mut own: Vec<(usize, usize, u32)> = Vec::new();
+    let g = guards();
+    let mut here = at;
+    while here < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        if unsafe { VirtualQuery(here as *const _, &mut info, size_of_val(&info)) } == 0 {
+            break;
+        }
+        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize).min(end);
+        if next <= here {
+            break;
+        }
+        if info.Protect != PAGE_READWRITE {
+            for block in here / BLOCK..next.div_ceil(BLOCK) {
+                if info.Protect == PAGE_READONLY && g.protected.contains(&block) {
+                    continue;
+                }
+                let (from, to) = ((block * BLOCK).max(here), ((block + 1) * BLOCK).min(next));
+                match own.last_mut() {
+                    Some((start, n, protect)) if *start + *n == from && *protect == info.Protect => *n += to - from,
+                    _ => own.push((from, to - from, info.Protect)),
+                }
+            }
+        }
+        here = next;
+    }
+    own
+}
+
+/// A title thread's access to `at` (`write`: a write) faulted. Whether it
+/// can be made now: if a change of mapping was or is under way, after it
+/// (see [`title_memory_gaps_waited`]). Memory that is not there, with no
+/// change under way, is not waited for; nor is a change of the faulting
+/// thread's own.
+fn came_back(at: usize, write: bool) -> bool {
+    use std::sync::atomic::Ordering::{Relaxed, SeqCst};
+    if !GAPS_WAITED.load(Relaxed) || CHANGING_HERE.with(std::cell::Cell::get) {
+        return false;
+    }
+    let there = || {
+        if write {
+            // (A copy may have guarded the page that came back.)
+            open(&mut guards(), at, at + 1, OPEN_FAULT) || writable(at)
+        } else {
+            readable_view(at)
+        }
+    };
+    // (Read before the look: a change that ends between the two is seen.)
+    let mut since = CHANGES.load(SeqCst);
+    if there() {
+        GAPS_MET.fetch_add(1, Relaxed);
+        return true;
+    }
+    for _ in 0..4 {
+        let now = change_done();
+        if now == since {
+            return false;
+        }
+        since = now;
+        if there() {
+            GAPS_MET.fetch_add(1, Relaxed);
+            return true;
+        }
+    }
+    false
+}
+
+/// [`CHANGES`] once no change is under way (or one has gone on for 5 s:
+/// the fault then goes on to the crash reporter).
+fn change_done() -> u64 {
+    use std::sync::atomic::Ordering::SeqCst;
+    let started = std::time::Instant::now();
+    let mut tries = 0u32;
+    loop {
+        let now = CHANGES.load(SeqCst);
+        if now.is_multiple_of(2) || started.elapsed().as_secs() >= 5 {
+            return now;
+        }
+        tries += 1;
+        if tries < 100 {
+            std::hint::spin_loop();
+        } else if tries < 200 {
+            std::thread::yield_now();
+        } else {
+            // SAFETY: a plain call (no wineserver request under Wine,
+            // `crate::coarse::quiet_sleep`).
+            unsafe { windows_sys::Win32::System::Threading::Sleep(1) };
+        }
+    }
+}
+
+/// Whether `at` is in a committed, readable page of a view.
+fn readable_view(at: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE, VirtualQuery,
+    };
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    n != 0 && info.State == MEM_COMMIT && info.Type == MEM_MAPPED && matches!(info.Protect, PAGE_READONLY | PAGE_READWRITE)
 }
 
 /// The runtime is about to map, unmap or move physical pages of title
@@ -1640,6 +1808,9 @@ pub fn title_memory_remapping() -> Remapping {
     // each, under Wine a call into its Unix side each).
     let asked = crate::framelog::on().then(std::time::Instant::now);
     let held = MAPPING.write().unwrap_or_else(|e| e.into_inner());
+    // Odd while the change is under way ([`CHANGES`]).
+    CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    CHANGING_HERE.with(|c| c.set(true));
     crate::framelog::add(crate::framelog::T::Remaps, 1);
     if let Some(asked) = asked {
         crate::framelog::add(crate::framelog::T::RemapWaitUs, asked.elapsed().as_micros() as u64);
@@ -1734,11 +1905,18 @@ fn install() {
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };
         const WRITE: usize = 1;
-        if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
-            || r.NumberParameters < 2
-            || r.ExceptionInformation[0] != WRITE
-        {
+        const READ: usize = 0;
+        if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS || r.NumberParameters < 2 {
             return EXCEPTION_CONTINUE_SEARCH;
+        }
+        if r.ExceptionInformation[0] != WRITE {
+            // A read of a page that a change of mapping took away for its
+            // moment: again after it (`title_memory_gaps_waited`).
+            return if r.ExceptionInformation[0] == READ && came_back(r.ExceptionInformation[1], false) {
+                EXCEPTION_CONTINUE_EXECUTION
+            } else {
+                EXCEPTION_CONTINUE_SEARCH
+            };
         }
         let at = r.ExceptionInformation[1];
         let _timed = crate::vmstat::time(crate::vmstat::Site::Fault);
@@ -1756,7 +1934,8 @@ fn install() {
             crate::framelog::add(crate::framelog::T::GuardFaults, 1);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
-        if writable(at) {
+        drop(g);
+        if writable(at) || came_back(at, true) {
             EXCEPTION_CONTINUE_EXECUTION
         } else {
             EXCEPTION_CONTINUE_SEARCH

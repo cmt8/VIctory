@@ -80,7 +80,7 @@ pub(crate) extern "system" fn schedule(
 }
 
 /// Frames begun so far (frame waits that ended).
-pub(crate) fn current() -> u64 {
+pub fn current() -> u64 {
     FRAME.load(Ordering::Relaxed)
 }
 

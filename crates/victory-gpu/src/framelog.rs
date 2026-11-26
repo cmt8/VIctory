@@ -63,6 +63,15 @@ pub enum T {
     Remaps,
     RemapUs,
     RemapWaitUs,
+    /// Views of physical pages the runtime mapped and the pages they
+    /// show, views it unmapped and theirs, and pages a mapping call found
+    /// showing what it asked for already and left as they were (`xmem`,
+    /// `VICTORY_MAP_COALESCE`).
+    ViewMaps,
+    ViewMapPages,
+    ViewUnmaps,
+    ViewUnmapPages,
+    ViewPagesKept,
     /// Texture refreshes on every thread, and of them the wait for title
     /// memory to hold still; uploads recorded.
     RefreshUs,
@@ -412,7 +421,7 @@ fn text(f: &Frame) -> String {
          send-and-hash lists {:.1} ms in {:.0}, our compare lists {:.1} ms in {:.0}, all other lists {:.1} ms in {:.0} | \
          recording, all threads: {:.1} ms in {:.0} calls; all submit calls {:.1} ms | textures: refresh {:.1} ms ({:.1} waiting for memory to hold \
          still), {:.0} uploads, staging {:.0} made {:.0} reused | remapping: {:.0} calls {:.1} ms ({:.1} waiting for \
-         readers) | pipelines: {:.0} made, {:.0} loaded, {:.1} ms waited | disk: {:.0} reads {:.1} MB {:.1} worker ms | \
+         readers); views: {:.1} maps of {:.1} pages each, {:.1} unmaps of {:.1} pages each, {:.1} pages kept | pipelines: {:.0} made, {:.0} loaded, {:.1} ms waited | disk: {:.0} reads {:.1} MB {:.1} worker ms | \
          faults: {:.0} page, {:.0} guard | process: {:.0} user {:.0} kernel ms | pacing, all threads {:.1} ms | {:.0} \
          draws | {:.0} MB free | found on a slow core: the render thread {:.0} of {:.0} looks, the submit thread {:.0} of {:.0}, recording threads {:.0} of {:.0}",
         f.us / 1e3,
@@ -454,6 +463,11 @@ fn text(f: &Frame) -> String {
         t(T::Remaps),
         ms(T::RemapUs),
         ms(T::RemapWaitUs),
+        t(T::ViewMaps),
+        t(T::ViewMapPages) / t(T::ViewMaps).max(1.0),
+        t(T::ViewUnmaps),
+        t(T::ViewUnmapPages) / t(T::ViewUnmaps).max(1.0),
+        t(T::ViewPagesKept),
         s(S_PIPELINES_MADE),
         s(S_PIPELINES_LOADED),
         ms(T::PipelineWaitUs),
