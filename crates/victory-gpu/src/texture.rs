@@ -327,7 +327,16 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     {
         return true;
     }
-    let first = list.first_use(placed as usize) || tick.is_some();
+    // An upload from title memory can have already used this view: only a
+    // copy from the same GPU source satisfies this read, so the list keeps
+    // the last source copied into each view (fxceless #1241;
+    // `VICTORY_ALIAS_BY_SOURCE=0`: the view's first use in the list, as
+    // before).
+    static BY_SOURCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let by_source = *BY_SOURCE.get_or_init(|| std::env::var_os("VICTORY_ALIAS_BY_SOURCE").is_none_or(|v| v != "0"));
+    let first_use = list.first_use(placed as usize);
+    let changed = list.alias_source_changed(to, from);
+    let new_source = (if by_source { changed } else { first_use }) || tick.is_some();
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
     // shows as a change of state.
@@ -342,7 +351,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         unsafe { list.list.ResourceBarrier(&[barrier]) };
         before
     });
-    if !first && before.is_none() {
+    if !new_source && before.is_none() {
         return true;
     }
     card_writes(list, placed, to, None);
