@@ -90,6 +90,7 @@ mod diff_tests;
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+mod compute_wave;
 mod lower;
 mod own_bits;
 #[cfg(all(test, windows))]
@@ -111,6 +112,8 @@ mod waterfall_tests;
 #[cfg(all(test, windows))]
 mod wave64_tests;
 #[cfg(all(test, windows))]
+mod wave_forms_tests;
+#[cfg(all(test, windows))]
 mod wave_pin_tests;
 mod wave;
 
@@ -120,6 +123,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
+pub use compute_wave::{compute_wave_32, host_min_wave_set, set_host_min_wave};
 pub use lower::{host_settings, set_host_max_wave, set_host_rdna, set_thread_max_wave};
 pub use rect::rect_list_gs;
 pub use shader::{
@@ -348,6 +352,8 @@ pub fn translation_fingerprint() -> Vec<u8> {
         out.push(0);
     }
     out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
+    out.extend_from_slice(&host_min_wave_set().to_le_bytes());
+    out.push(u8::from(compute_wave_32()));
     out.extend_from_slice(&lower::host_rdna().to_le_bytes());
     out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());
     out.extend_from_slice(&shader::raw_views().to_le_bytes());
@@ -538,6 +544,45 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    emit_sized(c, native, p, st, io, res).map(|(shader, _)| shader)
+}
+
+/// [`emit`], with the wave size the program declares. With
+/// [`compute_wave_32`] a console wave64 compute program that the 32-lane
+/// forms take only approximately, or not at all, is translated as before
+/// (in waves of 64 where it declares a size).
+pub(crate) fn emit_sized(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
+    let sized = emit_forms(c, native, p, st, io, res);
+    if native.stage == HwStage::Cs && native.wave64 && compute_wave_32() {
+        if let Ok((_, wave)) = &sized
+            && *wave != Some(64)
+        {
+            return sized;
+        }
+        let before = compute_wave::without(|| emit_forms(c, native, p, st, io, res));
+        if before.is_ok() || sized.is_err() {
+            return before;
+        }
+    }
+    sized
+}
+
+/// [`emit_sized`] for the switches as they are.
+fn emit_forms(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
     let original = emit_program(c, native, p, st, io, res);
@@ -554,7 +599,7 @@ pub fn emit(
     // (a mask with lanes elsewhere is only helped by the exact forms: not by each half-wave
     // on its own)
     let exact_only = matches!(&original, Err(ShaderError::Unsupported { what, .. }) if *what == lower::MASK_ELSEWHERE);
-    if stuck && native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32 {
+    if stuck && native.stage == HwStage::Cs && native.wave64 && compute_wave::lanes_wave() == 32 {
         let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
         let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
             if why {
@@ -573,7 +618,9 @@ pub fn emit(
         // the same way last of all, each half-wave giving its own results
         // (approximate: a tile-wide result becomes two half-tile ones);
         // `VICTORY_WAVE_LOCAL=idiom` refuses those instead.
-        let strict = std::env::var_os("VICTORY_WAVE_LOCAL").is_some_and(|v| v == "idiom");
+        // (With `compute_wave_32` the approximate forms are left out too: the
+        // host takes the program in waves of 64 as before, `emit_sized`.)
+        let strict = std::env::var_os("VICTORY_WAVE_LOCAL").is_some_and(|v| v == "idiom") || compute_wave_32();
         let idiom = |p: &ir::Program, st: &structure::Structured| match lower::wave_local(p, st) {
             Ok(()) => true,
             Err((offset, what)) => {
@@ -602,7 +649,7 @@ pub fn emit(
                 let again = emit_program(c, native, p, st, io, res);
                 report(name, &again);
                 if done(&again) {
-                    return again.map(|(shader, _)| shader);
+                    return again;
                 }
             }
         }
@@ -627,7 +674,7 @@ pub fn emit(
                     let again = emit_program(c, native, p, st, io, res);
                     report("without skips, scalars followed", &again);
                     if done(&again) {
-                        return again.map(|(shader, _)| shader);
+                        return again;
                     }
                 }
                 // Still stopped where not every lane runs: the per-lane branches around
@@ -644,7 +691,7 @@ pub fn emit(
                         let again = widen(c, native, base, why);
                         report("wave-wide branches", &again);
                         if done(&again) {
-                            return again.map(|(shader, _)| shader);
+                            return again;
                         }
                     }
                 }
@@ -662,7 +709,7 @@ pub fn emit(
                     let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
                     report(&format!("local waves ({}), {name}", if exact { "idiom" } else { "APPROXIMATE" }), &local);
                     if done(&local) {
-                        return local.map(|(shader, _)| shader);
+                        return local;
                     }
                 }
             }
@@ -670,7 +717,7 @@ pub fn emit(
                 let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
                 report(if exact { "local waves (idiom)" } else { "local waves (APPROXIMATE)" }, &local);
                 if done(&local) {
-                    return local.map(|(shader, _)| shader);
+                    return local;
                 }
             }
         }
@@ -682,14 +729,14 @@ pub fn emit(
                         let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
                         report(&format!("local waves (APPROXIMATE, any mask), {name}"), &local);
                         if done(&local) {
-                            return local.map(|(shader, _)| shader);
+                            return local;
                         }
                     }
                 }
                 let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
                 report("local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
-                    return local.map(|(shader, _)| shader);
+                    return local;
                 }
             }
         }
@@ -711,7 +758,6 @@ pub fn emit(
         }
         other => other,
     };
-    let original = original.map(|(shader, _)| shader);
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
     if !matches!(original, Err(ShaderError::Unsupported { .. })) {
@@ -725,7 +771,7 @@ pub fn emit(
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    emit_program(c, native, &p, &st, &io, &res).map(|(shader, _)| shader)
+    emit_program(c, native, &p, &st, &io, &res)
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
@@ -747,7 +793,7 @@ fn widen(
     };
     match native.io {
         // (a program whose waves are the host's meets no one: no barrier, any group)
-        crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
+        crate::native::StageIo::Cs(_) if !(native.wave64 && compute_wave::lanes_wave() == 32) => {}
         crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
         crate::native::StageIo::Cs(cs) => {
             if why {

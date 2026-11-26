@@ -260,9 +260,14 @@ pub fn run(
     // Without VICTORY_HOST_WAVE / VICTORY_HOST_MAX_WAVE (`wave`, set per
     // worker), translate as for the adapter the pipelines are made on.
     if wave.is_none()
-        && let Some((lanes, _)) = host_caps
+        && let Some((lanes, rdna)) = host_caps
     {
         victory_shader::emit::set_host_max_wave(lanes);
+        // (An RDNA card runs waves of 32 and 64: compute programs then take
+        // waves of 32, `VICTORY_COMPUTE_WAVE`, as in a run.)
+        if rdna {
+            victory_shader::emit::set_host_min_wave(32);
+        }
     }
     // `VICTORY_HOST_RDNA=1`: as for an AMD RDNA card (`VICTORY_RDNA_FLOAT`).
     victory_shader::emit::set_host_rdna(std::env::var_os("VICTORY_HOST_RDNA").map_or_else(

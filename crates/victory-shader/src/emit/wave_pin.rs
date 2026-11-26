@@ -28,15 +28,33 @@ impl<'a> Lower<'a> {
     /// program's code was compiled for. A console wave64 program on a host
     /// of at most 32 lanes keeps what the lowering chose (the host takes no
     /// `WaveSize(64)`).
+    ///
+    /// With [`super::super::compute_wave_32`] (`VICTORY_COMPUTE_WAVE`) every
+    /// compute program declares the console's wave, wave operations or
+    /// not, so that no host lane layout is left to the driver: what the
+    /// lowering did not see as lane-dependent still runs in the console's
+    /// waves. A console wave64 program that the 32-lane forms took has
+    /// declared 32 already; one they did not take declares the console's 64
+    /// here, and is then translated as before (`emit_sized`). Left to the
+    /// host: a program without wave operations whose group barriers the
+    /// host leaves out (`fence_only`): a host wave of 64 holds more of such
+    /// a group together than one of 32. `VICTORY_WAVE_PIN` does not apply
+    /// then.
     pub(super) fn pin_wave(&mut self) {
-        if !super::super::wave_pin()
-            || self.x.native.stage != HwStage::Cs
-            || self.s.wave_size.is_some()
-            || self.s.flags & flags::WAVE_OPS == 0
-        {
+        if self.x.native.stage != HwStage::Cs || self.s.wave_size.is_some() {
             return;
         }
         let wave = if self.x.p.wave64 { 64 } else { 32 };
+        let wave_ops = self.s.flags & flags::WAVE_OPS != 0;
+        if super::super::compute_wave_32() {
+            if wave_ops || self.fence_only.is_empty() {
+                self.s.wave_size = Some(wave);
+            }
+            return;
+        }
+        if !super::super::wave_pin() || !wave_ops {
+            return;
+        }
         // (0: the host's widest wave is not known, as in most tests: then
         // nothing is declared, as before.)
         let host = host_max_wave();

@@ -2,7 +2,55 @@
 //! have to know beyond the lowering's own choice of them.
 
 use super::super::bitcode::{Bin, V, pred};
-use super::Lower;
+use super::{Lower, Parts, all_lane_blocks, lane_uniform, wave_tid};
+use crate::gfx10::{Fields, Operand};
+use crate::ir::Reg;
+
+/// Whether a `v_readfirstlane_b32` of the program reads a VGPR that may
+/// differ between the lanes of a console wave (not [`lane_uniform`]; not a
+/// waterfall loop's descriptor read, which is the lane's own), with
+/// [`super::super::compute_wave_32`] only.
+///
+/// Such a read makes the program's lanes the console's (`console_lanes`:
+/// threads relabelled as the halves exchange them) and crosses halves.
+/// The console's first lane of a wave64 program is in its lower half, so
+/// the upper half's host wave has to get the value from the lower one
+/// (`exchange`): without anything else crossing halves the lowering would
+/// split the wave without that, and the upper half would read its own
+/// first lane (lane 32: on the RX 7900 XTX threads 32..63 of a group of 64
+/// with LDS read thread 32's value). The program then takes the exchanging
+/// form, or keeps 64 lanes where that form cannot be had.
+/// (NVIDIA's forms are left as they were, the upper half reading its own
+/// first lane: there no form in waves of 64 is left to fall back on where
+/// the exchange cannot be had.)
+pub(super) fn first_lane_crosses(x: &Parts) -> bool {
+    if !x.native.wave64 || !super::super::compute_wave_32() {
+        return false;
+    }
+    let reads: Vec<_> = x
+        .p
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .filter(|i| i.name() == "v_readfirstlane_b32")
+        .filter(|i| !i.writes.first().is_some_and(|w| x.res.waterfall.reads.contains(&w.1)))
+        .filter_map(|i| match &i.fields {
+            Fields::Valu(v) => match v.src.first() {
+                Some(&Operand::Vector { reg, .. }) => Some(i.read(Reg::V(reg))),
+                _ => None,
+            },
+            _ => Some(None),
+        })
+        .collect();
+    if reads.is_empty() {
+        return false;
+    }
+    let Some(all) = all_lane_blocks(x.st) else {
+        return true;
+    };
+    let same = lane_uniform(x.p, x.st, &all, wave_tid(x.p, x));
+    reads.iter().any(|r| r.is_none_or(|v| !same.contains(&v)))
+}
 
 impl<'a> Lower<'a> {
     /// The upper half's value `hi` that `exchange_halves` read for this

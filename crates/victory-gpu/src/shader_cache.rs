@@ -134,6 +134,9 @@ fn build() -> [u8; 32] {
             // A missing upper half of a console wave64 program in host
             // waves of 32 (`victory_shader::emit::missing_upper_on`).
             "VICTORY_WAVE_MISSING_UPPER",
+            // Compute programs in waves of 32 on a host of 32 and 64
+            // (`victory_shader::emit::compute_wave_32`, also below).
+            "VICTORY_COMPUTE_WAVE",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
@@ -157,6 +160,10 @@ fn build() -> [u8; 32] {
     for value in victory_shader::emit::host_settings() {
         hash.update(&value.to_le_bytes());
     }
+    // Whether compute programs take waves of 32 (`VICTORY_COMPUTE_WAVE`,
+    // keyed above too), which depends on the host's narrowest wave as well.
+    hash.update(&victory_shader::emit::host_min_wave_set().to_le_bytes());
+    hash.update(&[u8::from(victory_shader::emit::compute_wave_32())]);
     *hash.finalize().as_bytes()
 }
 

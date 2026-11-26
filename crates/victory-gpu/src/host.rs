@@ -1121,8 +1121,17 @@ fn create() -> windows::core::Result<Host> {
             .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, (&raw mut o1).cast(), size_of_val(&o1) as u32)
             .is_ok()
         {
-            tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
             victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
+            victory_shader::emit::set_host_min_wave(o1.WaveLaneCountMin);
+            // `VICTORY_COMPUTE_WAVE` (on; `=0` or `=host`: off): on a host of waves of 32
+            // and 64 (RADV) compute programs are translated for and declare waves of 32
+            // (`victory_shader::emit::compute_wave_32`).
+            tracing::info!(
+                min = o1.WaveLaneCountMin,
+                max = o1.WaveLaneCountMax,
+                compute_wave_32 = victory_shader::emit::compute_wave_32(),
+                "host wave lanes"
+            );
             // (RDNA has waves of 32 and 64, the vendor's older cards of 64 alone.)
             let amd = crate::indirect::amd(&device);
             victory_shader::emit::set_host_rdna(amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64);
