@@ -613,6 +613,11 @@ fn translated(
 /// Runs `shader` once on `host` (one group) and gives the UAV's first
 /// `dwords` dwords; None where the device takes no such pipeline.
 fn run(host: &Host, shader: &HostShader, dwords: u32) -> Option<Vec<u32>> {
+    run_groups(host, shader, dwords, 1)
+}
+
+/// [`run`] in a dispatch of `groups` groups.
+fn run_groups(host: &Host, shader: &HostShader, dwords: u32, groups: u32) -> Option<Vec<u32>> {
     let (root, pso) = host.compute_pipeline(shader).ok()?;
     let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
     for u in &shader.user_data {
@@ -630,11 +635,22 @@ fn run(host: &Host, shader: &HostShader, dwords: u32) -> Option<Vec<u32>> {
                 roots: vec![(0, Root::Constants(ud))],
                 views: &[View::RawUav(dwords)],
                 samplers: &[],
-                groups: [1, 1, 1],
+                groups: [groups, 1, 1],
             },
         )
         .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
     Some(out[0][..dwords as usize].to_vec())
+}
+
+/// `words` with every `buffer_store_dword` (MUBUF opcode 0x1C) made a
+/// `buffer_atomic_add` (0x32) of the same dword at the same place: what the
+/// groups of a dispatch leave is then the sum of what each would store,
+/// whichever comes last.
+fn adding(words: &[u32]) -> Vec<u32> {
+    words
+        .iter()
+        .map(|&w| if w >> 26 == 0x38 && w >> 18 & 0x7F == 0x1C { w & !(0x7F << 18) | 0x32 << 18 } else { w })
+        .collect()
 }
 
 /// The programs, their console wave, the groups each runs in, and whether those are
@@ -738,6 +754,63 @@ fn the_wave_forms_on_the_card_give_the_consoles_results() {
     assert!(wrong.is_empty(), "forms that differ from the console: {wrong:?}");
 }
 
+/// The same cases in a dispatch of many groups at once, each group adding
+/// what it would store ([`adding`]): every group of the dispatch gives the
+/// console's result in the forms for a host of 64-lane waves and in those
+/// of [`super::compute_wave_32`], whose two host waves of a console wave
+/// meet through their group's shared memory and barriers while thousands of
+/// other groups do the same (the title's tile passes dispatch one group a
+/// tile).
+#[test]
+fn the_wave_forms_give_the_consoles_results_in_every_group_of_a_dispatch() {
+    const GROUPS: u32 = 4096;
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let mut wrong = Vec::new();
+    let mut ran = 0;
+    for (name, words, wave64, groups, flat) in cases() {
+        if name == "branch" {
+            // (per lane in every form; see the test above)
+            continue;
+        }
+        let wave = if wave64 { 64 } else { 32 };
+        let words = adding(words);
+        for &threads in groups {
+            let want: Vec<u32> = console(name, wave, threads).iter().map(|v| v.wrapping_mul(GROUPS)).collect();
+            for form in [Form::Host64, Form::Waves32] {
+                let shape = if flat { format!("8x{}", threads / 8) } else { format!("x{threads}") };
+                let label = format!("wave{wave} {name} {shape} {form:?} in {GROUPS} groups");
+                let (shader, declared) = match translated(&words, wave64, threads, flat, form) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        wrong.push(format!("{label}: not translated: {e}"));
+                        continue;
+                    }
+                };
+                let Some(got) = run_groups(&host, &shader, 4 * threads, GROUPS) else {
+                    eprintln!("{label}: declared {declared:?}: the device takes no such pipeline");
+                    continue;
+                };
+                ran += 1;
+                let diffs: Vec<String> = (0..got.len())
+                    .filter(|&i| got[i] != want[i])
+                    .map(|i| format!("t{}[{}]={:#x} (console {:#x})", i / 4, i % 4, got[i], want[i]))
+                    .collect();
+                if !diffs.is_empty() {
+                    let shown: Vec<&String> = diffs.iter().take(6).collect();
+                    eprintln!("{label}: declared {declared:?}: {} dwords differ: {shown:?}", diffs.len());
+                    wrong.push(label);
+                }
+            }
+        }
+    }
+    eprintln!("{ran} dispatches of {GROUPS} groups on the hardware device");
+    assert!(wrong.is_empty(), "forms that differ from the console: {wrong:?}");
+}
+
 /// A barrier only some threads reach (a lane branch around it), no wave operation: the
 /// host leaves the barrier out (`fence_only`).
 const BARRIER32: &[u32] = &[
@@ -784,4 +857,46 @@ fn each_form_declares_its_wave() {
     assert_eq!(declared(FIRST64, true, 128, Form::Host32), None);
     assert_eq!(declared(SUM64, true, 128, Form::Waves32), Some(32));
     assert_eq!(declared(BRANCH64, true, 128, Form::Waves32), None);
+}
+
+/// `VICTORY_COMPUTE_WAVE=pin` and `=forms` (no device needed): with `pin` the console
+/// wave32 programs declare their wave as with the whole switch and the console wave64
+/// programs are what they were before it; with `forms` the other way round.
+#[test]
+fn the_switch_can_leave_one_kind_of_program_as_before() {
+    let declared = |words: &[u32], wave64: bool, threads: u32, only: Option<bool>| {
+        let was = compute_wave::TEST_ONLY.replace(only);
+        let r = translated(words, wave64, threads, false, Form::Waves32);
+        compute_wave::TEST_ONLY.set(was);
+        r.unwrap_or_else(|e| panic!("{only:?}: {e}")).1
+    };
+    let before = |words: &[u32], wave64: bool, threads: u32| {
+        translated(words, wave64, threads, false, Form::Host64).unwrap_or_else(|e| panic!("{e}")).1
+    };
+    let (pin, forms) = (Some(false), Some(true));
+    // console wave32 programs: without wave operations, and with
+    assert_eq!(before(BRANCH32, false, 64), None);
+    assert_eq!(declared(BRANCH32, false, 64, None), Some(32));
+    assert_eq!(declared(BRANCH32, false, 64, pin), Some(32));
+    assert_eq!(declared(BRANCH32, false, 64, forms), None);
+    for only in [None, pin, forms] {
+        assert_eq!(declared(FIRST32, false, 64, only), Some(32), "{only:?}");
+    }
+    // console wave64 programs
+    for words in [BALLOT64, FIRST64, SUM64] {
+        assert_eq!(before(words, true, 128), Some(64));
+        assert_eq!(declared(words, true, 128, None), Some(32));
+        assert_eq!(declared(words, true, 128, pin), Some(64));
+        assert_eq!(declared(words, true, 128, forms), Some(32));
+    }
+    // ... and the code is the one of before, not only the wave
+    let code = |form: Form, only: Option<bool>| {
+        let was = compute_wave::TEST_ONLY.replace(only);
+        let r = translated(BALLOT64, true, 128, false, form);
+        compute_wave::TEST_ONLY.set(was);
+        r.expect("translated").0.dxil
+    };
+    assert!(code(Form::Waves32, pin) == code(Form::Host64, None));
+    assert!(code(Form::Waves32, forms) == code(Form::Waves32, None));
+    assert!(code(Form::Waves32, forms) != code(Form::Host64, None));
 }

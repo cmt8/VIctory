@@ -181,9 +181,10 @@ pub(crate) fn translation() -> [u8; 32] {
 pub fn precompile(container: &[u8]) -> Result<bool, String> {
     let _ = crate::host::host();
     let misses = MISSES.load(Ordering::Relaxed);
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let (name, build) = named(container);
+    let translate = |c: &[u8]| translate_named(&name, c);
     match CACHE.get() {
-        Some(cache) => cached(cache, &build(), container, translate, true)?,
+        Some(cache) => cached(cache, &build, container, translate, true)?,
         None => translate(container)?,
     };
     // (Counts other threads' misses too: the caller only adds them up.)
@@ -193,11 +194,40 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let (name, build) = named(container);
+    let translate = |c: &[u8]| translate_named(&name, c);
     match CACHE.get() {
-        Some(cache) => cached(cache, &build(), container, translate, refresh_in_runs()),
+        Some(cache) => cached(cache, &build, container, translate, refresh_in_runs()),
         None => translate(container),
     }
+}
+
+/// The name the log gives `container` (the `hash=` of `pipeline.rs`'s lines),
+/// and what its translation is keyed by: [`build`], but for a program
+/// `VICTORY_WAVE_KEEP` lists, which is translated as before
+/// (`victory_shader::emit::named`) and so kept apart from the translation a
+/// run without the variable makes of it. Every other program keeps its key,
+/// and its cached translation.
+fn named(container: &[u8]) -> (String, [u8; 32]) {
+    let name = blake3::hash(container).to_hex()[..16].to_owned();
+    let build = kept_key(build(), victory_shader::emit::wave_kept(&name));
+    (name, build)
+}
+
+/// `build`, or the key beside it for a program translated as before.
+fn kept_key(build: [u8; 32], kept: bool) -> [u8; 32] {
+    if !kept {
+        return build;
+    }
+    let mut hash = blake3::Hasher::new();
+    hash.update(&build);
+    hash.update(b"VICTORY_WAVE_KEEP");
+    *hash.finalize().as_bytes()
+}
+
+/// The translation of `container`, which the log names `name`.
+fn translate_named(name: &str, container: &[u8]) -> Result<HostShader, String> {
+    victory_shader::emit::named(name, || victory_shader::emit::translate(container)).map_err(|e| e.to_string())
 }
 
 /// The cache entry's converter: the build and the container in, the
@@ -519,6 +549,15 @@ mod tests {
             }],
             half_views: vec![(0, 8), (4, 0)],
         }
+    }
+
+    #[test]
+    fn a_program_translated_as_before_is_keyed_apart_and_no_other() {
+        let build = [7u8; 32];
+        assert_eq!(kept_key(build, false), build);
+        assert_ne!(kept_key(build, true), build);
+        assert_eq!(kept_key(build, true), kept_key(build, true));
+        assert_ne!(kept_key(build, true), kept_key([8u8; 32], true));
     }
 
     #[test]
