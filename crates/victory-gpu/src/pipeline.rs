@@ -504,10 +504,30 @@ pub(crate) fn bound(this: This) {
 /// use starts that, see [`make`]).
 #[cfg(windows)]
 pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
-    if this.is_null() {
+    if this.is_null() || no_draws() {
         return None;
     }
     make::ready(&pipeline(this).host)
+}
+
+/// `VICTORY_NO_DRAWS=1` (a measuring switch, off by default): no host
+/// pipeline is made and no shader translated for one; every draw and
+/// dispatch of the title is dropped. The title runs as before (its code,
+/// streaming, memory) and the picture stays black: the frame time is then
+/// the title's own code, the system's services under Wine and the layer's
+/// work that does not hang on a draw, the floor no graphics work can
+/// lower. (Kelvaroq's patch 0061, after the switch of the same name in Cold
+/// Project VI.)
+#[cfg(windows)]
+pub(crate) fn no_draws() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_NO_DRAWS").is_some_and(|v| v == "1");
+        if on {
+            tracing::warn!("VICTORY_NO_DRAWS=1: no pipelines, no shaders, nothing of the title drawn");
+        }
+        on
+    })
 }
 
 /// Host pipelines queued and not made yet.
@@ -765,7 +785,9 @@ fn hand_out(
     #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
     #[cfg(windows)]
-    make::early(&host);
+    if !no_draws() {
+        make::early(&host);
+    }
     #[cfg(windows)]
     let builder = of_builder(&shaders);
     #[cfg(windows)]
