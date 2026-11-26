@@ -25,6 +25,13 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 #[path = "intersect.rs"]
 pub(super) mod intersect;
 
+/// Format loads that move 16-bit halves without the d16 form, a child
+/// module so it shares the emitter's state.
+#[path = "halves.rs"]
+mod halves;
+#[path = "coherent.rs"]
+mod coherent;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -55,6 +62,8 @@ pub(crate) struct Lowered {
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
+    /// See [`super::HostShader::half_views`].
+    pub half_views: Vec<(u8, u32)>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// The wave size the shader requires of the host, if any.
@@ -220,6 +229,13 @@ struct Lower<'a> {
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
+    /// Table descriptors read or written sixteen bits a channel
+    /// ([`super::HostShader::half_views`]): root parameter, dword offset.
+    half_views: std::collections::BTreeSet<(u8, u32)>,
+    /// [`Self::places_read_as_halves`], found before the code is lowered.
+    halves_only: std::collections::BTreeSet<(u8, u32)>,
+    /// [`Self::find_coherent`], found before the code is lowered.
+    coherent: HashSet<(usize, u32)>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
@@ -1160,65 +1176,7 @@ pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
 /// TEXCOORD4's second dword stays zero.
 type PackedLayout = Vec<(u8, Vec<(u8, u8, u8, u8)>)>;
 
-fn packed_layout(elements: &[SigElement], packs: &[(u8, Option<u8>)]) -> PackedLayout {
-    let of_row = |r: u8| {
-        let mut of: Vec<&SigElement> = elements
-            .iter()
-            .filter(|e| e.row == Some(u32::from(r)))
-            .collect();
-        of.sort_by_key(|e| e.col);
-        of
-    };
-    let mut packs = packs.to_vec();
-    packs.sort_unstable();
-    packs.dedup_by_key(|p| p.0);
-    // Per parameter: its first row, the dwords used, the elements.
-    let mut layout: Vec<(u8, u8, Vec<(u8, u8, u8, u8)>)> = Vec::new();
-    let mut behind = Vec::new();
-    for &(a, b) in &packs {
-        let mut placed = Vec::new();
-        let mut at = 0u8;
-        if !of_row(a).is_empty() {
-            for r in [Some(a), b].into_iter().flatten() {
-                let of = of_row(r);
-                let Some((lead, more)) = of.split_first() else {
-                    continue;
-                };
-                placed.push((at, r, lead.col, lead.cols));
-                at += lead.cols.div_ceil(2);
-                behind.extend(more.iter().map(|e| (r, e.col, e.cols)));
-            }
-        }
-        layout.push((a, at, placed));
-    }
-    behind.sort_unstable();
-    for (r, col, cols) in behind {
-        let need = cols.div_ceil(2);
-        if let Some(p) = layout.iter_mut().find(|p| p.1 + need <= 4) {
-            p.2.push((p.1, r, col, cols));
-            p.1 += need;
-        }
-    }
-    layout.into_iter().map(|(a, _, of)| (a, of)).collect()
-}
-
-/// Where half `h` (dword h / 2, the high half when odd) of the parameter
-/// whose first 16-bit row is `a` comes from: a register and column of
-/// `elements`, none for padding ([`packed_layout`]; `packs` lists every
-/// parameter packing two 16-bit rows per dword).
-fn packed_half(
-    elements: &[SigElement],
-    packs: &[(u8, Option<u8>)],
-    a: u8,
-    h: u8,
-) -> Option<(u8, u8)> {
-    let layout = packed_layout(elements, packs);
-    let (_, of) = layout.iter().find(|p| p.0 == a)?;
-    of.iter().find_map(|&(dword, row, col, cols)| {
-        let k = h.checked_sub(2 * dword)?;
-        (k < cols).then_some((row, col + k))
-    })
-}
+include!("lower_packed.rs");
 
 /// Whether a pixel program runs its depth and stencil tests before the
 /// shader on the console (`DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER`, bit 12:
@@ -1602,6 +1560,9 @@ impl<'a> Lower<'a> {
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
+            half_views: Default::default(),
+            halves_only: Default::default(),
+            coherent: HashSet::new(),
             samplers: Vec::new(),
             descriptors: x
                 .res
@@ -2305,6 +2266,8 @@ impl<'a> Lower<'a> {
 
     fn run(mut self) -> Result<Lowered, Stop> {
         let p = self.x.p;
+        self.halves_only = self.places_read_as_halves();
+        self.coherent = self.find_coherent();
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
             self.rpo[b] = n;
@@ -2390,6 +2353,7 @@ impl<'a> Lower<'a> {
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
+        let half_views = std::mem::take(&mut self.half_views).into_iter().collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
         Ok(Lowered {
@@ -2398,6 +2362,7 @@ impl<'a> Lower<'a> {
             root_cbvs,
             root_srvs,
             root_uavs,
+            half_views,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -6050,7 +6015,15 @@ impl<'a> Lower<'a> {
                 let props = if un.starts_with("buffer_load_format")
                     || un.starts_with("buffer_store_format")
                 {
-                    (10 | u, 0x409)
+                    // (Unsigned integers where the access moves halves.)
+                    let halves = self
+                        .table_place(&Source::Loaded { load: site, first })
+                        .is_some_and(|p| {
+                            self.halves_only.contains(&p)
+                                && (un.contains("_format_d16_")
+                                    || self.format_load_read_as_halves(ui))
+                        });
+                    (10 | u, if halves { 0x405 } else { 0x409 })
                 } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
                     (12 | u, stride)
                 } else {
@@ -6620,39 +6593,6 @@ impl<'a> Lower<'a> {
         let bits = self.s.m.bin(c, Bin::Or, e, m);
         let is_zero = self.s.m.cmp(c, pred::EQ, a, zero);
         self.s.m.select(c, is_zero, zero, bits)
-    }
-
-    /// Channels of buffer format `format`, as [`Self::format_load`] gives
-    /// them, as d16 data: 16 bits each, two per dword, low half first (an
-    /// odd last high half 0). Integer formats keep their low 16 bits; the
-    /// others become f16.
-    fn d16_channels(&mut self, format: u8, channels: Vec<V>) -> Result<Vec<V>, Why> {
-        let (_, numeric) = buffer_format(format).ok_or("a buffer format")?;
-        let c = self.cur;
-        let mut halves = Vec::new();
-        for x in channels {
-            halves.push(if matches!(numeric, Numeric::Uint | Numeric::Sint) {
-                let m = self.s.m.i32(0xFFFF);
-                self.s.m.bin(c, Bin::And, x, m)
-            } else {
-                let (f, i32t) = (self.as_float(x), self.s.t.i32);
-                self.s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
-            });
-        }
-        let mut out = Vec::new();
-        for pair in halves.chunks(2) {
-            out.push(match *pair {
-                [lo, hi] => {
-                    let k16 = self.s.m.i32(16);
-                    let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
-                    self.s.m.bin(c, Bin::Or, lo, hi)
-                }
-                [lo] => lo,
-                _ => unreachable!("chunks of one or two"),
-            });
-        }
-        Ok(out)
     }
 
     /// The byte offset a buffer descriptor built around a root descriptor adds
@@ -10860,6 +10800,7 @@ impl<'a> Lower<'a> {
             .copied()
             .ok_or("an untracked buffer")?;
         let used = self.used_kind(src);
+        let halves = self.moves_halves(inst, src, typed, d16);
         let (base, extra) = self.built_offset(src)?;
         if base != 0 {
             let b = self.s.m.i32(base);
@@ -10923,7 +10864,10 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
-        let u = if uav { 0x1000 } else { 0 };
+        let mut u = if uav { 0x1000 } else { 0 };
+        if uav && !typed && self.is_coherent(src) {
+            u |= 0x4000; // globally coherent
+        }
         let iu = self.s.m.undef(self.s.t.i32);
         if let Some((bits, signed)) = narrow {
             // Below a dword: raw buffers are read and written in dwords on
@@ -11074,6 +11018,8 @@ impl<'a> Lower<'a> {
             let mut vals =
                 self.vgprs(inst, data.as_ref().ok_or("buffer store data")?, regs as u8)?;
             if d16 {
+                // Through a view of a table each half is stored as it is
+                // (`halves`). Reached another way:
                 // shortcut: d16 data is taken as f16 (integer formats would
                 // keep 16 bits), widened for the 32-bit float store.
                 let mut wide = Vec::new();
@@ -11082,6 +11028,11 @@ impl<'a> Lower<'a> {
                     if k % 2 == 1 {
                         let k16 = self.s.m.i32(16);
                         x = self.s.m.bin(c, Bin::LShr, x, k16);
+                    }
+                    if halves {
+                        let low = self.s.m.i32(0xffff);
+                        wide.push(self.s.m.bin(c, Bin::And, x, low));
+                        continue;
                     }
                     let f32t = self.s.t.f32;
                     let f = self
@@ -11098,12 +11049,21 @@ impl<'a> Lower<'a> {
                 if count != 4 || *offen || *offset != 0 {
                     return Err("a typed buffer store of some channels or at an offset");
                 }
-                args.push(self.handle(site, src, false, (10 | u, 0x409))?);
+                // Four unsigned integers for halves, four floats otherwise.
+                let component = if halves { 0x405 } else { 0x409 };
+                args.push(self.handle(site, src, false, (10 | u, component))?);
                 args.extend([index.unwrap_or(self.s.m.i32(0)), iu]);
                 for x in vals {
-                    args.push(self.as_float(x));
+                    args.push(if halves { x } else { self.as_float(x) });
                 }
-                (69, "bufferStore.f32")
+                (
+                    69,
+                    if halves {
+                        "bufferStore.i32"
+                    } else {
+                        "bufferStore.f32"
+                    },
+                )
             } else {
                 match index {
                     // A raw buffer (stride 1) written by index: the index is the byte.
@@ -11163,16 +11123,30 @@ impl<'a> Lower<'a> {
             if uav {
                 self.s.flags |= flags::TYPED_UAV_LOADS;
             }
-            let h = self.handle(site, src, false, (10 | u, 0x409))?;
             let index = index.unwrap_or(self.s.m.i32(0));
-            self.s.op(
-                c,
-                "bufferLoad.f32",
-                Attr::ReadOnly,
-                self.s.t.res_ret,
-                68,
-                &[h, index, iu],
-            )
+            if halves {
+                let h = self.handle(site, src, false, (10 | u, 0x405))?;
+                let i32t = self.s.t.i32;
+                let ret = self.s.m.named_struct("dx.types.ResRet.i32", vec![i32t; 5]);
+                self.s.op(
+                    c,
+                    "bufferLoad.i32",
+                    Attr::ReadOnly,
+                    ret,
+                    68,
+                    &[h, index, iu],
+                )
+            } else {
+                let h = self.handle(site, src, false, (10 | u, 0x409))?;
+                self.s.op(
+                    c,
+                    "bufferLoad.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    68,
+                    &[h, index, iu],
+                )
+            }
         } else {
             let mask = self.s.m.i8((1u8 << count) - 1);
             let align = self.s.m.i32(4);
@@ -11222,16 +11196,21 @@ impl<'a> Lower<'a> {
             return Err("a buffer result");
         };
         if d16 {
-            // Two f16 channels per VGPR (an odd last high half 0).
+            // Two f16 channels per VGPR (an odd last high half 0); through
+            // a view of a table, the 16 bits of each as they are.
             let k16 = self.s.m.i32(16);
             let i32t = self.s.t.i32;
             for k in 0..count.div_ceil(2) {
                 let mut x = None;
                 for ch in (2 * k..(2 * k + 2).min(count)).rev() {
                     let f = self.s.m.extract(c, r, ch);
-                    let h = self
-                        .s
-                        .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
+                    let h = if halves {
+                        let low = self.s.m.i32(0xffff);
+                        self.s.m.bin(c, Bin::And, f, low)
+                    } else {
+                        self.s
+                            .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+                    };
                     x = Some(match x {
                         Some(hi) => {
                             let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
@@ -11246,7 +11225,8 @@ impl<'a> Lower<'a> {
         }
         for k in 0..count {
             let x = self.s.m.extract(c, r, k);
-            let x = self.as_int(x);
+            // (Integers already where the load moved halves.)
+            let x = if halves { x } else { self.as_int(x) };
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())

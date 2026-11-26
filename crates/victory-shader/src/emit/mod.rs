@@ -93,6 +93,8 @@
 //!   It binds nothing.
 
 mod bitcode;
+#[cfg(all(test, windows))]
+mod coherent_tests;
 mod container;
 #[cfg(all(test, windows))]
 mod cube_lod_tests;
@@ -250,6 +252,25 @@ pub fn early_depth_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_EARLY_DEPTH").is_none_or(|v| v != "0"))
 }
 
+/// Whether 16-bit typed buffer accesses through a table's views move their
+/// bits as unsigned integers (`HostShader::half_views`; tippythetaidum's
+/// fix for the faces' network). `VICTORY_HALF_BITS`: on, `=0` moves them
+/// by way of floats as before, for A/B runs. Part of the translation: the
+/// shader cache keys on it.
+pub fn half_bits() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HALF_BITS").is_none_or(|v| v != "0"))
+}
+
+/// Whether a raw unordered buffer the program loads past the cache (GLC)
+/// is globally coherent on the host (`lower::coherent`; after
+/// AvatarManz/VIctory-7900XTX 875a63a4). `VICTORY_GLC_COHERENT`: on, `=0`
+/// off, for A/B runs. Part of the translation: the shader cache keys on it.
+pub fn glc_coherent() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GLC_COHERENT").is_none_or(|v| v != "0"))
+}
+
 /// Whether the ray-tracing node tests (`image_bvh_intersect_ray`,
 /// `image_bvh64_intersect_ray`) answer "nothing here" without reading the
 /// node: a box node has no child the ray enters, any other node is a
@@ -356,6 +377,21 @@ pub struct HostShader {
     pub root_uavs: Vec<u8>,
     /// Heap descriptors that can be selected from root state at bind time.
     pub root_indexed_views: Vec<crate::resource::RootIndexedView>,
+    /// Table descriptors (root parameter, dword offset in the table) whose
+    /// buffer the shader reads or writes sixteen bits a channel
+    /// (`buffer_load_format_d16_*`, `buffer_store_format_d16_*`), in
+    /// order. On the console each channel's 16 bits move as they are
+    /// through a 16-bit float view and through a 16-bit integer one alike
+    /// (the title keeps half floats, and indices beside them, in
+    /// `R16G16B16A16_UINT` and `R16_UINT` buffers). The DXIL moves them as
+    /// unsigned integers, which an unsigned 16-bit view carries unchanged;
+    /// the host shows the shader a 16-bit float or signed buffer view at
+    /// these places as the unsigned format of the same layout.
+    /// shortcut: a view in a normalised 16-bit format, whose values the
+    /// console would convert to halves, is read as its integers; a
+    /// descriptor picked at run time keeps the float path (its slot, and so
+    /// its format, is known only then).
+    pub half_views: Vec<(u8, u32)>,
 }
 
 impl HostShader {
@@ -791,6 +827,7 @@ fn emit_program(
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
+        half_views: l.half_views,
     };
     Ok((shader, wave_size))
 }
@@ -1239,6 +1276,7 @@ mod tests {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
+            half_views: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1251,6 +1289,7 @@ mod tests {
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
                 root_indexed_views: Vec::new(),
+                half_views: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -1735,6 +1774,7 @@ mod tests {
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
                 root_indexed_views: Vec::new(),
+                half_views: l.half_views.clone(),
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [
