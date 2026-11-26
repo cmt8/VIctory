@@ -76,6 +76,11 @@ impl Pending {
     }
 }
 
+/// Whether `p`'s host pipeline is still being made (queued, not done).
+pub(crate) fn being_made(p: &Pending) -> bool {
+    p.made.get().is_none()
+}
+
 /// Why a pipeline has no host pipeline (`super::drop_reasons`): its
 /// shaders that do not translate, else "refused" or "being made"; `None`
 /// if it has one.

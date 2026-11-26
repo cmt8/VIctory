@@ -881,6 +881,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             // PR #671): a copy read whatever the host texture held.
             if crate::texture::title_written(from) {
                 crate::texture::upload(list, src, from);
+                crate::texture::copied_out_of(src);
             }
             // Depth textures shaders also write: what they wrote, first.
             list.twin_use(dst, false, true);
@@ -1038,6 +1039,7 @@ extern "system" fn copy_texture_region(
             list.twin_use(src.resource, false, false);
             if crate::texture::title_written(texture) {
                 crate::texture::upload(list, src.resource, texture);
+                crate::texture::copied_out_of(src.resource);
             }
             if !same {
                 ensure_state(list, src.resource, COPY_SOURCE);
@@ -1152,6 +1154,7 @@ fn read_back(
     list.twin_use(src.resource, false, false);
     if crate::texture::title_written(texture) {
         crate::texture::upload(list, src.resource, texture);
+        crate::texture::copied_out_of(src.resource);
     }
     ensure_state(list, src.resource, COPY_SOURCE);
     let mut from = src;
