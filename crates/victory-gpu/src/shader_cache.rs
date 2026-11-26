@@ -83,6 +83,7 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_HALF_SUM_PRESENT",
                     "VICTORY_BUFFER_GUARD",
                     "VICTORY_EARLY_DEPTH",
+                    "VICTORY_HALF_BITS",
                     // The node tests miss unless the structure builder runs
                     // (`victory_shader::emit::bvh_miss`).
                     "VICTORY_BVH_MISS",

@@ -5,9 +5,82 @@
 
 use std::collections::HashSet;
 
-use super::{Fields, Inst, Lower, Operand, Reg, Role, RootType, Source, Value};
+use super::super::bitcode::{Attr, Bin, V};
+use super::{
+    Fields, Inst, Lower, Numeric, Operand, Reg, Role, RootType, Source, Value, Why, buffer_format,
+};
 
 impl<'a> Lower<'a> {
+    /// The table descriptor `src` is, as (root parameter, dword in the
+    /// table), when the code loads it from a fixed place in a table: the
+    /// load's own place, not the start of the range its used-resource
+    /// entry describes (a range of several descriptors starts before most
+    /// of them). `None` for a descriptor picked at run time, built in the
+    /// code or chosen by control flow.
+    pub(super) fn table_place(&self, src: &Source) -> Option<(u8, u32)> {
+        let Source::Loaded { load, first } = src else {
+            return None;
+        };
+        let a = self.scalar.get(load)?;
+        let rp = self.x.native.layout.get(a.param)?;
+        (rp.root == RootType::Table && a.dynamic.is_none())
+            .then(|| (rp.slot, a.offset / 4 + u32::from(*first)))
+    }
+
+    /// Whether the buffer access `inst` through `src` moves sixteen bits a
+    /// channel through a view of a table: the bits go as they are, as
+    /// unsigned integers, and the host is told (the place goes into
+    /// `half_views`), which shows the shader a 16-bit float view there as
+    /// its unsigned twin ([`super::super::HostShader::half_views`]). A
+    /// format load of whole dwords whose every use reads one half of a
+    /// result as a half float moves 16-bit integers too (the head
+    /// program's reads of the face network's output), where every access
+    /// through its view does ([`Self::places_read_as_halves`]). A d16
+    /// access too only where every access does: a whole float read
+    /// through the same place would see the unsigned twin.
+    pub(super) fn moves_halves(&mut self, inst: &Inst, src: &Source, typed: bool, d16: bool) -> bool {
+        let place = typed.then(|| self.table_place(src)).flatten().filter(|p| {
+            self.halves_only.contains(p) && (d16 || self.format_load_read_as_halves(inst))
+        });
+        if let Some(place) = place {
+            self.half_views.insert(place);
+        }
+        place.is_some()
+    }
+
+    /// Channels of buffer format `format`, as [`Self::format_load`] gives
+    /// them, as d16 data: 16 bits each, two per dword, low half first (an
+    /// odd last high half 0). Integer formats keep their low 16 bits; the
+    /// others become f16.
+    pub(super) fn d16_channels(&mut self, format: u8, channels: Vec<V>) -> Result<Vec<V>, Why> {
+        let (_, numeric) = buffer_format(format).ok_or("a buffer format")?;
+        let c = self.cur;
+        let mut halves = Vec::new();
+        for x in channels {
+            halves.push(if matches!(numeric, Numeric::Uint | Numeric::Sint) {
+                let m = self.s.m.i32(0xFFFF);
+                self.s.m.bin(c, Bin::And, x, m)
+            } else {
+                let (f, i32t) = (self.as_float(x), self.s.t.i32);
+                self.s
+                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+            });
+        }
+        let mut out = Vec::new();
+        for pair in halves.chunks(2) {
+            out.push(match *pair {
+                [lo, hi] => {
+                    let k16 = self.s.m.i32(16);
+                    let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
+                    self.s.m.bin(c, Bin::Or, lo, hi)
+                }
+                [lo] => lo,
+                _ => unreachable!("chunks of one or two"),
+            });
+        }
+        Ok(out)
+    }
+
     /// Whether every use of `value`, a typed buffer load's result, reads
     /// one 16-bit half of it as a half float: a `v_fma_mix*` source with
     /// its `op_sel_hi` bit set, or `v_cvt_f32_f16`. A program that takes a
@@ -103,6 +176,10 @@ impl<'a> Lower<'a> {
     /// time: what the program makes of such a view is not halves alone.
     pub(super) fn places_read_as_halves(&self) -> std::collections::BTreeSet<(u8, u32)> {
         let mut halves = std::collections::BTreeSet::new();
+        // (None with the switch off: every access keeps the float path.)
+        if !super::super::half_bits() {
+            return halves;
+        }
         let mut other = std::collections::BTreeSet::new();
         let mut picked = HashSet::new();
         for d in &self.x.res.descriptors {
