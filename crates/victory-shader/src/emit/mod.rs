@@ -89,6 +89,8 @@
 //!   It binds nothing.
 
 mod bitcode;
+#[cfg(all(test, windows))]
+mod coherent_tests;
 mod container;
 #[cfg(all(test, windows))]
 mod cube_lod_tests;
@@ -227,6 +229,15 @@ pub fn early_depth_on() -> bool {
 pub fn half_bits() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_HALF_BITS").is_none_or(|v| v != "0"))
+}
+
+/// Whether a raw unordered buffer the program loads past the cache (GLC)
+/// is globally coherent on the host (`lower::coherent`; after
+/// AvatarManz/VIctory-7900XTX 875a63a4). `VICTORY_GLC_COHERENT`: on, `=0`
+/// off, for A/B runs. Part of the translation: the shader cache keys on it.
+pub fn glc_coherent() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GLC_COHERENT").is_none_or(|v| v != "0"))
 }
 
 /// Whether the ray-tracing node tests (`image_bvh_intersect_ray`,

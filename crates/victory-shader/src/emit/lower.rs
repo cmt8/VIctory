@@ -29,6 +29,8 @@ pub(super) mod intersect;
 /// module so it shares the emitter's state.
 #[path = "halves.rs"]
 mod halves;
+#[path = "coherent.rs"]
+mod coherent;
 
 type Why = &'static str;
 
@@ -228,6 +230,8 @@ struct Lower<'a> {
     half_views: std::collections::BTreeSet<(u8, u32)>,
     /// [`Self::places_read_as_halves`], found before the code is lowered.
     halves_only: std::collections::BTreeSet<(u8, u32)>,
+    /// [`Self::find_coherent`], found before the code is lowered.
+    coherent: HashSet<(usize, u32)>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
@@ -1608,6 +1612,7 @@ impl<'a> Lower<'a> {
             user_reads: BTreeMap::new(),
             half_views: Default::default(),
             halves_only: Default::default(),
+            coherent: HashSet::new(),
             samplers: Vec::new(),
             descriptors: x
                 .res
@@ -2309,6 +2314,7 @@ impl<'a> Lower<'a> {
     fn run(mut self) -> Result<Lowered, Stop> {
         let p = self.x.p;
         self.halves_only = self.places_read_as_halves();
+        self.coherent = self.find_coherent();
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
             self.rpo[b] = n;
@@ -10867,7 +10873,10 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
-        let u = if uav { 0x1000 } else { 0 };
+        let mut u = if uav { 0x1000 } else { 0 };
+        if uav && !typed && self.is_coherent(src) {
+            u |= 0x4000; // globally coherent
+        }
         let iu = self.s.m.undef(self.s.t.i32);
         if let Some((bits, signed)) = narrow {
             // Below a dword: raw buffers are read and written in dwords on
