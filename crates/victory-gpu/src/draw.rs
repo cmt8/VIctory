@@ -1312,6 +1312,22 @@ impl State {
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
         self.host_heaps_set = false;
+        // A table with a constant buffer view reads the scratch memory of
+        // the host list it was made in, which that list fills when it is
+        // sent and uses again once it has run: the part before may have,
+        // while this one still reads it (constants of another recording;
+        // and what the title wrote to them since is not seen). Those are
+        // made afresh in this part, from its own scratch. The others stay
+        // (their slots hold what they show), and are gone through again
+        // for this host list whatever its epoch says. The dynamic slots of
+        // all stay the list's until its state goes.
+        if cut_tables() {
+            self.fresh_tables.retain(|_, table| !table.constants);
+            for table in self.fresh_tables.values_mut() {
+                table.epoch = 0;
+                table.ready.clear();
+            }
+        }
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
@@ -1613,9 +1629,9 @@ impl State {
         }
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them, with both a view heap and a sampler heap bound.
-        // (`VICTORY_FALLBACK_HEAPS=1`, codec-d/cool_fox 641835a4: a host
-        // heap of one slot for one the title did not set; else only those it
-        // set, as before.)
+        // (codec-d/cool_fox 641835a4: a heap of ours for one the title did
+        // not set, as long as a title's and every slot null;
+        // `VICTORY_FALLBACK_HEAPS=0`: only those it set, as before.)
         let fallback = crate::host::fallback_heaps();
         if (fallback && !self.host_heaps_set) || self.host_heaps != self.heaps {
             let mut view_heap: Option<ID3D12DescriptorHeap> = None;
@@ -2744,6 +2760,11 @@ impl State {
                 let _ = crate::residency::take_staging_deferred();
                 readable(list, sampled.kind, view);
                 crate::texture::PICKING.set(None);
+                // Made now if it was left until its upload was recorded
+                // (`HostHeap::remake_written`).
+                if let Some(handle) = heap.handle(index) {
+                    host.remake_written(index, handle, false);
+                }
             }
             // A staging buffer refused or put off (`crate::residency`) leaves
             // the slot due: marking it served would lose its only retry.
@@ -3498,8 +3519,20 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        if let Some(view) = host.mirror(index, handle, true) {
+        // (Read in the title's own slot: a view held back for it is needed
+        // before the next submission.)
+        if let Some(view) = host.mirror_required(index, handle, true) {
+            // Counted only: the title's slot is read in place by others too.
+            if matches!(u.kind, ResourceType::Srv | ResourceType::Uav | ResourceType::Cbv)
+                && crate::descriptor::host::kind_mismatch(&view, u.dwords)
+            {
+                let n = crate::descriptor::host::KIND_MISMATCHES[1].fetch_add(1, Ordering::Relaxed);
+                if n == 0 {
+                    tracing::warn!(index, dwords = u.dwords, ?view, "a title slot read in place holds a view of another kind than the shader reads");
+                }
+            }
             readable(list, u.kind, &view);
+            host.remake_written(index, handle, true);
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
@@ -3677,7 +3710,8 @@ impl State {
                 made.push((slot, u32::MAX));
                 continue;
             };
-            self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
+            self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new(), constants: false });
+            let mut constants = false;
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of
@@ -3699,6 +3733,7 @@ impl State {
             let recording = self.recording;
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
+            let kind_null = crate::descriptor::host::kind_null();
             for k in 0..n {
                 let index = first + k;
                 // The unsigned twin of the title's view, where the shader
@@ -3710,6 +3745,9 @@ impl State {
                 } else {
                     None
                 };
+                // What the shader reads there, if it names the slot: only
+                // buffers' descriptors, or only textures'.
+                let read = if kind_null && group.entry(k).is_some() { read_as(&group.entries, k) } else { None };
                 // A view this list has made before: its descriptor copied,
                 // and nothing more if nothing changed in the list since.
                 if list_views
@@ -3717,6 +3755,14 @@ impl State {
                     && let Some(words) = crate::descriptor::record_at(table + u64::from(k) * 32)
                     && let Some(mut listed) = host.make_listed(recording, words, index)
                 {
+                    if let Some((as_buffer, unordered)) = read
+                        && as_buffer != listed.buffer
+                    {
+                        // (As below; the slot is this list's, which is not
+                        // sent yet.)
+                        null_of_kind(host, index, as_buffer, unordered);
+                        continue;
+                    }
                     let kind = group
                         .entry(k)
                         .map(|u| u.kind)
@@ -3755,7 +3801,23 @@ impl State {
                 }
                 let used = group.entry(k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
+                    Some(view)
+                        if read.is_some_and(|(as_buffer, _)| {
+                            crate::descriptor::host::kind_mismatch(&view, if as_buffer { 4 } else { 8 })
+                        }) =>
+                    {
+                        // A texture view where the shader reads a buffer: its
+                        // descriptor's upper half read as a buffer's is
+                        // address 0 with a large size on RADV (a page
+                        // fault); a buffer view where it reads a texture is
+                        // no image's descriptor either. The console read
+                        // whatever the first dwords said. Read as nothing
+                        // instead.
+                        let (as_buffer, unordered) = read.unwrap_or_default();
+                        null_of_kind(host, index, as_buffer, unordered);
+                    }
                     Some(View::Constant(address, size)) => {
+                        constants = true;
                         // Renderer port 5: title memory in place is the
                         // card's to read where it is; nothing is copied.
                         if crate::port_cbv::in_place_on() {
@@ -3779,15 +3841,19 @@ impl State {
                         host.constant_at(index, &buffer, gpu, size);
                     }
                     Some(view) => {
-                        match &shown {
-                            Some(shown) => host.make_at(index, shown),
-                            None => host.make_at(index, &view),
-                        }
+                        // What it reads is made ready first (a texture's
+                        // upload recorded), so that the slot is made with a
+                        // host copy that has been written
+                        // (`descriptor::host::unwritten_null`).
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
                         if let Some(kind) = kind {
                             readable(list, kind, &view);
+                        }
+                        match &shown {
+                            Some(shown) => host.make_at(index, shown),
+                            None => host.make_at(index, &view),
                         }
                         // The title's slot is a table's: out of the queue
                         // of textures picked by index if the draw read it
@@ -3810,6 +3876,9 @@ impl State {
                         }
                     }
                 }
+            }
+            if constants && let Some(known) = self.fresh_tables.get_mut(&key) {
+                known.constants = true;
             }
             made.push((slot, first * 32));
         }
@@ -4411,6 +4480,40 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
 
 /// Gets what a shader reads or writes through a view ready: buffer data
 /// copied, textures moved to the state they need.
+/// What the shader reads at table slot `k` by the used-resource
+/// `entries` there, if they agree: only through console buffer descriptors
+/// (4 dwords: constant, shader-resource or unordered buffers; true) or
+/// only through texture descriptors (8 dwords; false), and whether any is
+/// unordered access. `None`: none is there, or both kinds are.
+fn read_as(entries: &[UsedResource], k: u32) -> Option<(bool, bool)> {
+    let mut read: Option<(bool, bool)> = None;
+    for u in entries.iter().filter(|u| u.table_offset_dwords / 8 == k) {
+        let as_buffer = match (u.kind, u.dwords) {
+            (ResourceType::Srv | ResourceType::Uav | ResourceType::Cbv, 4) => true,
+            (ResourceType::Srv | ResourceType::Uav, 8) => false,
+            _ => return None,
+        };
+        let unordered = u.kind == ResourceType::Uav;
+        match &mut read {
+            Some((was, _)) if *was != as_buffer => return None,
+            Some((_, any)) => *any |= unordered,
+            None => read = Some((as_buffer, unordered)),
+        }
+    }
+    read
+}
+
+/// Dynamic slot `index` reads nothing, as the kind of view the shader
+/// reads there (`crate::descriptor::host::kind_mismatch`).
+fn null_of_kind(host: &crate::descriptor::host::HostHeap, index: u32, as_buffer: bool, unordered: bool) {
+    crate::descriptor::host::KIND_MISMATCHES[0].fetch_add(1, Ordering::Relaxed);
+    match (as_buffer, unordered) {
+        (true, true) => host.null_raw_uav_at(index),
+        (true, false) => host.null_raw_at(index),
+        (false, unordered) => host.null_texture_at(index, unordered),
+    }
+}
+
 pub(crate) fn view_kind(view: &View) -> Option<ResourceType> {
     match view {
         View::Shader(..) | View::Placed(false, ..) => Some(ResourceType::Srv),
@@ -4498,6 +4601,17 @@ struct FreshTable {
     /// tested depth target.
     epoch: u64,
     ready: Vec<((usize, usize, bool, usize), bool)>,
+    /// Whether an entry is a constant buffer view: its bytes are in the
+    /// scratch memory of the host list it was made in, filled when that
+    /// list is sent ([`State::replay`]).
+    constants: bool,
+}
+
+/// Whether the part of a list after a cut makes afresh the tables that hold
+/// constant buffer views (`VICTORY_CUT_TABLES=0`: it reads those the part
+/// before made, as before).
+fn cut_tables() -> bool {
+    crate::toggled!("VICTORY_CUT_TABLES")
 }
 
 /// Whether a table a list reads again, with nothing changed in the list
@@ -4905,5 +5019,52 @@ mod record_hash_tests {
         // (One record of zeros is among the above.)
         let zeros: Vec<u64> = (2..100).map(|n| of(&vec![[0; 3]; n])).collect();
         assert!(zeros.iter().all(|h| seen.insert(*h)));
+    }
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::{FreshTable, State};
+
+    /// The part of a list after a cut forgets the tables whose constant
+    /// buffer views read the part before's scratch memory, keeps the
+    /// others, and gives back no dynamic slot.
+    #[test]
+    fn replay_evicts_cbv_fresh_tables_while_keeping_non_cbv_and_dynamic_slots() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        if !super::cut_tables() {
+            return;
+        }
+        let list = host.new_list().expect("host list");
+        let mut state = State::default();
+        let cbv_key = (0x1000, 4, 0xAAAA);
+        let srv_key = (0x2000, 4, 0xBBBB);
+        let table = |first, constants| FreshTable { first, epoch: 7, ready: vec![((1, 1, false, 0), false)], constants };
+        state.fresh_tables.insert(cbv_key, table(10, true));
+        state.fresh_tables.insert(srv_key, table(14, false));
+        // Pretend dynamic slots belong to Part 1 (cleared before Drop so
+        // `Drop` does not call `release_dynamic` on a fake heap pointer).
+        state.dynamic.push((0xDEAD, 10, 4));
+        state.dynamic.push((0xDEAD, 14, 4));
+
+        state.replay(&list);
+
+        assert!(
+            !state.fresh_tables.contains_key(&cbv_key),
+            "CBV-backed fresh_tables entry must be evicted on cut/replay"
+        );
+        let kept = state.fresh_tables.get(&srv_key).expect("non-CBV fresh_tables entry may stay cached across replay");
+        assert_eq!((kept.first, kept.constants), (14, false));
+        assert!(kept.epoch == 0 && kept.ready.is_empty(), "and is gone through again for the new host list");
+        assert_eq!(
+            state.dynamic.len(),
+            2,
+            "Part 1 dynamic slots must stay retained until final state drop"
+        );
+
+        state.dynamic.clear();
+        list.close();
     }
 }

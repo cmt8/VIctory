@@ -223,6 +223,30 @@ pub fn raw_views() -> u32 {
     RAW_VIEWS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The view heap slot of the host's null buffer view for shaders that pick
+/// a typed or structured buffer by an index they compute (0: none; see
+/// [`null_buffer_view`]).
+static NULL_BUFFER_VIEW: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// See [`null_buffer_view`]: `slot` is a slot of the host's view heaps that
+/// always holds a null buffer view and that no title, dynamic or twin slot
+/// is ever made in.
+pub fn set_null_buffer_view(slot: u32) {
+    NULL_BUFFER_VIEW.store(slot, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The view heap slot of the host's null buffer view: a shader that reads
+/// a buffer in place from the view heap at an index it computes reads it
+/// instead where the host's table of strides ([`SLOT_STRIDES`]) says the
+/// slot shows no buffer view (`super::buffer_guard`). `None`: the host
+/// named none, such shaders read the index as it is.
+pub fn null_buffer_view() -> Option<u32> {
+    match NULL_BUFFER_VIEW.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        slot => Some(slot),
+    }
+}
+
 pub(crate) struct Shader {
     pub m: Module,
     pub t: Types,

@@ -330,6 +330,12 @@ pub(crate) fn there(resource: This) -> bool {
     crate::resource::made_copy(resource).is_some_and(|copy| copy.ahead.load(Relaxed) == DONE)
 }
 
+/// Whether `copy` was filled here, or a list is about to record an upload
+/// into it ([`listed`]): for `HostTexture::is_written`.
+pub(crate) fn written(copy: &HostTexture) -> bool {
+    matches!(copy.ahead.load(Relaxed), DONE | LISTED)
+}
+
 /// The state of [`HostTexture::ahead`] of a new host copy.
 pub(crate) fn fresh() -> AtomicU8 {
     AtomicU8::new(NONE)

@@ -1193,6 +1193,18 @@ pub(crate) struct HostTexture {
     /// The texture's flags (asked once: the runtime takes 100 ns to say, and
     /// every texture of every draw is asked about).
     flags: u32,
+    /// The submissions begun (`crate::host::submissions`) when it was
+    /// made: a title slot must not show it while one of those may still
+    /// run (`crate::descriptor::host::defer_new_views`; a list sent before
+    /// the card's memory for it was there page-faults reading it).
+    pub(crate) born_after: u64,
+    /// Whether a list has been given something to write into it: an upload
+    /// of title memory (`crate::texture::upload_from`), a copy through
+    /// from a texture the host writes (`crate::texture::alias`), or a copy
+    /// or resolve of the title's ([`note_written`]). Until then it holds
+    /// what its memory on the card held before it was made
+    /// ([`HostTexture::is_written`]).
+    written: std::sync::atomic::AtomicBool,
 }
 
 /// What a host copy was filled with last: the first level of it and the
@@ -2378,6 +2390,36 @@ impl HostTexture {
         self.flags
     }
 
+    /// A list has been given something to write into it.
+    pub(crate) fn note_written(&self) {
+        self.written.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether it holds something a slot may show
+    /// (`crate::descriptor::host::unwritten_null`): a list was given
+    /// something to write into it ([`HostTexture::written`]), an upload of
+    /// its own queue filled it or a list is about to
+    /// (`crate::texture::ahead`), the store filled levels of it, its last
+    /// upload is known, or it is given memory level by level
+    /// (`crate::tiles`: a level without memory reads zeros). And, so that
+    /// a way of filling it that notes none of these cannot leave it unseen
+    /// for good: `UNWRITTEN_GRACE` submissions have finished since those
+    /// begun when it was made (`finished`: the submissions finished).
+    pub(crate) fn is_written(&self, finished: u64) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        #[cfg(not(test))]
+        const UNWRITTEN_GRACE: u64 = 256;
+        // (Tests say what has finished themselves.)
+        #[cfg(test)]
+        const UNWRITTEN_GRACE: u64 = u64::MAX;
+        self.written.load(Relaxed)
+            || self.tiled.is_some()
+            || self.prefilled.load(Relaxed) > 0
+            || crate::texture::ahead::written(self)
+            || self.holds.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+            || self.born_after.saturating_add(UNWRITTEN_GRACE) <= finished
+    }
+
     pub(crate) fn new(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) -> HostTexture {
         use std::sync::atomic::Ordering::Relaxed;
         let bytes = host_bytes(&texture);
@@ -2399,6 +2441,8 @@ impl HostTexture {
             prefill: Default::default(),
             prefilled: Default::default(),
             flags,
+            born_after: crate::host::submissions().0,
+            written: Default::default(),
         }
     }
 
@@ -2426,6 +2470,8 @@ impl HostTexture {
             prefill: Default::default(),
             prefilled: Default::default(),
             flags,
+            born_after: crate::host::submissions().0,
+            written: Default::default(),
         }
     }
 }
@@ -2496,6 +2542,57 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
         return None;
     }
     hosted(this, true).map(|made| made.0)
+}
+
+/// The submissions begun when the host copy of `this` (or its twins, the
+/// newest of them) was made ([`HostTexture::born_after`]); 0 if none is
+/// made.
+#[cfg(windows)]
+pub(crate) fn host_born_after(this: This) -> u64 {
+    if this.is_null() {
+        return 0;
+    }
+    hosted(this, false).map_or(0, |(host, twin)| {
+        let mut born = host.born_after;
+        if let Some(twin) = twin {
+            born = born.max(twin.colour.born_after);
+            if let Some(plane) = &twin.plane {
+                born = born.max(plane.born_after);
+            }
+        }
+        born
+    })
+}
+
+/// The host copy of `this` (if one is made) has been given something to
+/// write into it by a list: an upload, a copy
+/// ([`HostTexture::note_written`]).
+#[cfg(windows)]
+pub(crate) fn note_written(this: This) {
+    with_made(this, HostTexture::note_written);
+}
+
+/// Whether the host copy of `this` (if one is made) holds something a slot
+/// may show ([`HostTexture::is_written`]); false if none is made.
+#[cfg(windows)]
+pub(crate) fn host_written_to(this: This) -> bool {
+    let finished = crate::host::submissions().1;
+    with_made(this, |host| host.is_written(finished)).unwrap_or(false) || crate::texture::host_wrote(this as usize)
+}
+
+/// `f` of the host copy of `this` if one is made, without making one or
+/// counting a use of it (as [`hosted`] does).
+#[cfg(windows)]
+fn with_made<R>(this: This, f: impl FnOnce(&HostTexture) -> R) -> Option<R> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return None;
+    }
+    let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+    made.as_ref().map(|(host, _)| f(host))
 }
 
 /// A title texture's host copy if it is made; not made here.

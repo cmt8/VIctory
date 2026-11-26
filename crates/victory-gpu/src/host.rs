@@ -451,12 +451,21 @@ static RESIDENT: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic:
 /// 85 % of the card's budget, windows of title memory and staging buffers
 /// for five minutes with 12 GiB of the PC's memory free, and 1 GiB of
 /// scratch chunks.
-/// Whether a list always has a view heap and a sampler heap bound, ours of
-/// one slot for one the title did not set (, from
-/// codec-d/cool_fox 641835a4; off by default).
+/// Whether a list always has a view heap and a sampler heap bound, ours
+/// for one the title did not set (from codec-d/cool_fox 641835a4, where it
+/// was off unless `VICTORY_FALLBACK_HEAPS=1` and the heaps had one slot;
+/// on by default now, `VICTORY_FALLBACK_HEAPS=0`: only the title's, as
+/// before).
+///
+/// Every root signature made here indexes both heaps directly. With none
+/// of a kind bound, vkd3d-proton (2576c0b4, command.c,
+/// `d3d12_command_list_init_default_descriptor_buffers`) leaves the
+/// device's own small descriptor buffer bound in its place, and an index a
+/// shader computes reads past it. The heaps of ours are as long as a
+/// title's, every slot null (`crate::descriptor::host::make_fallback`).
 pub(crate) fn fallback_heaps() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_FALLBACK_HEAPS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FALLBACK_HEAPS").is_none_or(|v| v != "0"))
 }
 
 pub(crate) fn keep_freed() -> bool {
@@ -6254,6 +6263,15 @@ impl Host {
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }
         let behind = late && flying();
+        // Title-slot writes held back while earlier submissions may read
+        // what the slots show (`crate::descriptor::host::HostHeap::clear`):
+        // a settle first if a draw of this submission reads one in place,
+        // then those whose submissions have finished are written, before
+        // this one counts as started.
+        if behind && crate::descriptor::has_required_deferred_views() {
+            self.settle(&mut submitted, WHY_SYNC);
+        }
+        crate::descriptor::flush_deferred_views();
         stage.next("submit: gathering what to ask about");
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it (with the relay).
@@ -6813,69 +6831,15 @@ impl Host {
         first_error
     }
 
-    /// 1-descriptor shader-visible CBV/SRV/UAV fallback heap for directly-indexed root signatures.
+    /// The view heap of ours for a list whose title bound none
+    /// ([`fallback_heaps`]): made when first wanted.
     pub(crate) fn fallback_view_heap(&self) -> Option<&ID3D12DescriptorHeap> {
-        self.fallback_view
-            .get_or_init(|| {
-                // SAFETY: plain 1-descriptor shader-visible heap + null SRV initialization.
-                unsafe {
-                    let heap: ID3D12DescriptorHeap = self
-                        .device
-                        .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                            NumDescriptors: 1,
-                            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                            NodeMask: 0,
-                        })
-                        .ok()?;
-                    let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
-                        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT,
-                        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
-                        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-                        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                            Buffer: D3D12_BUFFER_SRV::default(),
-                        },
-                    };
-                    self.device.CreateShaderResourceView(
-                        None,
-                        Some(&desc),
-                        heap.GetCPUDescriptorHandleForHeapStart(),
-                    );
-                    Some(heap)
-                }
-            })
-            .as_ref()
+        self.fallback_view.get_or_init(|| crate::descriptor::host::make_fallback(self, false)).as_ref()
     }
 
-    /// 1-descriptor shader-visible Sampler fallback heap for directly-indexed root signatures.
+    /// The same of samplers.
     pub(crate) fn fallback_sampler_heap(&self) -> Option<&ID3D12DescriptorHeap> {
-        self.fallback_sampler
-            .get_or_init(|| {
-                // SAFETY: plain 1-descriptor shader-visible sampler heap initialization.
-                unsafe {
-                    let heap: ID3D12DescriptorHeap = self
-                        .device
-                        .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                            Type: D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
-                            NumDescriptors: 1,
-                            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                            NodeMask: 0,
-                        })
-                        .ok()?;
-                    let desc = D3D12_SAMPLER_DESC {
-                        Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
-                        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-                        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-                        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-                        MaxLOD: f32::MAX,
-                        ..Default::default()
-                    };
-                    self.device
-                        .CreateSampler(&desc, heap.GetCPUDescriptorHandleForHeapStart());
-                    Some(heap)
-                }
-            })
-            .as_ref()
+        self.fallback_sampler.get_or_init(|| crate::descriptor::host::make_fallback(self, true)).as_ref()
     }
 
     /// A host render target view of `resource`, valid until it is recorded.
@@ -9945,6 +9909,58 @@ impl Meter {
                     u8::from(crate::descriptor::host::show_new_later()),
                     crate::descriptor::host::NEW_LATER.load(Ordering::Relaxed)
                 );
+                {
+                    let [held, replaced, cleared, remade] =
+                        [0, 1, 2, 3].map(|i| crate::descriptor::host::HELD_CLEARS[i].load(Ordering::Relaxed));
+                    tracing::info!(
+                        "slots that showed a host resource and were to read nothing while submissions that may read them ran \
+                         (VICTORY_DEFER_SLOT_CLEARS={}), since the start: {held} clears held back, {cleared} written once those had \
+                         finished; {replaced} replacements held back, {remade} made",
+                        crate::descriptor::host::defer_slot_clears()
+                    );
+                }
+                {
+                    let [held, made] = [0, 1].map(|i| crate::descriptor::host::DEFERRED_VIEWS[i].load(Ordering::Relaxed));
+                    tracing::info!(
+                        "title slots whose view was of a host resource made while submissions begun before it ran \
+                         (VICTORY_DEFER_NEW_VIEWS={}), since the start: {held} held back, {made} made once those had finished",
+                        u8::from(crate::descriptor::host::defer_new_views())
+                    );
+                }
+                {
+                    let [fresh, in_place] = [0, 1].map(|i| crate::descriptor::host::KIND_MISMATCHES[i].load(Ordering::Relaxed));
+                    if fresh + in_place > 0 {
+                        tracing::info!(
+                            "table entries whose view was not of the kind the shader reads there (VICTORY_KIND_NULL={}), since the \
+                             start: {fresh} in tables made afresh (null instead), {in_place} read in place in the title's slot",
+                            u8::from(crate::descriptor::host::kind_null())
+                        );
+                    }
+                }
+                {
+                    let [sync, read, again, fresh, remade] =
+                        [0, 1, 2, 3, 4].map(|i| crate::descriptor::host::UNWRITTEN[i].load(Ordering::Relaxed));
+                    tracing::info!(
+                        "slots that would have shown a texture's host copy no list had written into (VICTORY_UNWRITTEN_NULL={}; \
+                         shown all the same: {}), since the start: {sync} as the title wrote the view, {read} by the texture \
+                         pass or a draw reading the slot in place, {again} asked again after the submissions on the card, \
+                         {fresh} in tables made afresh (null there); {remade} made right after their upload was recorded",
+                        u8::from(crate::descriptor::host::unwritten_null()),
+                        crate::descriptor::host::UNWRITTEN_SHOWN.load(Ordering::Relaxed)
+                    );
+                }
+                {
+                    let [hidden, withheld] = [0, 1].map(|i| crate::descriptor::host::STRIDES_HIDDEN[i].load(Ordering::Relaxed));
+                    tracing::info!(
+                        "buffers shaders pick by index: a slot the stride table says shows no buffer reads view slot {:?} \
+                         (VICTORY_BUFFER_GUARD={}); the table says a buffer only while the host slot shows one \
+                         (VICTORY_STRIDE_FOLLOWS_SLOT={}), since the start: {hidden} strides taken out before another view was \
+                         written, {withheld} withheld until the buffer view was made",
+                        victory_shader::emit::null_buffer_view(),
+                        u8::from(victory_shader::emit::buffer_guard()),
+                        u8::from(crate::descriptor::host::stride_follows_slot())
+                    );
+                }
                 tracing::info!("textures shown, since the start (crate::texlate): {}", crate::texlate::line());
                 if let Some(line) = crate::texstore::line() {
                     tracing::info!("{line}");
