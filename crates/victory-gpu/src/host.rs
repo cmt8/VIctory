@@ -144,7 +144,8 @@ unsafe impl Sync for Host {}
 /// releases reach the host at once, from its own threads, while the host
 /// runs a submission: freeing there is a GPU page fault on the freed
 /// texture (a device hang).
-static RETIRED: Mutex<Vec<(u64, Retired)>> = Mutex::new(Vec::new());
+/// In the order of that count (`crate::grave`): a bury takes the front.
+static RETIRED: Mutex<crate::grave::Queue<Retired>> = Mutex::new(crate::grave::Queue::new());
 /// Submissions started and finished (waited for).
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -291,7 +292,7 @@ pub(crate) fn finished() -> u64 {
 /// if none is.
 pub(crate) fn retire<T: 'static>(object: T) {
     let started = STARTED.load(Ordering::Acquire);
-    if bury_lag() == 0 && started <= FINISHED.load(Ordering::Acquire) {
+    if crate::grave::at_once(bury_lag(), started, FINISHED.load(Ordering::Acquire)) {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
         drop(object);
         return;
@@ -300,7 +301,7 @@ pub(crate) fn retire<T: 'static>(object: T) {
     RETIRED
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .push((started, Retired(Box::new(object))));
+        .push(started, Retired(Box::new(object)));
 }
 
 /// How many submissions later than it could (once the last one that may
@@ -334,21 +335,27 @@ fn land_lag() -> usize {
     *LAG.get_or_init(|| std::env::var("VICTORY_LAND_LAG").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
 }
 
-/// Drops what waited for submissions up to `finished`, less [`bury_lag`].
+/// Drops what waited for submissions up to `finished`, less [`bury_lag`]:
+/// the due front of [`RETIRED`], moved out under its lock into a buffer this
+/// thread keeps (no allocation once it has grown), and dropped after.
 fn bury(finished: u64) {
-    let finished = finished.saturating_sub(bury_lag());
-    let done: Vec<(u64, Retired)> = {
-        let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
-        if retired.is_empty() {
-            return;
+    thread_local! {
+        static DUE: std::cell::RefCell<Vec<Retired>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    // Taken out, not borrowed: a drop below that buries again finds an
+    // empty buffer of its own.
+    let mut due = DUE.try_with(|d| std::mem::take(&mut *d.borrow_mut())).unwrap_or_default();
+    RETIRED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take_due(finished, bury_lag(), &mut due);
+    due.clear();
+    let _ = DUE.try_with(|d| {
+        let mut d = d.borrow_mut();
+        if d.capacity() < due.capacity() {
+            *d = due;
         }
-        let (done, keep) = std::mem::take(&mut *retired)
-            .into_iter()
-            .partition(|(at, _)| *at <= finished);
-        *retired = keep;
-        done
-    };
-    drop(done);
+    });
 }
 
 /// Objects [`retire`] dropped at once (no submission was running) and
