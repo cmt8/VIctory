@@ -32,6 +32,8 @@ mod halves;
 pub use halves::take_half_report;
 #[path = "coherent.rs"]
 mod coherent;
+#[path = "wave_pin.rs"]
+mod wave_pin;
 
 type Why = &'static str;
 
@@ -2358,6 +2360,7 @@ impl<'a> Lower<'a> {
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let half_views = std::mem::take(&mut self.half_views).into_iter().collect();
+        self.pin_wave();
         self.report_halves();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;

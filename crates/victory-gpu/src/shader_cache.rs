@@ -87,6 +87,7 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_CONSTANT_MARKS",
                     "VICTORY_EARLY_DEPTH",
                     "VICTORY_HALF_BITS",
+                    "VICTORY_WAVE_PIN",
                     // (Only the report of the halves; served from the
                     // cache, a program would not be counted.)
                     "VICTORY_HALF_REPORT",
