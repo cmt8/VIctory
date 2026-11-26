@@ -234,6 +234,17 @@ pub fn half_bits() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_HALF_BITS").is_none_or(|v| v != "0"))
 }
 
+/// Whether a console wave64 program in host waves of 32 takes nothing from
+/// an upper half its group does not have (`lower::missing_upper`: the last
+/// console wave of a group of 96 has only a lower half, whose exchange
+/// dword no host wave writes). `VICTORY_WAVE_MISSING_UPPER`: on, `=0`
+/// reads that dword as before, for A/B runs. Part of the translation: the
+/// shader cache keys on it.
+pub fn missing_upper_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_MISSING_UPPER").is_none_or(|v| v != "0"))
+}
+
 /// Whether a 16-bit result written by SDWA with `dst_unused` 1 (sext) into
 /// WORD_0 copies its bit 15 into the high word, and the reserved
 /// `dst_unused` 3 is refused (upstream VIctory #3124). `VICTORY_SDWA_SEXT`:

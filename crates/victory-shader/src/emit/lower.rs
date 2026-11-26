@@ -27,6 +27,8 @@ pub(super) mod intersect;
 
 #[path = "wave_pin.rs"]
 mod wave_pin;
+#[path = "wave64_halves.rs"]
+mod wave64_halves;
 
 /// Format loads that move 16-bit halves without the d16 form, a child
 /// module so it shares the emitter's state.
@@ -2550,6 +2552,7 @@ impl<'a> Lower<'a> {
                     let rb = bits(self, r);
                     let c = self.cur;
                     let (lo, hi) = self.exchange_halves(c, rb);
+                    let hi = if op.counts() { hi } else { self.missing_upper(c, hi, Some(rb)) };
                     let (lo, hi) = (back(self, lo), back(self, hi));
                     match op {
                         Op::AddU | Op::AddF => self.s.m.bin(c, Bin::Add, lo, hi),
@@ -4773,7 +4776,7 @@ impl<'a> Lower<'a> {
         let hi = self.s.m.load(at, p1);
         // the slots are written again only after every thread read them
         self.group_sync(at);
-        (lo, hi)
+        (lo, self.missing_upper(at, hi, None))
     }
 
     /// The first of the two exchange dwords of this thread's console wave (made in the entry

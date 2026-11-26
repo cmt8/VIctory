@@ -131,6 +131,9 @@ fn build() -> [u8; 32] {
             "VICTORY_HALF_BITS",
             // SDWA sext of 16-bit results (`victory_shader::emit::sdwa_sext`).
             "VICTORY_SDWA_SEXT",
+            // A missing upper half of a console wave64 program in host
+            // waves of 32 (`victory_shader::emit::missing_upper_on`).
+            "VICTORY_WAVE_MISSING_UPPER",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
