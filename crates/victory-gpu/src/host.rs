@@ -813,8 +813,18 @@ fn create() -> windows::core::Result<Host> {
             // of 64 are then refused as there.
             let forced = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse::<u32>().ok());
             let max = forced.map_or(o1.WaveLaneCountMax, |n| n.clamp(o1.WaveLaneCountMin, o1.WaveLaneCountMax));
-            tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, translated_for = max, "host wave lanes");
             victory_shader::emit::set_host_max_wave(max);
+            victory_shader::emit::set_host_min_wave(o1.WaveLaneCountMin);
+            // `VICTORY_COMPUTE_WAVE` (on; `=0` or `=host`: off): on a host of waves of 32
+            // and 64 (RADV) compute programs are translated for and declare waves of 32
+            // (`victory_shader::emit::compute_wave_32`).
+            tracing::info!(
+                min = o1.WaveLaneCountMin,
+                max = o1.WaveLaneCountMax,
+                translated_for = max,
+                compute_wave_32 = victory_shader::emit::compute_wave_32(),
+                "host wave lanes"
+            );
         }
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
