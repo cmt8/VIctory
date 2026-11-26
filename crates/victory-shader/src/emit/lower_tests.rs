@@ -8,7 +8,7 @@ use crate::native::{
 };
 use crate::{io, ir, resource, structure};
 
-const S_ENDPGM: u32 = 0xBF81_0000;
+pub(super) const S_ENDPGM: u32 = 0xBF81_0000;
 
 #[test]
 fn packed_pixel_inputs_find_their_second_row() {
@@ -167,7 +167,7 @@ fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
 
 /// Lowers a compute program with the root parameters `layout` (in user
 /// SGPRs from s0 on) and the used resources `used`.
-fn lower_with(
+pub(super) fn lower_with(
     words: &[u32],
     layout: Vec<RootParam>,
     used: Vec<UsedResource>,
@@ -182,6 +182,17 @@ fn lower_wave(
     used: Vec<UsedResource>,
     wave64: bool,
 ) -> Result<Lowered, crate::ShaderError> {
+    lower_compute(words, layout, used, wave64, true)
+}
+
+/// [`lower_wave`], with 512 bytes of LDS only if `lds`.
+pub(super) fn lower_compute(
+    words: &[u32],
+    layout: Vec<RootParam>,
+    used: Vec<UsedResource>,
+    wave64: bool,
+    lds: bool,
+) -> Result<Lowered, crate::ShaderError> {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let sgprs: u32 = layout.iter().map(|p| p.sgprs).sum();
     let native = NativeProgram {
@@ -191,8 +202,8 @@ fn lower_wave(
         layout,
         used,
         io: StageIo::Cs(ComputeIo {
-            // The layout's user SGPRs (at least two), 512 bytes of LDS.
-            rsrc2: 1 << 15 | sgprs.max(2) << 1,
+            // The layout's user SGPRs (at least two), optionally 512 bytes of LDS.
+            rsrc2: u32::from(lds) << 15 | sgprs.max(2) << 1,
             threads: [1, 1, 1],
         }),
         code,
@@ -215,7 +226,7 @@ fn lower_wave(
 }
 
 /// Root parameter `slot` in user SGPRs from `user_data` on.
-fn root(root: RootType, user_data: u8, slot: u8) -> RootParam {
+pub(super) fn root(root: RootType, user_data: u8, slot: u8) -> RootParam {
     RootParam {
         root,
         table_offset_dwords: 0,
@@ -404,6 +415,30 @@ fn texture_tables() -> (Vec<RootParam>, Vec<UsedResource>) {
             range(ResourceType::Sampler, 1, 1),
         ],
     )
+}
+
+#[test]
+fn a_uniform_branch_can_choose_between_immediate_samplers() {
+    // A root constant selects wrap or clamp. Keep the sample live with an LDS store.
+    let words = [
+        0xBE84_0300, 0xBE85_0380,       // s[4:5] = texture table
+        0xF40C_0302, 0xFA00_0000,       // s_load_dwordx8 s[12:19], s[4:5], 0
+        0xBE89_0380, 0xBE8A_0380, 0xBE8B_0380, // sampler words 1-3
+        0xBF06_8001,                    // s_cmp_eq_u32 s1, 0
+        0xBF85_0002,                    // branch to clamp
+        0xBE88_0380, 0xBF82_0002,       // wrap, skip clamp
+        0xBE88_03FF, 0x0000_0092,       // clamp all axes
+        0xF09C_0F08, 0x0043_0C02,       // image_sample_lz v[12:15], ..., s[8:11]
+        0xD834_0000, 0x0000_0C00,       // ds_write_b32 v0, v12
+        S_ENDPGM,
+    ];
+    let (mut layout, mut used) = texture_tables();
+    layout[1] = root(RootType::Constants, 1, 1);
+    used.truncate(1);
+    let shader = lower_with(&words, layout, used).unwrap();
+    assert_eq!(shader.samplers.len(), 2);
+    assert!(shader.samplers.contains(&[0, 0, 0, 0]));
+    assert!(shader.samplers.contains(&[0x92, 0, 0, 0]));
 }
 
 #[test]
