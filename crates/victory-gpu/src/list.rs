@@ -1468,15 +1468,40 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
     let _ = this;
 }
 
+/// Whether a pipeline sync records a wait for every earlier shader write
+/// on the host list ([`sync`]). `VICTORY_SYNC_BARRIER`: on, `=0` records
+/// nothing, as before, for A/B runs.
+#[cfg(windows)]
+fn sync_barrier_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_BARRIER").is_none_or(|v| v != "0"))
+}
+
+/// The title's pipeline syncs since the last [`take_syncs`]: recorded as a
+/// wait for every earlier shader write, and left out (the switch off, or
+/// a list without a host side).
+static SYNCS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// [`SYNCS`] since the last call, and zero again: (waited, left out).
+pub(crate) fn take_syncs() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (SYNCS[0].swap(0, Relaxed), SYNCS[1].swap(0, Relaxed))
+}
+
 /// Pipeline syncs: waits for earlier work and cache flushes, at the top or
 /// bottom of the pipe `(flags, control, address, size)`. The host orders
-/// nothing between dispatches by itself: what shaders wrote is waited for
-/// here as at the title's barriers (the ray-tracing structure builder has
-/// no other wait between its stages).
+/// nothing between dispatches by itself: in a D3D12 list a dispatch may
+/// run beside the one before it unless a UAV barrier stands between them
+/// (vkd3d-proton's `Dispatch` records no barrier of its own, and RADV then
+/// lets the two overlap), so what shaders wrote is waited for here as at
+/// the title's barriers (the ray-tracing structure builder has no other
+/// wait between its stages). Counted per frame ([`take_syncs`]).
 extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size: u64) {
     #[cfg(windows)]
     {
-        if let Some(list) = host_list(this) {
+        let host = host_list(this).filter(|_| sync_barrier_on());
+        SYNCS[usize::from(host.is_none())].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(list) = host {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
             #[cfg(feature = "diagnostics")]
             {
@@ -2358,6 +2383,55 @@ mod tests {
         assert_eq!(reset(list, allocator, null), S_OK);
         // SAFETY: the list is ours.
         assert!(unsafe { &(*list.cast::<List>()).uploads }.lock().unwrap().is_empty());
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    /// A pipeline sync of the title's (the method at 0x408, 0x418 in newer
+    /// lists) records a wait for every earlier shader write on a list with
+    /// a host side, which the host takes (the list closes and runs, the
+    /// device stays), and is counted for the frame line either way: a list
+    /// without a host side, or `VICTORY_SYNC_BARRIER=0`, leaves it out.
+    #[test]
+    fn a_pipeline_sync_waits_for_shader_writes_on_the_host_list() {
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        let hr = create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list);
+        assert_eq!(hr, S_OK);
+        // Through the list's own table, at the slot the title calls.
+        let sync_at = |newer: bool| {
+            let table = if newer { &NEWER_LIST_FUNCTIONS } else { &LIST_FUNCTIONS };
+            table.0[if newer { newer_slot(129) } else { 129 }]
+        };
+        assert_eq!(sync_at(false), sync as *const ());
+        assert_eq!(sync_at(true), sync as *const ());
+        assert_eq!(sync_at(true), NEWER_LIST_FUNCTIONS.0[0x418 / 8]);
+        let _ = take_syncs();
+        sync(list, 0, 0, 0, 0);
+        sync(list, 1, 0, 0x1000, 0x100);
+        let counted = take_syncs();
+        #[cfg(windows)]
+        {
+            let waits = host_list(list).is_some() && sync_barrier_on();
+            assert_eq!(counted, if waits { (2, 0) } else { (0, 2) });
+            if let (Some(host), Some(recorded)) = (crate::host::host(), host_list(list)) {
+                assert_eq!(close(list), S_OK);
+                host.execute(&[recorded]);
+                // SAFETY: a live device.
+                assert!(
+                    unsafe { host.device.GetDeviceRemovedReason() }.is_ok(),
+                    "the device, after a list with the syncs' waits"
+                );
+            }
+        }
+        #[cfg(not(windows))]
+        assert_eq!(counted, (0, 0));
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);

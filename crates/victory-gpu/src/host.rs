@@ -9424,6 +9424,12 @@ impl Meter {
         tracing::info!(
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
         );
+        let (synced, unsynced) = crate::list::take_syncs();
+        tracing::info!(
+            "the title's pipeline syncs per frame: {:.1} recorded as waits for every earlier shader write, {:.1} left out (VICTORY_SYNC_BARRIER=0 leaves them all out)",
+            synced as f64 / frames,
+            unsynced as f64 / frames
+        );
         let [emptied, nothing, cut, spent] = [0, 1, 2, 3].map(|i| CLAMP_NOTES[i].swap(0, Ordering::Relaxed) as f64 / frames);
         if crate::pipeline::drop_reasons() {
             tracing::info!(
