@@ -92,7 +92,7 @@ pub(crate) struct HostHeap {
     buffers: Mutex<std::collections::BTreeSet<u32>>,
     /// Of those and of the slots that left the set: the ones written since
     /// [`HostHeap::buffer_changes`] last took them.
-    changed: Mutex<std::collections::HashSet<u32>>,
+    changed: Mutex<crate::fxhash::FxHashSet<u32>>,
     /// Title slots holding a view of a texture the title may fill itself (a
     /// placed texture, a texture object), with the frame from which they
     /// are due: such a texture is uploaded when a draw reads it through a
@@ -127,7 +127,7 @@ pub(crate) struct HostHeap {
     /// Slots made from a placed texture whose memory was found unmapped,
     /// with the record they were made from and when (`crate::host::now_ms`)
     /// that was first found ([`HostHeap::texture_slot_gone`]).
-    away: Mutex<std::collections::HashMap<u32, (u64, u64)>>,
+    away: Mutex<crate::fxhash::FxHashMap<u32, (u64, u64)>>,
     /// Tests: [`texture_away_ms`] for this heap.
     #[cfg(test)]
     away_ms: Mutex<Option<u64>>,
@@ -353,13 +353,13 @@ pub(crate) struct Spans {
     /// When a newer view makes an older one stale.
     rule: Rule,
     by_start: std::collections::BTreeMap<u64, (u64, std::collections::BTreeSet<u32>)>,
-    by_slot: std::collections::HashMap<u32, u64>,
+    by_slot: crate::fxhash::FxHashMap<u32, u64>,
     /// The level each slot's view starts at ([`Spans::shows`]).
-    first: std::collections::HashMap<u32, u32>,
+    first: crate::fxhash::FxHashMap<u32, u32>,
     /// The bytes a placed texture takes, by resource description: worked
     /// out once for each (a title writes the views of a few thousand
     /// descriptions, thousands of times a frame).
-    sizes: std::collections::HashMap<[u32; 14], Option<u64>>,
+    sizes: crate::fxhash::FxHashMap<[u32; 14], Option<u64>>,
 }
 
 /// When a view the title writes makes an older view of other memory stale.

@@ -38,6 +38,8 @@ pub mod frame;
 #[cfg(windows)]
 pub mod framelog;
 #[cfg(windows)]
+mod fxhash;
+#[cfg(windows)]
 mod grave;
 #[cfg(windows)]
 mod heap;
