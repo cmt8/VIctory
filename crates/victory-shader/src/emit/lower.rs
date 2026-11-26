@@ -65,6 +65,9 @@ pub(crate) struct Lowered {
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
+    /// Buffer handles guarded by the stride table (`Lower::buffer_guard`).
+    #[cfg(test)]
+    pub buffer_guards: usize,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -307,6 +310,9 @@ struct Lower<'a> {
     /// Element strides read from the host's table by heap slot
     /// ([`super::shader::SLOT_STRIDES`]), by block and descriptor load.
     strides: HashMap<(usize, Site, u8), V>,
+    /// Buffer handles guarded by the stride table ([`Lower::buffer_guard`]).
+    #[cfg(test)]
+    buffer_guards: usize,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -1519,10 +1525,30 @@ fn own_bits_on() -> bool {
 }
 
 /// What the translator was told of the host, for a cache's key: the widest
-/// wave, the view heap's limit, where the raw twins of its views start, and
-/// what it writes for the console's own hardware.
-pub fn host_settings() -> [u32; 4] {
-    [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), host_rdna()]
+/// wave, the view heap's limit, where the raw twins of its views start,
+/// what it writes for the console's own hardware, and the null buffer view
+/// guarded buffer reads go to (0: not guarded, [`super::buffer_guard`]).
+pub fn host_settings() -> [u32; 5] {
+    let guard = if super::buffer_guard() { super::shader::null_buffer_view().unwrap_or(0) } else { 0 };
+    [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), host_rdna(), guard]
+}
+
+/// The heap slot of the host's null buffer view
+/// (`super::null_buffer_view`); in tests, also the one a test on this
+/// thread names ([`GUARD_NULL`]), so that it need not set the process's
+/// under the other tests.
+fn guard_null() -> Option<u32> {
+    #[cfg(test)]
+    if let Some(null) = GUARD_NULL.with(std::cell::Cell::get) {
+        return Some(null);
+    }
+    super::shader::null_buffer_view()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// See [`guard_null`].
+    static GUARD_NULL: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
 static HOST_RDNA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2096,6 +2122,8 @@ impl<'a> Lower<'a> {
             },
             handles: HashMap::new(),
             strides: HashMap::new(),
+            #[cfg(test)]
+            buffer_guards: 0,
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
@@ -2873,6 +2901,8 @@ impl<'a> Lower<'a> {
             root_uavs,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
+            #[cfg(test)]
+            buffer_guards: self.buffer_guards,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             dxil: self.s.finish(),
@@ -7987,6 +8017,86 @@ impl<'a> Lower<'a> {
     /// device losses of runs n03 and n04) reads a structured one of 8 byte
     /// elements at 8 as raw bytes per lane.
     fn raw_twin(&mut self, src: &Source, index: V, sampler: bool, props: (u32, u32)) -> (V, bool) {
+        match self.raw_twin_only(src, index, sampler, props) {
+            (index, true) => (index, true),
+            // Read in place: not where the slot shows no buffer view.
+            (index, false) => self.buffer_guard(src, index, sampler, props),
+        }
+    }
+
+    /// The heap index to read a buffer view at in place, for a descriptor
+    /// `src` the program takes from the view heap at an index it computes:
+    /// `index` (inside the heap: clamped to its null slot as
+    /// `Shader::heap_handle_at` would), or the host's null buffer view
+    /// where the stride table says the slot shows no buffer view; and
+    /// whether it is inside the host's heap so. The index comes from data,
+    /// and a slot showing a texture view read as a buffer's descriptor is
+    /// a wild address, a GPU page fault. Under vkd3d-proton a null buffer
+    /// view holds a null typed and a null raw descriptor both
+    /// (`vkd3d_create_buffer_srv_embedded`, 2576c0b4: "a packed NULL
+    /// descriptor that contains both texel buffer and SSBO"), so one view
+    /// serves typed, raw and structured reads, and unordered ones.
+    fn buffer_guard(&mut self, src: &Source, index: V, sampler: bool, props: (u32, u32)) -> (V, bool) {
+        // Typed, raw and structured buffers (DXIL resource kinds 10 to 12).
+        if sampler || !(10..=12).contains(&(props.0 & 0xFF)) || !super::buffer_guard() {
+            return (index, false);
+        }
+        let Some(null) = guard_null() else {
+            return (index, false);
+        };
+        let leaves = src.leaves();
+        let picked = !leaves.is_empty()
+            && leaves.iter().all(|leaf| match leaf {
+                Source::Loaded { load, .. } | Source::Fetched { load, .. } => self
+                    .scalar
+                    .get(load)
+                    .and_then(|a| self.x.native.layout.get(a.param))
+                    .is_some_and(|p| p.root == RootType::ResourceHeap),
+                _ => false,
+            });
+        if !picked {
+            return (index, false);
+        }
+        #[cfg(test)]
+        {
+            self.buffer_guards += 1;
+        }
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        // Inside the table whatever the index, as `slot_word` reads it.
+        let last = self.s.m.i32(super::shader::SLOT_STRIDES_COUNT - 1);
+        let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[index, last]);
+        self.s.m.tag(slot, Tag::Clamp);
+        let two = self.s.m.i32(2);
+        let byte = self.s.m.bin(c, Bin::Shl, slot, two);
+        let h = self.s.root_srv_handle(super::shader::SLOT_STRIDES);
+        let iu = self.s.m.undef(self.s.t.i32);
+        let mask = self.s.m.i8(1);
+        let align = self.s.m.i32(4);
+        let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[h, byte, iu, mask, align]);
+        let f = self.s.m.extract(c, r, 0);
+        let word = self.as_int(f);
+        let bits = self.s.m.i32(super::shader::VIEW_STRIDE_BITS);
+        let stride = self.s.m.bin(c, Bin::And, word, bits);
+        let zero = self.s.m.i32(0);
+        let none = self.s.m.cmp(c, pred::EQ, stride, zero);
+        // The slot itself: inside the heap (the null view may lie past the
+        // null slot, so the handle is made without that clamp).
+        let limit = super::shader::view_heap_limit();
+        let inside = if limit == 0 {
+            index
+        } else {
+            let limit = self.s.m.i32(limit);
+            let v = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[index, limit]);
+            self.s.m.tag(v, Tag::Clamp);
+            v
+        };
+        let null = self.s.m.i32(null);
+        (self.s.m.select(c, none, null, inside), true)
+    }
+
+    /// [`Self::raw_twin`] without the guard of reads in place.
+    fn raw_twin_only(&mut self, src: &Source, index: V, sampler: bool, props: (u32, u32)) -> (V, bool) {
         // Raw and constant buffers (DXIL resource kinds 11 and 13).
         const RAW: u32 = 11;
         const CONSTANT: u32 = 13;
@@ -13641,6 +13751,75 @@ mod tests {
             mesh_stride: 0,
         })
         .map(|_| ())
+    }
+
+    /// A buffer read in place through a descriptor the program takes from
+    /// the view heap at an index it computes looks its slot up in the
+    /// stride table and reads the host's null buffer view where that says
+    /// no buffer view is there; one taken from a table is read as before,
+    /// and so is everything while no null view is named. (A raw buffer
+    /// with raw twins is read through its twin, which needs no guard.)
+    #[test]
+    fn heap_buffers_read_at_computed_indices_are_guarded() {
+        // The descriptor of slot 3 of the view heap (s0, its base address
+        // as the program sees it) into s[8:11], a scalar buffer load
+        // through it, and the result into LDS.
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0060, // s_load_dwordx4 s[8:11], s[4:5], 0x60
+            0xF420_0304,
+            0xFA00_0000, // s_buffer_load_dword s12, s[8:11], 0x0
+            0x7E02_020C, // v_mov_b32 v1, s12
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let heap = || vec![root(RootType::ResourceHeap, 0, 0)];
+        let table = || vec![root(RootType::Table, 0, 0)];
+        let table_used = || {
+            vec![UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }]
+        };
+        let null = |n: Option<u32>| super::GUARD_NULL.with(|c| c.set(n));
+        // (In place: no raw twins for this thread.)
+        super::super::shader::RAW_VIEWS_HERE.set(Some(0));
+        null(Some(999_999));
+        let guarded = lower_with(&words, heap(), vec![]).expect("a heap read lowers");
+        let tabled = lower_with(&words, table(), table_used()).expect("a table read lowers");
+        // With raw twins a raw buffer is read through its twin instead.
+        super::super::shader::RAW_VIEWS_HERE.set(Some(1 << 21));
+        let twinned = lower_with(&words, heap(), vec![]).expect("a heap read lowers");
+        super::super::shader::RAW_VIEWS_HERE.set(Some(0));
+        null(None);
+        let unset = (super::super::null_buffer_view().is_none())
+            .then(|| lower_with(&words, heap(), vec![]).expect("a heap read lowers"));
+        super::super::shader::RAW_VIEWS_HERE.set(None);
+        assert_eq!(guarded.buffer_guards, 1, "the heap read is guarded");
+        assert!(guarded.root_srvs.contains(&super::super::SLOT_STRIDES), "{:?}", guarded.root_srvs);
+        // Where the validator is found, the guarded program passes it.
+        #[cfg(windows)]
+        {
+            use super::super::validator::Validator;
+            if let Ok(mut v) = Validator::load(Validator::default_path().as_deref()) {
+                v.validate(&mut guarded.dxil.clone()).expect("the guarded heap read validates");
+                eprintln!("the guarded heap read validates");
+            }
+        }
+        assert_eq!(tabled.buffer_guards, 0, "a table read is not");
+        assert_eq!(twinned.buffer_guards, 0, "nor one read through its raw twin");
+        if let Some(unset) = unset {
+            assert_eq!(unset.buffer_guards, 0, "nor anything without a null view");
+        }
     }
 
     /// Lowers a compute program with the root parameters `layout` (in user

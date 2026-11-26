@@ -9844,6 +9844,18 @@ impl Meter {
                         crate::descriptor::host::UNWRITTEN_SHOWN.load(Ordering::Relaxed)
                     );
                 }
+                {
+                    let [hidden, withheld] = [0, 1].map(|i| crate::descriptor::host::STRIDES_HIDDEN[i].load(Ordering::Relaxed));
+                    tracing::info!(
+                        "buffers shaders pick by index: a slot the stride table says shows no buffer reads view slot {:?} \
+                         (VICTORY_BUFFER_GUARD={}); the table says a buffer only while the host slot shows one \
+                         (VICTORY_STRIDE_FOLLOWS_SLOT={}), since the start: {hidden} strides taken out before another view was \
+                         written, {withheld} withheld until the buffer view was made",
+                        victory_shader::emit::null_buffer_view(),
+                        u8::from(victory_shader::emit::buffer_guard()),
+                        u8::from(crate::descriptor::host::stride_follows_slot())
+                    );
+                }
                 tracing::info!("textures shown, since the start (crate::texlate): {}", crate::texlate::line());
                 if let Some(line) = crate::texstore::line() {
                     tracing::info!("{line}");

@@ -197,6 +197,14 @@ pub(crate) struct HostHeap {
     /// (and its memory a host copy) only when something reads it: a draw
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
     /// buffers from the whole heap.
+    /// What the title's view in each title slot says in the stride table
+    /// (stride and kind), whether or not the table says so now
+    /// ([`stride_follows_slot`]). Written under the slot's lock.
+    wanted: Vec<std::sync::atomic::AtomicU32>,
+    /// The title slots whose host slot shows a buffer view made from the
+    /// title's: those whose stride is in the table
+    /// ([`stride_follows_slot`]).
+    buffer_shown: Slots,
     buffers: Slots,
     /// Of those and of the slots that left the set: the ones written since
     /// [`HostHeap::buffer_changes`] last took them.
@@ -1880,8 +1888,39 @@ pub(crate) fn probe_view_limit() {
             "host view heaps hold {views} views; view indices are clamped to the null slot at the end from the first shader on"
         );
         victory_shader::emit::set_view_heap_limit(views - 1);
+        // What a shader reads instead of a slot that shows no buffer
+        // (`victory_shader::emit::buffer_guard`): with twins the twin of
+        // the null slot, a null buffer view no slot's twin is ever written
+        // over (`fill_null`; twins are written for the title's and the
+        // dynamic slots only, all below the null slot); without, the null
+        // slot itself.
+        victory_shader::emit::set_null_buffer_view(if twins { RAW_TWINS + views - 1 } else { views - 1 });
     });
 }
+
+/// Whether a title slot's dword in the stride table says "a buffer" (a
+/// stride that is not 0) only while its host slot shows a buffer view made
+/// from the title's (`VICTORY_STRIDE_FOLLOWS_SLOT=0`: whenever the title's
+/// slot holds one, as before).
+///
+/// The table was written from the title's record when the title wrote it
+/// ([`HostHeap::note_buffer`]); the host slot is made later (a buffer view
+/// waits for a draw or a pass) and may go on showing what it showed (a
+/// texture whose clear is held for a submission on the card,
+/// [`defer_slot_clears`]). A shader that picks buffers by index
+/// (`victory_shader::emit::buffer_guard`) reads the slot as a buffer where
+/// the table says so, and read the texture's descriptor as one in between.
+pub(crate) fn stride_follows_slot() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STRIDE_FOLLOWS_SLOT").is_none_or(|v| v != "0"))
+}
+
+/// Times a stride was taken out of the table before something that is not a
+/// buffer view of the title's was written to its host slot, and times one
+/// was withheld when the title wrote a buffer view to a slot whose host slot
+/// does not show one yet ([`stride_follows_slot`]).
+pub(crate) static STRIDES_HIDDEN: [std::sync::atomic::AtomicU64; 2] =
+    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
@@ -2045,6 +2084,10 @@ impl HostHeap {
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
+            wanted: (0..if sampler || !stride_follows_slot() { 0 } else { count })
+                .map(|_| std::sync::atomic::AtomicU32::new(0))
+                .collect(),
+            buffer_shown: Slots::new(if sampler { 0 } else { count as usize }),
             buffers: Slots::new(count as usize),
             changed: Slots::new(count as usize),
             textures: Mutex::new(TextureQueue { queued: queued.clone(), ..Default::default() }),
@@ -3320,9 +3363,22 @@ impl HostHeap {
         if let Some((_, _, data)) = &self.strides
             && index < victory_shader::emit::SLOT_STRIDES_COUNT
         {
+            let mut dword = stride.unwrap_or(0) | kind;
+            // The stride only where the host slot shows a buffer view
+            // ([`stride_follows_slot`]): else when one is made there
+            // ([`HostHeap::stride_show`]).
+            if let Some(wanted) = self.wanted.get(index as usize) {
+                wanted.store(dword, std::sync::atomic::Ordering::Relaxed);
+                if !self.shows_buffer(index) {
+                    if dword & victory_shader::emit::VIEW_STRIDE_BITS != 0 {
+                        STRIDES_HIDDEN[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    dword &= !victory_shader::emit::VIEW_STRIDE_BITS;
+                }
+            }
             // SAFETY: inside the mapping; shaders read it while we write (a
             // dword, either value is one the slot had).
-            unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0) | kind) };
+            unsafe { (*data as *mut u32).add(index as usize).write_volatile(dword) };
             write_view_address(*data, index, view);
         }
         let was = if stride.is_some() {
@@ -3441,6 +3497,8 @@ impl HostHeap {
             written.store(crate::host::coarse_ms() as u32, std::sync::atomic::Ordering::Relaxed);
         }
         let Some(host) = host() else { return };
+        // (As [`HostHeap::put`]: no stride while it is written.)
+        self.stride_hide(to);
         // SAFETY: a slot of our heap, and one of this thread's heap.
         unsafe { host.device.CopyDescriptorsSimple(1, self.cpu(to), from, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
     }
@@ -3736,14 +3794,81 @@ impl HostHeap {
     /// a slot of this thread's in a heap the card does not see
     /// ([`staged`]), or the slot itself.
     fn at(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        staged(self.sampler, 0).unwrap_or_else(|| self.cpu(index))
+        staged(self.sampler, 0).unwrap_or_else(|| {
+            // (Made in the slot itself: it changes from here on.)
+            self.stride_hide(index);
+            self.cpu(index)
+        })
     }
 
     /// The descriptor this thread made last ([`HostHeap::at`]) goes to slot
     /// `index`.
     fn put(&self, index: u32) {
+        // Whatever it is, the slot's stride goes first; a buffer view of
+        // the title's has it back when it is there
+        // ([`HostHeap::stride_show`]).
+        self.stride_hide(index);
         self.copy_to(index, 0);
         self.written_now(index);
+    }
+
+    /// Whether title slot `index`'s host slot shows a buffer view made from
+    /// the title's ([`stride_follows_slot`]).
+    fn shows_buffer(&self, index: u32) -> bool {
+        let bit = 1u64 << (index % 64);
+        self.buffer_shown.0.get(index as usize / 64).is_some_and(|w| w.load(std::sync::atomic::Ordering::Acquire) & bit != 0)
+    }
+
+    /// Something is about to be written to title slot `index`'s host slot:
+    /// the stride table says "no buffer" for it first
+    /// ([`stride_follows_slot`]). Every write of a slot comes by here
+    /// ([`HostHeap::at`], [`HostHeap::put`]), under the slot's lock.
+    fn stride_hide(&self, index: u32) {
+        let Some(wanted) = self.wanted.get(index as usize) else {
+            return; // a dynamic slot, a sampler heap, or the switch off
+        };
+        if !self.buffer_shown.remove(index) {
+            return;
+        }
+        if let Some((_, _, data)) = &self.strides
+            && index < victory_shader::emit::SLOT_STRIDES_COUNT
+        {
+            let dword = wanted.load(std::sync::atomic::Ordering::Relaxed) & !victory_shader::emit::VIEW_STRIDE_BITS;
+            // SAFETY: inside the mapping, as in `note_buffer`.
+            unsafe { (*data as *mut u32).add(index as usize).write_volatile(dword) };
+            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+            STRIDES_HIDDEN[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Title slot `index`'s host slot now shows the buffer view the title's
+    /// slot holds: its stride is in the table from here on
+    /// ([`stride_follows_slot`]). Under the slot's lock, after the
+    /// descriptor is there.
+    fn stride_show(&self, index: u32) {
+        let Some(wanted) = self.wanted.get(index as usize) else {
+            return;
+        };
+        let dword = wanted.load(std::sync::atomic::Ordering::Relaxed);
+        if dword & victory_shader::emit::VIEW_STRIDE_BITS == 0 {
+            return;
+        }
+        self.buffer_shown.put(index);
+        if let Some((_, _, data)) = &self.strides
+            && index < victory_shader::emit::SLOT_STRIDES_COUNT
+        {
+            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+            // SAFETY: inside the mapping, as in `note_buffer`.
+            unsafe { (*data as *mut u32).add(index as usize).write_volatile(dword) };
+        }
+    }
+
+    /// What the stride table says of title slot `index` now.
+    #[cfg(test)]
+    fn stride_shown(&self, index: u32) -> u32 {
+        let Some((_, _, data)) = &self.strides else { return 0 };
+        // SAFETY: inside the mapping.
+        unsafe { (*data as *const u32).add(index as usize).read_volatile() & victory_shader::emit::VIEW_STRIDE_BITS }
     }
 
     /// The raw twin this thread made last goes to that of slot `index`.
@@ -4074,6 +4199,9 @@ impl HostHeap {
                         self.twin_made(index, twinned(&view));
                         self.keep(index, kept);
                         self.made_now(index);
+                        if !self.sampler && view_stride(&view).is_some() {
+                            self.stride_show(index);
+                        }
                     }
                     // (A sampler the host cannot make: the slot as it was.)
                     Make::None if self.sampler => {
@@ -6183,6 +6311,133 @@ mod tests {
         srv[..9].copy_from_slice(&[0, 1, 5768, 0, 0, 0, 256, 16, 0]);
         (srv[10], srv[11]) = (address as u32, (address >> 32) as u32);
         View::Placed(false, resource, srv)
+    }
+
+    /// The stride table says a title slot holds a buffer only while its
+    /// host slot shows one. A buffer view the title writes where the host
+    /// slot goes on showing a texture (its clear held for a submission on
+    /// the card) leaves the slot's dword at 0, as for the texture; it
+    /// said 16 here before, and a shader picking buffers by index read the
+    /// texture's descriptor as a buffer's (base 0, a large size on RADV).
+    #[test]
+    fn the_stride_table_follows_the_host_slot_not_the_title() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        if heap.strides.is_none() || !stride_follows_slot() {
+            return;
+        }
+        static TEXTURE: [u8; 65536] = [0; 65536];
+        static BUFFER: [u8; 4096] = [0; 4096];
+        let (texture, record) = placed_record(&TEXTURE);
+        let buffer = structured_view(&BUFFER);
+        assert_eq!(view_stride(&buffer), Some(16));
+        assert_eq!(view_stride(&texture), None);
+        let handle = descriptor(record);
+        set_card(&heap, ON_CARD, ON_CARD, 1);
+        assert_eq!(heap.mirror(1, handle, true), Some(texture.clone()));
+        let image = shown(&heap, 1);
+        assert!(image.is_some(), "the texture is made");
+        assert!(!heap.shows_buffer(1));
+        assert_eq!(heap.stride_shown(1), 0);
+        // The buffer view, written while a submission is on the card.
+        set_card(&heap, ON_CARD + 1, ON_CARD, 1);
+        rewrite(handle, record_of(&buffer));
+        assert_eq!(heap.mirror(1, handle, false), Some(buffer.clone()));
+        assert_eq!(shown(&heap, 1), image, "the clear is held: the texture is still shown");
+        assert_eq!(heap.stride_shown(1), 0, "no buffer while the texture is shown");
+        // The clear published: a null buffer view, still no stride.
+        assert_eq!(heap.flush_deferred(ON_CARD + 1), 1);
+        assert_eq!(shown(&heap, 1), None);
+        assert_eq!(heap.stride_shown(1), 0);
+        // A draw reads it: the stride is there if (and only if) the view
+        // was made (a host copy of the test's bytes may not be made here).
+        set_card(&heap, ON_CARD + 1, ON_CARD + 1, 1);
+        assert_eq!(heap.mirror(1, handle, true), Some(buffer));
+        let made = shown(&heap, 1).is_some();
+        assert_eq!(heap.stride_shown(1), if made { 16 } else { 0 }, "made: {made}");
+        assert_eq!(heap.shows_buffer(1), made);
+        // The texture again: the stride is gone before the texture is there.
+        rewrite(handle, record);
+        assert_eq!(heap.mirror(1, handle, true), Some(texture));
+        assert!(shown(&heap, 1).is_some());
+        assert!(!heap.shows_buffer(1));
+        assert_eq!(heap.stride_shown(1), 0);
+        assert_eq!(super::device_removed(), None);
+    }
+
+    /// A slot the title writes a buffer view to while its host slot shows a
+    /// texture is noted as reading no buffer from then on: through its held
+    /// clear (a null buffer view) until the buffer view is made, or until
+    /// something else is written there.
+    #[test]
+    fn a_buffer_view_over_a_shown_texture_waits_until_it_is_made() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        if heap.strides.is_none() || !stride_follows_slot() {
+            return;
+        }
+        // (The title's slot holds a buffer view the table does not show.)
+        let waits = |heap: &HostHeap| {
+            heap.wanted[1].load(Relaxed) & victory_shader::emit::VIEW_STRIDE_BITS != 0 && heap.stride_shown(1) == 0
+        };
+        static TEXTURE: [u8; 65536] = [0; 65536];
+        static BUFFER: [u8; 4096] = [0; 4096];
+        let (texture, record) = placed_record(&TEXTURE);
+        let buffer = structured_view(&BUFFER);
+        let handle = descriptor(record);
+        set_card(&heap, ON_CARD, ON_CARD, 1);
+        assert_eq!(heap.mirror(1, handle, true), Some(texture.clone()));
+        assert!(!waits(&heap), "a texture waits for nothing");
+        set_card(&heap, ON_CARD + 1, ON_CARD, 1);
+        let withheld = STRIDES_HIDDEN[1].load(Relaxed);
+        rewrite(handle, record_of(&buffer));
+        assert_eq!(heap.mirror(1, handle, false), Some(buffer.clone()));
+        assert!(shown(&heap, 1).is_some());
+        assert!(waits(&heap), "the buffer view over the shown texture waits");
+        assert!(STRIDES_HIDDEN[1].load(Relaxed) > withheld, "counted");
+        // Its held clear, a null buffer view, is still no buffer.
+        assert_eq!(heap.flush_deferred(ON_CARD + 1), 1);
+        assert!(waits(&heap), "a null buffer view is what it shows while it waits");
+        set_card(&heap, ON_CARD + 1, ON_CARD + 1, 1);
+        assert_eq!(heap.mirror(1, handle, true), Some(buffer));
+        let made = shown(&heap, 1).is_some();
+        assert_eq!(waits(&heap), !made, "made: {made}");
+        // A null written over the buffer view takes its stride first.
+        if made {
+            heap.write_null(1, Null::Plain);
+            assert!(waits(&heap), "nothing is shown: no stride");
+            assert!(!heap.shows_buffer(1));
+        }
+        // Something else written there ends any wait.
+        rewrite(handle, record);
+        assert_eq!(heap.mirror(1, handle, true), Some(texture));
+        assert!(!waits(&heap));
+        assert_eq!(super::device_removed(), None);
+    }
+
+    /// What shaders read in place of a slot whose dword says "no buffer"
+    /// is a slot no view is ever written to: past every title and dynamic
+    /// slot, and with raw twins the twin of the null slot.
+    #[test]
+    fn the_null_buffer_view_is_a_slot_nothing_writes() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let Some(null) = victory_shader::emit::null_buffer_view() else {
+            panic!("set with the view heap's limit");
+        };
+        let limit = victory_shader::emit::view_heap_limit();
+        if heap.raw == 0 {
+            assert_eq!(null, limit);
+        } else {
+            assert_eq!(null, heap.raw + limit);
+            assert!(heap.twin(limit).is_none(), "no twin is made for the null slot");
+        }
+        assert!(heap.count + heap.dynamic <= limit);
+        assert!(heap.kept.len() as u32 <= limit, "nothing is kept for it: nothing is made there");
     }
 
     /// A buffer view read as a texture or a texture view read as a buffer

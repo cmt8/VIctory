@@ -125,8 +125,26 @@ pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, VIEW_ADDRESSES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    constants_raw, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
+    constants_raw, null_buffer_view, raw_views, set_null_buffer_view, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
+
+/// Whether a typed or structured buffer the program reads in place from
+/// the view heap at an index it computes (a raw one too where the host has
+/// no raw twins, [`raw_views`]) is read through the host's null buffer
+/// view ([`null_buffer_view`]) where the heap's table of strides says the
+/// slot shows no buffer view (`VICTORY_BUFFER_GUARD`; on, `=0` off). The
+/// index comes from data; a texture view read as a buffer's descriptor is
+/// a wild address (under vkd3d-proton with embedded mutable descriptors a
+/// raw or structured buffer is the bytes at the slot's raw-buffer offset,
+/// inside a sampled image descriptor's upper half, and a typed buffer its
+/// first bytes). After upstream VIctory d71c3889 (Marvis) and pull
+/// requests #2068 and #2128 (fuzeofficial), by way of 4cf0e82a0 of
+/// linux/fx-next21. Part of the translation: the shader cache keys on it
+/// ([`host_settings`]).
+pub fn buffer_guard() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BUFFER_GUARD").is_none_or(|v| v != "0"))
+}
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
