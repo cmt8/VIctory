@@ -1981,7 +1981,6 @@ impl HostHeap {
         // Sampler heaps always back the full 2,048 hardware limit and reserve
         // slot 2,047 as a permanent null point sampler so `umin(index, 2047)`
         // in `victory-shader` never reads past smaller title sampler heaps.
-        const SAMPLERS: u32 = 2048;
         if !sampler {
             probe_view_limit();
         }
@@ -2127,48 +2126,8 @@ impl HostHeap {
     /// Makes the first `total` slots null: one null slot in a CPU-side heap,
     /// doubled by copies to a block, the block copied over the heap.
     fn fill_null(&self, kind: D3D12_DESCRIPTOR_HEAP_TYPE, total: u32) -> windows::core::Result<()> {
-        const BLOCK: u32 = 1 << 16;
         let Some(host) = host() else { return Ok(()) };
-        // SAFETY: plain heap creation and copies inside live heaps.
-        unsafe {
-            let block: ID3D12DescriptorHeap =
-                host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                    Type: kind,
-                    NumDescriptors: BLOCK,
-                    ..Default::default()
-                })?;
-            let start = block.GetCPUDescriptorHandleForHeapStart();
-            let at = |i: u32| D3D12_CPU_DESCRIPTOR_HANDLE {
-                ptr: start.ptr + (i * self.step) as usize,
-            };
-            // (The twins are null buffer views.)
-            let ends = if self.raw == 0 { [total, total] } else { [self.raw.min(total), total] };
-            let mut done = 0;
-            for (twin, end) in ends.into_iter().enumerate() {
-                if done == end {
-                    continue;
-                }
-                if self.sampler {
-                    null_sampler(start);
-                } else if twin == 1 {
-                    null_buffer_view(start);
-                } else {
-                    null_view(start);
-                }
-                let mut filled = 1;
-                while filled < BLOCK {
-                    let n = filled.min(BLOCK - filled);
-                    host.device.CopyDescriptorsSimple(n, at(filled), start, kind);
-                    filled += n;
-                }
-                while done < end {
-                    let n = BLOCK.min(end - done);
-                    host.device.CopyDescriptorsSimple(n, self.cpu(done), start, kind);
-                    done += n;
-                }
-            }
-        }
-        Ok(())
+        fill_null(host, kind, self.cpu, self.step, self.raw, total)
     }
 
     /// A plain point sampler at slot `index`, for sampler slots without a
@@ -2177,6 +2136,117 @@ impl HostHeap {
         null_sampler(self.at(index));
         self.put(index);
     }
+}
+
+/// Makes the first `total` slots of the heap of `kind` whose slots start at
+/// `cpu`, `step` bytes each, null: null views up to `raw` (0: all of them),
+/// null buffer views from there (the raw twins); plain point samplers in a
+/// sampler heap.
+fn fill_null(
+    host: &crate::host::Host,
+    kind: D3D12_DESCRIPTOR_HEAP_TYPE,
+    cpu: usize,
+    step: u32,
+    raw: u32,
+    total: u32,
+) -> windows::core::Result<()> {
+    const BLOCK: u32 = 1 << 16;
+    let sampler = kind == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+    // SAFETY: plain heap creation and copies inside live heaps.
+    unsafe {
+        let block: ID3D12DescriptorHeap = host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: kind,
+            NumDescriptors: BLOCK,
+            ..Default::default()
+        })?;
+        let start = block.GetCPUDescriptorHandleForHeapStart();
+        let at = |i: u32| D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: start.ptr + (i * step) as usize,
+        };
+        let slot = |i: u32| D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: cpu + i as usize * step as usize,
+        };
+        // (The twins are null buffer views.)
+        let ends = if raw == 0 { [total, total] } else { [raw.min(total), total] };
+        let mut done = 0;
+        for (twin, end) in ends.into_iter().enumerate() {
+            if done == end {
+                continue;
+            }
+            if sampler {
+                null_sampler(start);
+            } else if twin == 1 {
+                null_buffer_view(start);
+            } else {
+                null_view(start);
+            }
+            let mut filled = 1;
+            while filled < BLOCK {
+                let n = filled.min(BLOCK - filled);
+                host.device.CopyDescriptorsSimple(n, at(filled), start, kind);
+                filled += n;
+            }
+            while done < end {
+                let n = BLOCK.min(end - done);
+                host.device.CopyDescriptorsSimple(n, slot(done), start, kind);
+                done += n;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Slots of a host sampler heap: the most one holds, and what translated
+/// shaders clamp a heap sampler's index below (`umin(index, 2047)`).
+const SAMPLERS: u32 = 2048;
+
+/// A heap of ours for a list to have bound where the title bound none of
+/// its kind ([`crate::host::fallback_heaps`]): as long as a title's host
+/// heap of that kind, every slot null, so whatever index a translated
+/// shader can read (clamped to the null slot, the raw twin of one, the
+/// null buffer view, a sampler below 2,048) is inside it and reads
+/// nothing. Views: null views, and null buffer views where the raw twins
+/// lie. Samplers: 2,048 plain point samplers.
+pub(crate) fn make_fallback(host: &crate::host::Host, sampler: bool) -> Option<ID3D12DescriptorHeap> {
+    let (kind, size, raw) = if sampler {
+        (D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, SAMPLERS, 0)
+    } else {
+        probe_view_limit();
+        let null = victory_shader::emit::view_heap_limit();
+        if null == 0 {
+            return None;
+        }
+        let raw = victory_shader::emit::raw_views();
+        (D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, if raw == 0 { null + 1 } else { 2 * raw }, raw)
+    };
+    // SAFETY: plain heap creation.
+    let made: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
+        host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: kind,
+            NumDescriptors: size,
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+            NodeMask: 0,
+        })
+    };
+    let heap = match made {
+        Ok(heap) => heap,
+        Err(e) => {
+            tracing::warn!(error = %e, sampler, size, "no heap of ours for lists that bind none");
+            return None;
+        }
+    };
+    // SAFETY: a live heap.
+    let (cpu, step) = unsafe {
+        (heap.GetCPUDescriptorHandleForHeapStart().ptr, host.device.GetDescriptorHandleIncrementSize(kind))
+    };
+    if let Err(e) = fill_null(host, kind, cpu, step, raw, size) {
+        // (Slots never written are undefined: not bound so.)
+        tracing::warn!(error = %e, sampler, "the heap of ours for lists that bind none was not made null");
+        return None;
+    }
+    crate::host::name(&heap, || format!("{} for lists that bind none", if sampler { "samplers" } else { "views" }));
+    tracing::info!(sampler, size, "a heap of ours for lists that bind none of its kind, every slot null");
+    Some(heap)
 }
 
 /// A plain point sampler at `at`.
@@ -6438,6 +6508,35 @@ mod tests {
         }
         assert!(heap.count + heap.dynamic <= limit);
         assert!(heap.kept.len() as u32 <= limit, "nothing is kept for it: nothing is made there");
+    }
+
+    /// The heaps of ours a list gets where the title bound none of a kind
+    /// hold every index a translated shader can read: a sampler heap of
+    /// 2,048 (indices are clamped to 2,047; a heap of one slot was read
+    /// past its end), a view heap as long as a title's host heap, with the
+    /// null slot, the raw twins and the null buffer view inside.
+    #[test]
+    fn the_heaps_for_lists_that_bind_none_hold_every_index_a_shader_reads() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let count = |heap: &ID3D12DescriptorHeap| {
+            // SAFETY: a live heap.
+            unsafe { heap.GetDesc().NumDescriptors }
+        };
+        let samplers = make_fallback(host, true).expect("a sampler heap of ours");
+        assert_eq!(count(&samplers), 2048);
+        let Some(title) = HostHeap::new(false, 8) else {
+            panic!("a host view heap");
+        };
+        let views = make_fallback(host, false).expect("a view heap of ours");
+        assert_eq!(count(&views), count(&title.heap), "as long as a title's");
+        let limit = victory_shader::emit::view_heap_limit();
+        assert!(count(&views) > limit, "the null slot is inside");
+        assert!(count(&views) > limit + victory_shader::emit::raw_views(), "and its raw twin");
+        let null = victory_shader::emit::null_buffer_view().expect("set with the limit");
+        assert!(count(&views) > null, "and the null buffer view");
+        assert_eq!(super::device_removed(), None);
     }
 
     /// A buffer view read as a texture or a texture view read as a buffer

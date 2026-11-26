@@ -451,12 +451,21 @@ static RESIDENT: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic:
 /// 85 % of the card's budget, windows of title memory and staging buffers
 /// for five minutes with 12 GiB of the PC's memory free, and 1 GiB of
 /// scratch chunks.
-/// Whether a list always has a view heap and a sampler heap bound, ours of
-/// one slot for one the title did not set (, from
-/// codec-d/cool_fox 641835a4; off by default).
+/// Whether a list always has a view heap and a sampler heap bound, ours
+/// for one the title did not set (from codec-d/cool_fox 641835a4, where it
+/// was off unless `VICTORY_FALLBACK_HEAPS=1` and the heaps had one slot;
+/// on by default now, `VICTORY_FALLBACK_HEAPS=0`: only the title's, as
+/// before).
+///
+/// Every root signature made here indexes both heaps directly. With none
+/// of a kind bound, vkd3d-proton (2576c0b4, command.c,
+/// `d3d12_command_list_init_default_descriptor_buffers`) leaves the
+/// device's own small descriptor buffer bound in its place, and an index a
+/// shader computes reads past it. The heaps of ours are as long as a
+/// title's, every slot null (`crate::descriptor::host::make_fallback`).
 pub(crate) fn fallback_heaps() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_FALLBACK_HEAPS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FALLBACK_HEAPS").is_none_or(|v| v != "0"))
 }
 
 pub(crate) fn keep_freed() -> bool {
@@ -6672,69 +6681,15 @@ impl Host {
         first_error
     }
 
-    /// 1-descriptor shader-visible CBV/SRV/UAV fallback heap for directly-indexed root signatures.
+    /// The view heap of ours for a list whose title bound none
+    /// ([`fallback_heaps`]): made when first wanted.
     pub(crate) fn fallback_view_heap(&self) -> Option<&ID3D12DescriptorHeap> {
-        self.fallback_view
-            .get_or_init(|| {
-                // SAFETY: plain 1-descriptor shader-visible heap + null SRV initialization.
-                unsafe {
-                    let heap: ID3D12DescriptorHeap = self
-                        .device
-                        .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                            NumDescriptors: 1,
-                            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                            NodeMask: 0,
-                        })
-                        .ok()?;
-                    let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
-                        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT,
-                        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
-                        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-                        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                            Buffer: D3D12_BUFFER_SRV::default(),
-                        },
-                    };
-                    self.device.CreateShaderResourceView(
-                        None,
-                        Some(&desc),
-                        heap.GetCPUDescriptorHandleForHeapStart(),
-                    );
-                    Some(heap)
-                }
-            })
-            .as_ref()
+        self.fallback_view.get_or_init(|| crate::descriptor::host::make_fallback(self, false)).as_ref()
     }
 
-    /// 1-descriptor shader-visible Sampler fallback heap for directly-indexed root signatures.
+    /// The same of samplers.
     pub(crate) fn fallback_sampler_heap(&self) -> Option<&ID3D12DescriptorHeap> {
-        self.fallback_sampler
-            .get_or_init(|| {
-                // SAFETY: plain 1-descriptor shader-visible sampler heap initialization.
-                unsafe {
-                    let heap: ID3D12DescriptorHeap = self
-                        .device
-                        .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                            Type: D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
-                            NumDescriptors: 1,
-                            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                            NodeMask: 0,
-                        })
-                        .ok()?;
-                    let desc = D3D12_SAMPLER_DESC {
-                        Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
-                        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-                        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-                        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-                        MaxLOD: f32::MAX,
-                        ..Default::default()
-                    };
-                    self.device
-                        .CreateSampler(&desc, heap.GetCPUDescriptorHandleForHeapStart());
-                    Some(heap)
-                }
-            })
-            .as_ref()
+        self.fallback_sampler.get_or_init(|| crate::descriptor::host::make_fallback(self, true)).as_ref()
     }
 
     /// A host render target view of `resource`, valid until it is recorded.

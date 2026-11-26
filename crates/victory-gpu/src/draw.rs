@@ -1604,9 +1604,9 @@ impl State {
         }
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them, with both a view heap and a sampler heap bound.
-        // (`VICTORY_FALLBACK_HEAPS=1`, codec-d/cool_fox 641835a4: a host
-        // heap of one slot for one the title did not set; else only those it
-        // set, as before.)
+        // (codec-d/cool_fox 641835a4: a heap of ours for one the title did
+        // not set, as long as a title's and every slot null;
+        // `VICTORY_FALLBACK_HEAPS=0`: only those it set, as before.)
         let fallback = crate::host::fallback_heaps();
         if (fallback && !self.host_heaps_set) || self.host_heaps != self.heaps {
             let mut view_heap: Option<ID3D12DescriptorHeap> = None;
