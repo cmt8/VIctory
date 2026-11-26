@@ -8,7 +8,7 @@ use crate::native::{
 };
 use crate::{io, ir, resource, structure};
 
-const S_ENDPGM: u32 = 0xBF81_0000;
+pub(super) const S_ENDPGM: u32 = 0xBF81_0000;
 
 #[test]
 fn packed_pixel_inputs_find_their_second_row() {
@@ -167,7 +167,7 @@ fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
 
 /// Lowers a compute program with the root parameters `layout` (in user
 /// SGPRs from s0 on) and the used resources `used`.
-fn lower_with(
+pub(super) fn lower_with(
     words: &[u32],
     layout: Vec<RootParam>,
     used: Vec<UsedResource>,
@@ -182,6 +182,17 @@ fn lower_wave(
     used: Vec<UsedResource>,
     wave64: bool,
 ) -> Result<Lowered, crate::ShaderError> {
+    lower_compute(words, layout, used, wave64, true)
+}
+
+/// [`lower_wave`], with 512 bytes of LDS only if `lds`.
+pub(super) fn lower_compute(
+    words: &[u32],
+    layout: Vec<RootParam>,
+    used: Vec<UsedResource>,
+    wave64: bool,
+    lds: bool,
+) -> Result<Lowered, crate::ShaderError> {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let sgprs: u32 = layout.iter().map(|p| p.sgprs).sum();
     let native = NativeProgram {
@@ -191,8 +202,8 @@ fn lower_wave(
         layout,
         used,
         io: StageIo::Cs(ComputeIo {
-            // The layout's user SGPRs (at least two), 512 bytes of LDS.
-            rsrc2: 1 << 15 | sgprs.max(2) << 1,
+            // The layout's user SGPRs (at least two), optionally 512 bytes of LDS.
+            rsrc2: u32::from(lds) << 15 | sgprs.max(2) << 1,
             threads: [1, 1, 1],
         }),
         code,
@@ -215,7 +226,7 @@ fn lower_wave(
 }
 
 /// Root parameter `slot` in user SGPRs from `user_data` on.
-fn root(root: RootType, user_data: u8, slot: u8) -> RootParam {
+pub(super) fn root(root: RootType, user_data: u8, slot: u8) -> RootParam {
     RootParam {
         root,
         table_offset_dwords: 0,

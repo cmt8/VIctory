@@ -34,6 +34,8 @@ pub use halves::take_half_report;
 mod coherent;
 #[path = "wave_pin.rs"]
 mod wave_pin;
+#[path = "packed_mask.rs"]
+mod packed_mask;
 
 type Why = &'static str;
 
@@ -229,6 +231,8 @@ struct Lower<'a> {
     pending_masks: Vec<(V, usize, usize)>,
     data_phis: Vec<(V, usize, usize)>,
     read_phis: HashSet<Value>,
+    /// Numeric joins retained while rebuilding scalar bitwise operands.
+    packed_phis: HashSet<Value>,
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
@@ -1561,6 +1565,7 @@ impl<'a> Lower<'a> {
             pending_masks: Vec::new(),
             data_phis: Vec::new(),
             read_phis: HashSet::new(),
+            packed_phis: HashSet::new(),
             stale: HashSet::new(),
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
@@ -3268,6 +3273,9 @@ impl<'a> Lower<'a> {
         if !self.x.st.active.contains(&lo) && !whole {
             if self.exchange.is_some() && !self.local {
                 need(made.unwrap_or(0));
+            }
+            if let Some(word) = self.packed_mask_word(v) {
+                return Ok(word);
             }
             return Err(MASK_ELSEWHERE);
         }
@@ -10288,7 +10296,9 @@ impl<'a> Lower<'a> {
             if kind == 5 && (*unorm || op == 81) {
                 return Err("a cube sample with texel coordinates or a level query");
             }
-            for (k, slot) in cs.iter_mut().enumerate().take(coords) {
+            // CalculateLOD takes only spatial coordinates, even on a texture array.
+            let coord_count = if op == 81 { spatial } else { coords };
+            for (k, slot) in cs.iter_mut().enumerate().take(coord_count) {
                 let x = addr_packed(self, coord_base, k)?;
                 *slot = to_float(self, x);
             }
@@ -11853,6 +11863,11 @@ impl<'a> Lower<'a> {
                 let second = p.blocks[b].preds[..n].contains(&q);
                 let qb = self.edges.get(&(q, b, second)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
+                if self.packed_phis.contains(&phi.value) && self.impossible_forward_edge(q, b) {
+                    let ty = if bit { self.s.t.i1 } else { self.s.t.i32 };
+                    incoming.push((self.s.m.undef(ty), qb));
+                    continue;
+                }
                 if self.read_phis.contains(&phi.value) && !self.vals.contains_key(&arg) {
                     let _ = self.lazy_barycentric(arg);
                     // A root parameter nothing read before the join (user
@@ -11867,7 +11882,7 @@ impl<'a> Lower<'a> {
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
                     (Some(Val::Missing(_)) | None, false)
-                        if numbers && self.dead(arg, &mut Vec::new()) =>
+                        if numbers && !self.packed_phis.contains(&phi.value) && self.dead(arg, &mut Vec::new()) =>
                     {
                         self.s.m.i32(0)
                     }
