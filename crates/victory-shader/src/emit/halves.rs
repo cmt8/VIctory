@@ -64,25 +64,34 @@ impl<'a> Lower<'a> {
     /// that succeeded made them.
     pub(super) fn report_halves(&mut self) {
         if super::super::half_report() {
-            HALF_REPORT.set(Some(std::mem::take(&mut self.half_counts)));
+            let [a, b, c, d] = std::mem::take(&mut self.half_counts);
+            let console = if self.x.p.wave64 { 64 } else { 32 };
+            let host = self.s.wave_size.unwrap_or(0);
+            let wave_ops = u32::from(self.s.flags & super::flags::WAVE_OPS != 0);
+            HALF_REPORT.set(Some([a, b, c, d, console, host, wave_ops]));
         }
     }
 }
 
 thread_local! {
     /// See [`take_half_report`].
-    static HALF_REPORT: std::cell::Cell<Option<[u32; 4]>> = const { std::cell::Cell::new(None) };
+    static HALF_REPORT: std::cell::Cell<Option<[u32; 7]>> = const { std::cell::Cell::new(None) };
 }
 
 /// With `VICTORY_HALF_REPORT=1`: of the program this thread translated
 /// last (since the last call), its typed buffer accesses that move 16-bit
 /// halves, as (d16 accesses moved as bits, d16 accesses moved by way of
 /// floats, format loads read only as halves moved as bits, such loads
-/// moved by way of floats). An access by way of floats through one of the
-/// title's 16-bit unsigned views does not keep its bits (the face network
-/// computed zeros so). `None` without the switch, or with nothing
-/// translated since.
-pub fn take_half_report() -> Option<[u32; 4]> {
+/// moved by way of floats), then the console's wave (32 or 64), the wave
+/// the program declares to the host (`WaveSize`; 0: none, and the host
+/// picks: RADV runs such a compute program in waves of 64, NVIDIA in 32),
+/// and whether it uses the host's wave operations (1) at all. An access by
+/// way of floats through one of the title's 16-bit unsigned views does not
+/// keep its bits (the face network computed zeros so); a program that uses
+/// wave operations without declaring a wave runs at another width on AMD
+/// than on NVIDIA. `None` without the switch, or with nothing translated
+/// since.
+pub fn take_half_report() -> Option<[u32; 7]> {
     HALF_REPORT.take()
 }
 

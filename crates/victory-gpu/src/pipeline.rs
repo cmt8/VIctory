@@ -152,7 +152,7 @@ impl Shader {
                 let _ = victory_shader::emit::take_half_report();
                 let done = translate(&self.container);
                 // `VICTORY_HALF_REPORT=1`: how the program moves 16-bit halves.
-                if let Some([d16_bits, d16_floats, format_bits, format_floats]) =
+                if let Some([d16_bits, d16_floats, format_bits, format_floats, console_wave, host_wave, wave_ops]) =
                     victory_shader::emit::take_half_report()
                     && d16_bits + d16_floats + format_bits + format_floats > 0
                 {
@@ -165,6 +165,9 @@ impl Shader {
                         format_bits,
                         format_floats,
                         places,
+                        console_wave,
+                        host_wave,
+                        wave_ops,
                         "halves report: typed buffer accesses moving 16-bit halves, as bits (through the unsigned view at a named place) or by way of floats (which an unsigned view does not carry)"
                     );
                 }

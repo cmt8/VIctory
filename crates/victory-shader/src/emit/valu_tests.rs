@@ -2041,10 +2041,15 @@ fn half_places_are_the_descriptors_the_program_loads() {
     // nothing is reported.
     super::HALF_REPORT_TEST.set(Some(true));
     let _ = super::take_half_report();
+    // (Then the console's wave, 32 here, the wave declared to the host
+    // and whether wave operations are used: a program of fixed places
+    // needs none; the run-time pick reads the first lane.)
     lowered(&fixed);
-    assert_eq!(super::take_half_report(), Some([2, 0, 0, 0]));
+    assert_eq!(super::take_half_report(), Some([2, 0, 0, 0, 32, 0, 0]));
     lowered(&runtime);
-    assert_eq!(super::take_half_report(), Some([0, 2, 0, 0]));
+    let report = super::take_half_report().expect("a report");
+    assert_eq!(report[..5], [0, 2, 0, 0, 32]);
+    eprintln!("halves report of the run-time pick: {report:?}");
     super::HALF_REPORT_TEST.set(Some(false));
     lowered(&fixed);
     assert_eq!(super::take_half_report(), None);
