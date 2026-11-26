@@ -695,6 +695,34 @@ before some 950 times in eight minutes of run b3.
   under shader writes the write lock. Run auto-c1 had the relay "28.2 ms
   landing in all" a frame; the PR measured 28-33 to 17 ms on an RX 7900 XT.
 
+### Mapping physical pages in runs (linux/fx-next19-map)
+
+Off-CPU recordings of a cutscene had the title's two mapping threads 13.1
+of 15 s inside wineserver round trips: some 17,800 maps and 23,000 unmaps
+of views of physical pages per 15 s, each made with ntdll's process-wide
+`virtual_mutex` held, which every protection change, query and write fault
+of every thread then waits for. The page-mapping copies made one view per
+page, and unmapping a range took one call per view.
+
+- `VICTORY_MAP_COALESCE` (on; `=0` as before): pages a call maps go in as
+  runs of consecutive pages of one allocation, one view each (a
+  page-mapping copy's run of pool pages, a scatter call's pages at
+  consecutive addresses); a view that shows what a call asks for already
+  is left as it is, with no call; what stays of a view a call changes in
+  part is mapped again together with the call's new pages where they
+  follow on, with the title's own protections there set again; the
+  placeholders under a run are cut at its ends and joined (only across
+  cuts the runtime made itself), which is ntdll's own work, no server
+  request. A thread that touches the rest of a view while it is mapped
+  again waits in the fault handler for the change instead of crashing.
+  A line every 5 s, "physical-page views", gives maps and unmaps per frame,
+  pages per view, pages kept, placeholder joins, protections set again and
+  faults that waited out a change; the frame log (`VICTORY_FRAME_LOG=1`)
+  has the same per frame under "views:".
+- Also on this branch: our coarse clock ticks every 10 ms instead of 2,
+  and it and the GameInput poller sleep through `Sleep`, which under Wine
+  makes no wineserver request (`std::thread::sleep` made three a sleep).
+
 ### Taking a profile (linux/fx-next6-prof)
 
 Every speed change so far was made without an in-game measurement of

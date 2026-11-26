@@ -969,6 +969,29 @@ pub(crate) fn page_mapper() -> Option<PageMapper> {
     PAGE_MAPPER.get().copied()
 }
 
+/// Whether the changes to title memory that one call asks for are made
+/// under one hold of the runtime's physical-page state and remapping lock
+/// (`title_memory_remapping`), not one per range or page
+/// (`VICTORY_REMAP_BATCH=1`; off by default): the ranges of a page-mapping
+/// copy, and the pages of an `XMemMapPhysicalPagesScatter` call (that one
+/// with `VICTORY_MAP_COALESCE` on). Each hold waits for the reads of title
+/// memory in place under way (a texture refresh reads, hashes and detiles
+/// under it) and each such read for the hold before it, so page by page
+/// the two take turns. Taken in the same order as everywhere (the physical
+/// pages, then the lock): no new lock order. A failed page of a run of one
+/// constant page does not stop the rest of that run; the call still
+/// reports the failure. After vxlayer d5106b6e4 (Geckomacabre).
+pub fn remap_batch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_REMAP_BATCH").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("title memory remaps: one hold of the locks per call, not per range (VICTORY_REMAP_BATCH=1)");
+        }
+        on
+    })
+}
+
 /// Allocation attributes for resource memory: allocator id, page size
 /// (bits 14-15: 2 MiB pages from 2 MiB up, else 64 KiB), alignment as log2
 /// (bits 24-28) and memory type (bits 29-32: write-combined for GPU-only
