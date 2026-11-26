@@ -1160,6 +1160,12 @@ pub(crate) struct HostTexture {
     /// earlier submissions finish (on RADV/amdgpu, a new BO's page tables are
     /// only mapped on a later submission).
     pub(crate) born_after: u64,
+    /// Whether a list has been given something to write into it: an upload
+    /// of title memory (`crate::texture::upload`), a copy through from a
+    /// texture the host writes (`crate::texture::alias`), or a copy or
+    /// resolve of the title's ([`note_written`]). Until then it holds what
+    /// its memory held before it was made.
+    written: std::sync::atomic::AtomicBool,
 }
 
 /// What a title texture has on the host: its host copy and, for a depth
@@ -2056,6 +2062,7 @@ impl HostTexture {
             filled: false,
             tiled: None,
             born_after: crate::host::started(),
+            written: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -2074,6 +2081,7 @@ impl HostTexture {
             filled: false,
             tiled: Some(tiled),
             born_after: crate::host::started(),
+            written: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -2127,6 +2135,35 @@ pub(crate) fn host_resource<'a>(
     // list and no slot holds and that nothing asked for in seconds (the
     // asking just made is noted under the same lock).
     Some(unsafe { &*std::ptr::from_ref(&host.texture) })
+}
+
+/// `this`'s host copy (if one is made) has been given something to write
+/// into it by a list: an upload, a copy (see [`HostTexture::written`]).
+#[cfg(windows)]
+pub(crate) fn note_written(this: This) {
+    with_made(this, |host| host.written.store(true, std::sync::atomic::Ordering::Relaxed));
+}
+
+/// Whether `this`'s host copy (if one is made) has been given anything to
+/// hold ([`note_written`]); false if none is made.
+#[cfg(windows)]
+pub(crate) fn host_written_to(this: This) -> bool {
+    with_made(this, |host| host.written.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(false)
+}
+
+/// `f` of `this`'s host copy if one is made, without making one or counting
+/// a use of it (as [`hosted`] does).
+#[cfg(windows)]
+fn with_made<R>(this: This, f: impl FnOnce(&HostTexture) -> R) -> Option<R> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return None;
+    }
+    let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+    made.as_ref().map(|(host, _)| f(host))
 }
 
 /// A title texture's host copy, shared, for a list to hold.

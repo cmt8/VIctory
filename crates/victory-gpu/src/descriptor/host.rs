@@ -565,6 +565,18 @@ pub(crate) static AWAY_KEPT: [std::sync::atomic::AtomicU64; 2] =
 /// memory, not the title's pages; when the time is up the slot goes null
 /// the usual way, held back while submissions that may read it are on the
 /// card (`VICTORY_DEFER_SLOT_CLEARS`).
+/// Whether the host texture a slot made from record `key` shows has been
+/// given anything to hold by a list (an upload, a copy:
+/// `crate::resource::host_written_to`), for [`HostHeap::texture_slot_gone`].
+fn shows_written(key: u64) -> bool {
+    view_at(key as u32, (key >> 32) as u32).is_some_and(|view| {
+        match placed_texture(&view).unwrap_or(view) {
+            View::Shader(texture, _) => crate::resource::host_written_to(texture as crate::object::This),
+            _ => false,
+        }
+    })
+}
+
 #[cfg_attr(test, allow(dead_code))]
 fn texture_away_ms() -> u64 {
     static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -1868,7 +1880,14 @@ impl HostHeap {
         let wait = self.away_ms.lock().unwrap_or_else(|e| e.into_inner()).unwrap_or(0);
         #[cfg(not(test))]
         let wait = texture_away_ms();
-        if wait > 0 {
+        // Only a texture that holds what a list wrote into it is shown on.
+        // A slot is made from a placed view when the title writes it, often
+        // before the texture's pages are mapped, and the upload waits for
+        // them: shown on, its host copy held whatever its memory on the
+        // card held before (block-compressed noise), for the wait and for
+        // good where the character bake read it through the slot. Such a
+        // slot is made null at the first look, as before the wait was.
+        if wait > 0 && shows_written(key) {
             let now = crate::host::now_ms();
             let mut away = self.away.lock().unwrap_or_else(|e| e.into_inner());
             match away.get(&index) {
@@ -4611,12 +4630,17 @@ mod tests {
         let handle = title.as_ptr() as u64;
         assert_eq!(heap.mirror(slot, handle, false), Some(view.clone()));
         let (_, write) = heap.texture_slots_due(u64::MAX, 1).0[0];
-        assert_eq!(heap.mirror(slot, handle, true), Some(view));
+        assert_eq!(heap.mirror(slot, handle, true), Some(view.clone()));
         let key = u64::from(generation) << 32 | u64::from(entry);
         let shown = |heap: &HostHeap| {
             heap.made.lock().unwrap()[slot as usize] == key && heap.kept.lock().unwrap()[slot as usize].is_some()
         };
         assert!(shown(&heap));
+        // Its host texture has been uploaded (only such a one is shown on:
+        // `a_slot_never_written_is_not_shown_on_after_its_memory_went`).
+        let Some(View::Shader(texture, _)) = placed_texture(&view) else { panic!("a placed texture") };
+        crate::resource::note_written(texture as crate::object::This);
+        assert!(shows_written(key));
 
         *heap.away_ms.lock().unwrap() = Some(3_600_000);
         assert!(!heap.texture_slot_gone(slot, write), "made null at the first look");
@@ -4632,6 +4656,38 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(80));
         assert!(heap.texture_slot_gone(slot, write));
         assert_eq!(heap.made.lock().unwrap()[slot as usize], 0);
+    }
+
+    /// A made slot whose host texture no list has written into yet (its
+    /// view written before its memory was mapped) is made null at the
+    /// first look that finds the memory away, whatever the wait: its host
+    /// copy holds what its memory on the card held before.
+    #[test]
+    fn a_slot_never_written_is_not_shown_on_after_its_memory_went() {
+        let Some(heap) = HostHeap::new(false, 8) else { return };
+        let slot = 2;
+        // Bytes of their own: the texture made for a placed view is found
+        // by address, and the test above writes into its own.
+        static BYTES: [u8; 65536] = [0; 65536];
+        let address = BYTES.as_ptr() as u64;
+        let resource = [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0];
+        let mut srv = [0; 16];
+        srv[..6].copy_from_slice(&[98, 4, 5768, 0, 0, 1]);
+        (srv[10], srv[11]) = (address as u32, (address >> 32) as u32);
+        let view = View::Placed(false, resource, srv);
+        let [entry, generation] = super::super::words_for(view.clone());
+        let title = [super::super::VIEW_TAG, entry, generation];
+        let handle = title.as_ptr() as u64;
+        assert_eq!(heap.mirror(slot, handle, false), Some(view.clone()));
+        let (_, write) = heap.texture_slots_due(u64::MAX, 1).0[0];
+        assert_eq!(heap.mirror(slot, handle, true), Some(view));
+        let key = u64::from(generation) << 32 | u64::from(entry);
+        assert!(heap.kept.lock().unwrap()[slot as usize].is_some(), "made, never uploaded");
+        assert!(!shows_written(key));
+        *heap.away_ms.lock().unwrap() = Some(3_600_000);
+        assert!(heap.texture_slot_gone(slot, write), "made null at the first look");
+        assert_eq!(heap.made.lock().unwrap()[slot as usize], 0);
+        assert!(heap.away.lock().unwrap().is_empty());
     }
 
     /// Memory the runtime maps under a slot's texture makes the slot due
