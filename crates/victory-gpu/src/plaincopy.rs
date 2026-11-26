@@ -201,7 +201,20 @@ fn install() -> bool {
         // context it will continue with.
         let (r, context) = unsafe { (&*(*info).ExceptionRecord, &mut *(*info).ContextRecord) };
         // Only at our own copy/write instructions.
-        if context.Rip == (&raw const victory_copy_guarded_at) as u64 {
+        let at_copy = context.Rip == (&raw const victory_copy_guarded_at) as u64;
+        let at_write = context.Rip == (&raw const victory_write_guarded_at) as u64;
+        if (at_copy || at_write)
+            && r.ExceptionCode == EXCEPTION_GUARD_PAGE
+            && r.NumberParameters >= 2
+            && guard::note(r.ExceptionInformation[1])
+        {
+            // The fault took the page's guard flag (the system's one-shot
+            // rule, Wine's virtual_handle_fault alike): the page is plain
+            // now, the copy goes on through it, and the flag is set again
+            // once the copy is done ([`guard`]).
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        if at_copy {
             const READ: usize = 0;
             let read = r.NumberParameters >= 1 && r.ExceptionInformation[0] == READ;
             let gone = (r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION || r.ExceptionCode == EXCEPTION_IN_PAGE_ERROR) && read;
@@ -211,7 +224,7 @@ fn install() -> bool {
             }
             return EXCEPTION_CONTINUE_SEARCH;
         }
-        if context.Rip == (&raw const victory_write_guarded_at) as u64 {
+        if at_write {
             const WRITE: usize = 1;
             let write = r.NumberParameters >= 1 && r.ExceptionInformation[0] == WRITE;
             let gone = (r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION || r.ExceptionCode == EXCEPTION_IN_PAGE_ERROR) && write;
@@ -254,8 +267,103 @@ fn guarded_with(to: *mut u8, from: *const u8, len: usize, install_handler: impl 
     }
     // SAFETY: the destination is the caller's to write; a source page that
     // is not there ends the copy at our exception handler ([`install`]).
-    unsafe { victory_copy_guarded(to, from, len) }
+    let left = unsafe { victory_copy_guarded(to, from, len) };
+    guard::rearm();
+    left
 }
+
+/// Guard pages of title memory (stack guards, the title's own) that a copy
+/// of ours goes through keep their guard (`VICTORY_GUARD_KEEP`, on; `=0`:
+/// the copy ends there and the page stays plain, as before).
+///
+/// A guard page faults once and loses its flag at that fault, on Windows
+/// and in Wine (`dlls/ntdll/unix/virtual.c`, `virtual_handle_fault`, for
+/// any page outside the faulting thread's own stack, also inside a system
+/// call). Our copy that met one ended at the fault and went to the kernel's
+/// copy, whose read took the flag as well: the title's next touch of the
+/// page raised no guard fault, which a thread's stack growth or the title's
+/// own guard needs (zocram4cc's safecopy fix in avatarmanz fa116500 found
+/// two such faults in a traced Proton run that later ended silently). Now
+/// the handler notes the page and lets the copy go on (the page is plain
+/// for that moment), and the copy's caller sets the flag again on the
+/// pages noted, with the protection they have, before it returns.
+#[cfg(target_arch = "x86_64")]
+mod guard {
+    use std::cell::Cell;
+
+    /// Guard pages one copy may go through; at more the copy ends at the
+    /// next one as before (the flag of that one is then lost).
+    const MOST: usize = 8;
+    const PAGE: usize = 4096;
+
+    thread_local! {
+        static NOTED: Cell<[usize; MOST]> = const { Cell::new([0; MOST]) };
+        static COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_KEEP").is_none_or(|v| v != "0"))
+    }
+
+    /// In the handler: notes the guard page of `at`; false when off or full.
+    pub(super) fn note(at: usize) -> bool {
+        if !on() {
+            return false;
+        }
+        let page = at & !(PAGE - 1);
+        COUNT.with(|count| {
+            let n = count.get();
+            if n == MOST {
+                return false;
+            }
+            NOTED.with(|noted| {
+                let mut all = noted.get();
+                all[n] = page;
+                noted.set(all);
+            });
+            count.set(n + 1);
+            true
+        })
+    }
+
+    /// After a copy: the guard flag set again on the pages it noted.
+    pub(super) fn rearm() {
+        let n = COUNT.with(|count| count.replace(0));
+        if n == 0 {
+            return;
+        }
+        let pages = NOTED.with(Cell::get);
+        for &page in &pages[..n] {
+            set(page);
+        }
+        super::REARMED.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            tracing::info!(
+                page = format_args!("{:#x}", pages[0]),
+                "a copy of ours went through a guard page of title memory; its guard is set again (said once, VICTORY_GUARD_KEEP)"
+            );
+        });
+    }
+
+    fn set(page: usize) {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, PAGE_GUARD, VirtualProtect, VirtualQuery};
+        // SAFETY: plain data the query fills in.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let mut old = 0;
+        // SAFETY: a valid out pointer of the right size; a protection change
+        // of one page that was a committed guard page a moment ago.
+        unsafe {
+            if VirtualQuery(page as *const _, &mut info, size_of_val(&info)) != 0 && info.Protect != 0 {
+                VirtualProtect(page as *const _, PAGE, info.Protect | PAGE_GUARD, &mut old);
+            }
+        }
+    }
+}
+
+/// Guard pages whose flag was set again after a copy of ours ([`guard`]).
+static REARMED: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(not(target_arch = "x86_64"))]
 fn guarded(_: *mut u8, _: *const u8, len: usize) -> usize {
@@ -272,7 +380,9 @@ fn guarded_write(to: *mut u8, from: *const u8, len: usize) -> bool {
     }
     // SAFETY: `from` is our readable host buffer; any unmapped or read-only
     // destination page ends the write with 0 via [`install`].
-    unsafe { victory_write_guarded(to, from, len) != 0 }
+    let whole = unsafe { victory_write_guarded(to, from, len) != 0 };
+    guard::rearm();
+    whole
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -362,11 +472,12 @@ pub(crate) fn line(frames: f64) {
     }
     let [copies, bytes, gone, lately, small] = [0, 1, 2, 3, 4].map(|i| COUNT[i].swap(0, Relaxed) as f64 / frames);
     let [writes, wbytes, wgone] = [0, 1, 2].map(|i| WRITE_COUNT[i].swap(0, Relaxed) as f64 / frames);
+    let rearmed = REARMED.swap(0, Relaxed);
     tracing::info!(
         "copies of title memory made in place per frame (VICTORY_COPY_PLAIN): {copies:.0}, {:.1} MB; {gone:.1} met a page \
          that was not there and went through the kernel's copy; left to the kernel's copy untried: {lately:.0} whose source \
          faulted in the last two seconds, {small:.0} of under {LEAST} bytes; writes back in place: {writes:.0}, {:.1} MB, \
-         {wgone:.1} fell back",
+         {wgone:.1} fell back; guard pages gone through and set again (VICTORY_GUARD_KEEP): {rearmed}",
         bytes / 1e6,
         wbytes / 1e6
     );
@@ -392,6 +503,45 @@ mod tests {
         assert_eq!(left, src.len(), "nothing copied");
         assert_eq!(dst, [0; 512]);
         assert!(!registered(&state, || panic!("registration already attempted")));
+    }
+
+    /// Whether the page at `at` is a guard page.
+    fn guard_page(at: usize) -> bool {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, PAGE_GUARD, VirtualQuery};
+        // SAFETY: plain data the query fills in.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        assert_ne!(unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) }, 0);
+        info.Protect & PAGE_GUARD != 0
+    }
+
+    /// A copy through a guard page takes its bytes and leaves it a guard
+    /// page (with `VICTORY_GUARD_KEEP` unset, as in tests); so does a
+    /// write into one.
+    #[test]
+    fn a_guard_page_is_copied_through_and_stays_a_guard_page() {
+        use windows_sys::Win32::System::Memory::{PAGE_GUARD, VirtualProtect};
+        // SAFETY: three pages of our own; the middle one becomes a guard page
+        // after its bytes are written.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 3 * PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE).cast::<u8>();
+            assert!(!base.is_null());
+            for i in 0..3 * PAGE {
+                base.add(i).write((i * 5 + 1) as u8);
+            }
+            let mut old = 0;
+            assert_ne!(VirtualProtect(base.add(PAGE).cast(), PAGE, PAGE_READWRITE | PAGE_GUARD, &mut old), 0);
+            let mut to = vec![0u8; 3 * PAGE];
+            assert_eq!(guarded(to.as_mut_ptr(), base, 3 * PAGE), 0, "the whole copy is made");
+            assert!((0..3 * PAGE).all(|i| to[i] == (i * 5 + 1) as u8), "with the guard page's bytes");
+            assert!(guard_page(base.addr() + PAGE), "the guard flag was consumed by the copy");
+            let from = vec![9u8; PAGE];
+            assert!(guarded_write(base.add(PAGE), from.as_ptr(), PAGE), "a write through it is made");
+            assert!(guard_page(base.addr() + PAGE), "the guard flag was consumed by the write");
+            assert_ne!(VirtualProtect(base.add(PAGE).cast(), PAGE, PAGE_READWRITE, &mut old), 0);
+            assert_eq!(*base.add(PAGE), 9);
+            VirtualFree(base.cast(), 0, MEM_RELEASE);
+        }
     }
 
     #[test]
