@@ -558,7 +558,7 @@ pub(crate) fn views_of_section(section: usize, offset: u64, len: usize) -> Vec<(
 
 /// The runtime's placeholder reservations for physical pages (`xmem`'s
 /// `XMemVirtualAlloc` of 64 KiB pages without a commit), by start: their
-/// end, and when (`crate::host::now_ms`) a look last found the reservation
+/// end, and when (`crate::coarse::ms`) a look last found the reservation
 /// still there. Inside them, title memory is mapped exactly where a view
 /// the runtime told of ([`title_memory_view`]) lies: the runtime maps and
 /// unmaps there only under its remapping lock, and tells of each change
@@ -578,7 +578,7 @@ pub fn title_memory_placeholder(at: usize, len: usize) {
     for s in gone {
         p.remove(&s);
     }
-    p.insert(at, (end, crate::host::now_ms()));
+    p.insert(at, (end, crate::coarse::ms()));
 }
 
 /// Whether the questions "what of `[at, at + len)` is mapped" are answered
@@ -621,7 +621,10 @@ const PLACEHOLDER_LOOK_MS: u64 = 250;
 /// runtime's that is still there (looked at again at most every
 /// [`PLACEHOLDER_LOOK_MS`]).
 fn in_placeholder(at: usize, end: usize) -> bool {
-    let now = crate::host::now_ms();
+    // Coarse, as the time the reservation was made: asked for every read
+    // the books answer, and a look a few milliseconds past the 250 is as
+    // good as one at them.
+    let now = crate::coarse::ms();
     let (start, looked) = {
         let p = PLACEHOLDERS.lock().unwrap_or_else(|e| e.into_inner());
         match p.range(..=at).next_back() {

@@ -1984,7 +1984,9 @@ impl HostHeap {
         // good where the character bake read it through the slot. Such a
         // slot is made null at the first look, as before the wait was.
         if wait > 0 && shows_written(key) {
-            let now = crate::host::now_ms();
+            // Coarse: the wait is seconds (`texture_away_ms`), and the
+            // coarse clock goes on advancing without submissions.
+            let now = crate::coarse::ms();
             let mut away = self.away.lock().unwrap_or_else(|e| e.into_inner());
             match away.get(&index) {
                 // The same record, away for less than the wait: shown on.

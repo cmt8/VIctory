@@ -1616,14 +1616,16 @@ static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 /// ([`title_memory_remapping`]).
 pub struct Remapping(
     #[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>,
-    std::time::Instant,
+    Option<std::time::Instant>,
     #[allow(dead_code)] crate::vmstat::Timed,
 );
 
 impl Drop for Remapping {
     fn drop(&mut self) {
         // From asking for the lock until it is let go (the frame log).
-        crate::framelog::add(crate::framelog::T::RemapUs, self.1.elapsed().as_micros() as u64);
+        if let Some(asked) = self.1 {
+            crate::framelog::add(crate::framelog::T::RemapUs, asked.elapsed().as_micros() as u64);
+        }
     }
 }
 
@@ -1633,10 +1635,15 @@ impl Drop for Remapping {
 /// around the whole change, the unmapping and the mapping again.
 pub fn title_memory_remapping() -> Remapping {
     let timed = crate::vmstat::time(crate::vmstat::Site::Remap);
-    let asked = std::time::Instant::now();
+    // Timed only for the frame log, which alone says these times (thousands
+    // of remappings a frame while the world streams in, two clock reads
+    // each, under Wine a call into its Unix side each).
+    let asked = crate::framelog::on().then(std::time::Instant::now);
     let held = MAPPING.write().unwrap_or_else(|e| e.into_inner());
     crate::framelog::add(crate::framelog::T::Remaps, 1);
-    crate::framelog::add(crate::framelog::T::RemapWaitUs, asked.elapsed().as_micros() as u64);
+    if let Some(asked) = asked {
+        crate::framelog::add(crate::framelog::T::RemapWaitUs, asked.elapsed().as_micros() as u64);
+    }
     Remapping(held, asked, timed)
 }
 

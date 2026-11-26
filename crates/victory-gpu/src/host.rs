@@ -165,9 +165,12 @@ pub(crate) fn now_ms() -> u64 {
 /// This moment, for telling later how long ago it was ([`long_ago`]): the
 /// frames begun so far (high half, `crate::frame::current`) and tenths of a
 /// second since the start. Host copies of title memory, staging buffers and
-/// host textures note when they were last used with it.
+/// host textures note when they were last used with it: at every use, many
+/// thousands of times a frame, so the time is the coarse clock's
+/// (`crate::coarse`, a few milliseconds behind at most, against tenths of a
+/// second here and ages of a second or more in every [`long_ago`]).
 pub(crate) fn moment() -> u64 {
-    (crate::frame::current() << 32) | ((now_ms() / 100) & 0xffff_ffff)
+    (crate::frame::current() << 32) | ((crate::coarse::ms() / 100) & 0xffff_ffff)
 }
 
 /// Whether `moment` lies at least `ms` milliseconds and `frames` frames
@@ -6735,6 +6738,7 @@ impl Host {
         }
         crate::descriptor::flush_deferred_views();
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
+        crate::coarse::tick();
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
         let started = std::time::Instant::now();

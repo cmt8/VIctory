@@ -1589,7 +1589,8 @@ pub(crate) fn room_lately() -> bool {
     // The tenth of a second of the last asking, counted from 1, and its
     // answer in the lowest bit.
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let tenth = crate::host::now_ms() / 100 + 1;
+    // Coarse (`crate::coarse`): asked of many textures a frame.
+    let tenth = crate::coarse::ms() / 100 + 1;
     let last = LAST.load(Relaxed);
     if last >> 1 == tenth {
         return last & 1 != 0;
