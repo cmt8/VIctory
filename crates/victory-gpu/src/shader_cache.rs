@@ -129,6 +129,8 @@ fn build() -> [u8; 32] {
             // 16-bit halves through a table's views as their bits
             // (`victory_shader::emit::half_bits`).
             "VICTORY_HALF_BITS",
+            // SDWA sext of 16-bit results (`victory_shader::emit::sdwa_sext`).
+            "VICTORY_SDWA_SEXT",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');

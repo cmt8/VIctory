@@ -1155,6 +1155,54 @@ fn v_cvt_u16_and_i16_f16_saturate() {
     }
 }
 
+/// VOP1 SDWA `op vdst, vsrc` with `dst_sel`, `dst_unused` and WORD_0 of a
+/// VGPR source.
+const fn vop1_sdwa(op: u16, vdst: u8, vsrc: u8, dst_sel: u8, dst_unused: u8) -> [u32; 2] {
+    [
+        0x7E00_0000 | (vdst as u32) << 17 | (op as u32) << 9 | 0xF9,
+        vsrc as u32 | (dst_sel as u32 & 7) << 8 | (dst_unused as u32 & 3) << 11 | 4 << 16,
+    ]
+}
+
+/// A 16-bit result written by SDWA into WORD_0 with dst_unused SEXT
+/// carries its bit 15 through the high word; with PAD the high word is
+/// zero (upstream VIctory #3124: a -1 written with sext came out as
+/// 0x0000FFFF). The reserved dst_unused 3 does not translate.
+#[test]
+fn sdwa_sext_of_a_16_bit_result_fills_the_high_word() {
+    if !super::sdwa_sext() {
+        eprintln!("VICTORY_SDWA_SEXT=0; skipped");
+        return;
+    }
+    // (f16 input, i16 result)
+    let cases: &[(u16, u16)] = &[(0xBC00, 0xFFFF), (0x4000, 2), (0xF800, 0x8000), (0x77FF, 32752)];
+    for (unused, what) in [(1u8, "sext"), (0, "pad")] {
+        let mut body = vec![vop1(0x001, 0, 128)];
+        body.extend(vop1_sdwa(0x053, 0, 1, 4, unused));
+        let shader = build_valu_cs(&body);
+        let inputs: Vec<[u32; 4]> = cases.iter().map(|c| [u32::from(c.0), 0, 0, 0]).collect();
+        run_cases(&shader, &inputs, |backend, i, _, got| {
+            let bits = cases[i].1;
+            let want = if unused == 1 {
+                i32::from(bits as i16) as u32
+            } else {
+                u32::from(bits)
+            };
+            assert_eq!(
+                got, want,
+                "{backend}: v_cvt_i16_f16 {what}({:#06x}) = {got:#010x}, want {want:#010x}",
+                cases[i].0,
+            );
+        });
+    }
+    // dst_unused 3 is reserved.
+    let mut body = vec![vop1(0x001, 0, 128)];
+    body.extend(vop1_sdwa(0x053, 0, 1, 4, 3));
+    let words = body;
+    let lowered = std::panic::catch_unwind(|| build_valu_cs(&words));
+    assert!(lowered.is_err(), "a reserved SDWA dst_unused translated");
+}
+
 #[test]
 fn v_cvt_f16_u16_and_i16_widen_the_integer_first() {
     // v_mov_b32 v0, 0; v_cvt_f16_u16 / v_cvt_f16_i16 v0, v1 (VOP1 0x050 / 0x051).
