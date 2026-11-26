@@ -9419,6 +9419,22 @@ impl Meter {
         tracing::info!(
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
         );
+        let (synced, unsynced) = crate::list::take_syncs();
+        tracing::info!(
+            "the title's pipeline syncs per frame: {:.1} recorded as waits for every earlier shader write, {:.1} left out (VICTORY_SYNC_BARRIER=0 leaves them all out)",
+            synced as f64 / frames,
+            unsynced as f64 / frames
+        );
+        let places = crate::draw::take_half_places().map(|n| n as f64 / frames);
+        if places.iter().sum::<f64>() > 0.0 {
+            tracing::info!(
+                "half places met per frame (views shaders move 16-bit halves through as integers): {:.1} float or signed views shown as their unsigned twin, {:.1} views that carry the integers as they are, {:.1} views the console converts (read unconverted), {:.1} with no view known there",
+                places[0],
+                places[1],
+                places[2],
+                places[3]
+            );
+        }
         let [emptied, nothing, cut, spent] = [0, 1, 2, 3].map(|i| CLAMP_NOTES[i].swap(0, Ordering::Relaxed) as f64 / frames);
         if crate::pipeline::drop_reasons() {
             tracing::info!(

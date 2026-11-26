@@ -148,7 +148,26 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
+                // (Nothing left from another translation on this thread.)
+                let _ = victory_shader::emit::take_half_report();
                 let done = translate(&self.container);
+                // `VICTORY_HALF_REPORT=1`: how the program moves 16-bit halves.
+                if let Some([d16_bits, d16_floats, format_bits, format_floats]) =
+                    victory_shader::emit::take_half_report()
+                    && d16_bits + d16_floats + format_bits + format_floats > 0
+                {
+                    let places = done.as_ref().map_or(0, |t| t.host.half_views.len());
+                    tracing::info!(
+                        stage = self.stage,
+                        hash = %self.hash,
+                        d16_bits,
+                        d16_floats,
+                        format_bits,
+                        format_floats,
+                        places,
+                        "halves report: typed buffer accesses moving 16-bit halves, as bits (through the unsigned view at a named place) or by way of floats (which an unsigned view does not carry)"
+                    );
+                }
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {

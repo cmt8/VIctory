@@ -545,6 +545,20 @@ pub(crate) fn take_frame() -> Vec<String> {
 pub(crate) fn take_dropped() -> u64 {
     DROPPED.swap(0, Ordering::Relaxed)
 }
+
+/// The half places (`HostShader::half_views`) draws and dispatches met
+/// since the last [`take_half_places`], by what the title's view there
+/// was: a 16-bit float or signed buffer view shown as its unsigned twin,
+/// a view whose integers serve as they are (the title's own 16-bit
+/// unsigned ones), a view whose values the console would convert (read
+/// unconverted), and no view known there (or no table bound): the shader
+/// then moves integers through whatever the host slot holds.
+static HALF_PLACES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// [`HALF_PLACES`] since the last call, and zero again.
+pub(crate) fn take_half_places() -> [u64; 4] {
+    [0, 1, 2, 3].map(|k| HALF_PLACES[k].swap(0, Ordering::Relaxed))
+}
 /// A root SRV's dynamic slot in a list, and the host copy it shows.
 type RootSlot = (u32, Option<std::sync::Arc<crate::shadow::Shadow>>);
 
@@ -3100,22 +3114,29 @@ impl State {
             };
             crate::descriptor::host::half_view(&crate::descriptor::view(table + u64::from(at) * 4)?)
         };
+        let place_seen = |k: usize| HALF_PLACES[k].fetch_add(1, Ordering::Relaxed);
         for &(slot, at) in half {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+                place_seen(3);
                 continue;
             };
             let Some(view) = crate::descriptor::view(table + u64::from(at) * 4) else {
+                place_seen(3);
                 continue;
             };
             if crate::descriptor::host::half_view(&view).is_some() {
+                place_seen(0);
                 if !fresh.contains(&slot) {
                     fresh.push(slot);
                 }
             } else if let Some(format) = crate::descriptor::host::half_inexact(&view) {
+                place_seen(2);
                 once!(
                     format,
                     "a shader moves a buffer's 16-bit channels as integers through a view whose values the console converts: they are read and written unconverted"
                 );
+            } else {
+                place_seen(1);
             }
         }
         // Tables reaching past a host heap smaller than the title's (the

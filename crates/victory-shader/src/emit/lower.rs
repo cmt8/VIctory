@@ -29,6 +29,7 @@ pub(super) mod intersect;
 /// module so it shares the emitter's state.
 #[path = "halves.rs"]
 mod halves;
+pub use halves::take_half_report;
 #[path = "coherent.rs"]
 mod coherent;
 
@@ -234,6 +235,8 @@ struct Lower<'a> {
     half_views: std::collections::BTreeSet<(u8, u32)>,
     /// [`Self::places_read_as_halves`], found before the code is lowered.
     halves_only: std::collections::BTreeSet<(u8, u32)>,
+    /// See [`halves::take_half_report`].
+    half_counts: [u32; 4],
     /// [`Self::find_coherent`], found before the code is lowered.
     coherent: HashSet<(usize, u32)>,
     samplers: Vec<[u32; 4]>,
@@ -1562,6 +1565,7 @@ impl<'a> Lower<'a> {
             user_reads: BTreeMap::new(),
             half_views: Default::default(),
             halves_only: Default::default(),
+            half_counts: [0; 4],
             coherent: HashSet::new(),
             samplers: Vec::new(),
             descriptors: x
@@ -2354,6 +2358,7 @@ impl<'a> Lower<'a> {
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let half_views = std::mem::take(&mut self.half_views).into_iter().collect();
+        self.report_halves();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
         Ok(Lowered {

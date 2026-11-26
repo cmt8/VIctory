@@ -1933,7 +1933,8 @@ fn halves_go_through_a_table_as_they_are_and_name_their_views() {
 /// dword 8 (a host view there in a 16-bit float format is the one shown
 /// as its unsigned twin). A descriptor picked at run time (the load's
 /// offset in an SGPR) names nothing and keeps the float path: which slot
-/// it reads, and in which format, is known only then.
+/// it reads, and in which format, is known only then. The halves report
+/// (`VICTORY_HALF_REPORT=1`) counts the two kinds apart.
 #[test]
 fn half_places_are_the_descriptors_the_program_loads() {
     /// MUBUF `op vdata, vaddr, s[srsrc:srsrc+3], 0 idxen`.
@@ -2034,6 +2035,20 @@ fn half_places_are_the_descriptors_the_program_loads() {
     runtime.extend_from_slice(&mubuf_idxen(STORE_D16_XYZW, 1, 0, 12));
     runtime.push(S_ENDPGM);
     assert!(lowered(&runtime).half_views.is_empty());
+    // `VICTORY_HALF_REPORT=1` counts the accesses by how they move their
+    // halves: from fixed places both d16 accesses move bits; with the load
+    // picked at run time both go by way of floats. Without the switch
+    // nothing is reported.
+    super::HALF_REPORT_TEST.set(Some(true));
+    let _ = super::take_half_report();
+    lowered(&fixed);
+    assert_eq!(super::take_half_report(), Some([2, 0, 0, 0]));
+    lowered(&runtime);
+    assert_eq!(super::take_half_report(), Some([0, 2, 0, 0]));
+    super::HALF_REPORT_TEST.set(Some(false));
+    lowered(&fixed);
+    assert_eq!(super::take_half_report(), None);
+    super::HALF_REPORT_TEST.set(None);
 }
 
 /// A format load of whole dwords (`buffer_load_format_x`, not d16) whose
