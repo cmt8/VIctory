@@ -518,6 +518,8 @@ fn mesh_kept(pipeline: usize) -> bool {
 /// The sampler heap we bind when the title binds none (a value no title heap
 /// address takes).
 const SAMPLERS_OURS: usize = usize::MAX;
+/// The view heap we bind when the title binds none (another such value).
+const VIEWS_OURS: usize = usize::MAX - 1;
 
 /// Draws recorded on the host GPU since the last frame line.
 static DRAWN: AtomicU64 = AtomicU64::new(0);
@@ -878,12 +880,16 @@ impl State {
 
     /// The heaps a list must have bound before a root signature that
     /// indexes them directly is set: the title's of each kind, and ours for
-    /// a sampler heap it binds none of. D3D12 requires a heap of both kinds
-    /// to be bound before such a signature (the debug layer's id 1419), and
-    /// every signature we make says its sampler heap is indexed directly;
-    /// compute lists that only read views bind no sampler heap.
+    /// a kind it binds none of. D3D12 requires a heap of both kinds to be
+    /// bound before such a signature (the debug layer's id 1419), and every
+    /// signature we make says both are indexed directly; compute lists that
+    /// only read views bind no sampler heap, and a list whose shaders read
+    /// constants only may bind no view heap (upstream VIctory #2896).
     fn wanted_heaps(title: [usize; 2]) -> [usize; 2] {
-        [title[0], if title[1] != 0 { title[1] } else { SAMPLERS_OURS }]
+        [
+            if title[0] != 0 { title[0] } else { VIEWS_OURS },
+            if title[1] != 0 { title[1] } else { SAMPLERS_OURS },
+        ]
     }
 
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
@@ -1381,6 +1387,17 @@ impl State {
                 .filter_map(|&h| crate::descriptor::heap(h as This).host())
                 .map(|h| Some(h.heap.clone()))
                 .collect();
+            if want[0] == VIEWS_OURS {
+                match crate::descriptor::fallback_views() {
+                    Some(h) => {
+                        tracing::debug!("the title binds no view heap: binding ours");
+                        heaps.insert(0, Some(h.heap.clone()));
+                    }
+                    None => {
+                        once!("no view heap of ours to bind");
+                    }
+                }
+            }
             if want[1] == SAMPLERS_OURS {
                 match crate::descriptor::fallback_samplers() {
                     Some(h) => {
@@ -4266,10 +4283,12 @@ mod tests {
         assert_eq!(State::wanted_heaps([0x10, 0x20]), [0x10, 0x20]);
         // Views only: our sampler heap after them.
         assert_eq!(State::wanted_heaps([0x10, 0]), [0x10, SAMPLERS_OURS]);
-        // Neither: ours of the sampler kind still.
-        assert_eq!(State::wanted_heaps([0, 0]), [0, SAMPLERS_OURS]);
-        // A title sampler heap stays whatever the views are.
-        assert_eq!(State::wanted_heaps([0, 0x20]), [0, 0x20]);
+        // Neither: ours of both kinds (upstream #2896: ours of the sampler
+        // kind only before).
+        assert_eq!(State::wanted_heaps([0, 0]), [VIEWS_OURS, SAMPLERS_OURS]);
+        // A title sampler heap stays whatever the views are, and a list
+        // without a view heap gets ours.
+        assert_eq!(State::wanted_heaps([0, 0x20]), [VIEWS_OURS, 0x20]);
     }
 
     #[test]

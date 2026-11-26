@@ -1429,6 +1429,19 @@ pub(crate) fn fallback_samplers() -> Option<&'static HostHeap> {
     .as_ref()
 }
 
+/// A view heap of our own, every slot null, for the lists that set a root
+/// signature whose view heap is indexed directly
+/// (`CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED`, every one we make) while the title
+/// binds no view heap (shaders that read constants only): D3D12 requires
+/// both kinds bound first, as for [`fallback_samplers`]. As long as the
+/// title's, so that an index clamped to the null slot reads inside it.
+/// After upstream VIctory #2896 (BastienRodz); upstream binds its title-memory
+/// heap, which this tree does not have.
+pub(crate) fn fallback_views() -> Option<&'static HostHeap> {
+    static HEAP: std::sync::OnceLock<Option<HostHeap>> = std::sync::OnceLock::new();
+    HEAP.get_or_init(|| HostHeap::new(false, 1)).as_ref()
+}
+
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.

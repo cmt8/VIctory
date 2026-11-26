@@ -65,7 +65,7 @@ pub(crate) struct Heap {
     written: Option<crate::watch::Tracked>,
 }
 
-pub(crate) use host::fallback_samplers;
+pub(crate) use host::{fallback_samplers, fallback_views};
 
 /// A title heap's host copy.
 pub(crate) fn heap<'a>(this: This) -> &'a Heap {
