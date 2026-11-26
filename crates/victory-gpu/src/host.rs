@@ -9583,10 +9583,12 @@ impl Meter {
             }
             {
                 let [at_once, held, waiting, lag] = retirements();
+                let same = crate::descriptor::host::KEPT_SAME.load(Ordering::Relaxed);
                 tracing::info!(
                     "host objects let go, since the start: {at_once} dropped at once, {held} held for submissions; \
                      {waiting} held now, each until {lag} submissions after the last that may use it have finished \
-                     (VICTORY_BURY_LAG=0: until it has)"
+                     (VICTORY_BURY_LAG=0: until it has); {same} slot writes gave a slot the resource it kept, none \
+                     let go (VICTORY_KEEP_SAME=0: each let go and held)"
                 );
             }
             let p: Vec<[f64; 3]> = crate::watch::PROTECTS

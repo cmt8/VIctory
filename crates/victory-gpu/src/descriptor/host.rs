@@ -2538,6 +2538,18 @@ impl HostHeap {
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(slot) = kept.get_mut(index as usize) {
+            // Given the resource it keeps already (the same COM object):
+            // the slot's own reference stays and the new one is let go at
+            // once. Nothing is released early: the object keeps the
+            // reference the slot held all along, and whatever replaces it
+            // later retires that one as below.
+            if keep_same()
+                && let (Some(old), Some(new)) = (slot.as_ref(), resource.as_ref())
+                && windows::core::Interface::as_raw(old) == windows::core::Interface::as_raw(new)
+            {
+                KEPT_SAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
             // A running submission may still read the old resource through
             // this slot.
             if let Some(old) = std::mem::replace(slot, resource) {
@@ -4129,6 +4141,21 @@ fn make_checked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE, max_born: Option<u
 /// since the start: the slot kept showing the old view.
 pub(crate) static KEPT_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Whether a slot given back the resource it keeps already holds on to
+/// the reference it has, without retiring it and taking the new one
+/// (`HostHeap::keep`). Every slot write retired the old resource, the same
+/// one or not: some 83,000 retirements a frame in the world, each a lock
+/// of the queue of objects let go and an entry in it for 64 submissions
+/// (`crate::host::bury`). `VICTORY_KEEP_SAME=0`: retired as before.
+fn keep_same() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_SAME").is_none_or(|v| v != "0"))
+}
+
+/// Slot writes that gave a slot the resource it kept already
+/// ([`keep_same`]), since the start.
+pub(crate) static KEPT_SAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Whether a slot written with another view of the placed texture it
 /// shows keeps showing the old one until the new is made;
 /// `VICTORY_KEEP_VIEWS=0` makes it null at once, as before.
@@ -5408,6 +5435,40 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         heap.kept.lock().unwrap()[index as usize]
             .as_ref()
             .map(|r| windows::core::Interface::as_raw(r) as usize)
+    }
+
+    /// A slot given the buffer it keeps already holds it once, the same
+    /// reference as before (`keep_same`); given another, the old one is
+    /// still held (retired, for the submissions that may read it), never
+    /// let go there and then.
+    #[test]
+    fn a_slot_given_what_it_keeps_holds_it_once() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let Some(host) = crate::host::host() else { return };
+        let (Some(a), Some(b)) = (host.uav_buffer(4096), host.uav_buffer(4096)) else {
+            panic!("buffers");
+        };
+        let Some(index) = heap.dynamic(1) else { panic!("a dynamic slot") };
+        let refs = |r: &ID3D12Resource| crate::host::references(r);
+        assert_eq!(refs(&a), 1);
+        heap.raw_at(index, &a, 0, 256);
+        assert_eq!(refs(&a), 2, "the owner and the slot");
+        let same = KEPT_SAME.load(std::sync::atomic::Ordering::Relaxed);
+        for _ in 0..3 {
+            heap.raw_at(index, &a, 16, 128);
+        }
+        assert_eq!(refs(&a), 2, "the slot's own reference, kept");
+        assert!(KEPT_SAME.load(std::sync::atomic::Ordering::Relaxed) >= same + 3);
+        assert_eq!(shown(&heap, index), Some(windows::core::Interface::as_raw(&a) as usize));
+        // Another buffer: the old one goes to the submissions' queue and is
+        // still held there (with the lag nothing is dropped at once).
+        heap.raw_at(index, &b, 0, 256);
+        assert_eq!(refs(&b), 2);
+        assert_eq!(refs(&a), 2, "the owner and the queue of objects let go");
+        assert_eq!(shown(&heap, index), Some(windows::core::Interface::as_raw(&b) as usize));
+        heap.release(index, 1);
     }
 
     /// A slot made null while a submission that may read it is on the card
