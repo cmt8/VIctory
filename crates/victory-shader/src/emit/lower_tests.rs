@@ -781,6 +781,7 @@ fn heap_slot_shader(words: &[u32], marks: bool) -> super::super::HostShader {
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: Vec::new(),
+        half_views: lowered.half_views,
     };
     use super::super::validator::Validator;
     if let Ok(mut v) = Validator::load(Validator::default_path().as_deref()) {
