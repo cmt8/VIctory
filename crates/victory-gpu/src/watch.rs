@@ -997,37 +997,39 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     }
     let rest = rest();
     let mut aliases: Vec<usize> = Vec::new();
-    for (base, bytes) in crate::inplace::views_between(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK)) {
-        let first = (base / BLOCK).max(from);
-        let last = (base.saturating_add(bytes).div_ceil(BLOCK)).min(to);
-        for block in first..last {
-            let shown = crate::inplace::pages_of(block * BLOCK);
-            // One view (nothing else to guard), or the page the title shows
-            // wherever it has nothing (thousands of views): each view of
-            // that one is guarded by itself.
-            if shown.len() < 2 || shown.len() > MANY_VIEWS {
-                continue;
-            }
-            #[cfg(feature = "diagnostics")]
-            ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            for alias in shown {
-                let alias = alias / BLOCK;
-                g.aliased.insert(alias);
-                if alias != block && !g.protected.contains(&alias) {
-                    if g.rests(alias, rest) {
-                        // Written through that view a moment ago and left
-                        // open ([`rest`]): this one hears of no write
-                        // through it, so it is told as written again.
-                        if g.clean.remove(&block) {
-                            RESTED[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::inplace::with_views_between(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK), |views| {
+        for &(base, bytes) in views {
+            let first = (base / BLOCK).max(from);
+            let last = (base.saturating_add(bytes).div_ceil(BLOCK)).min(to);
+            for block in first..last {
+                let shown = crate::inplace::pages_of(block * BLOCK);
+                // One view (nothing else to guard), or the page the title shows
+                // wherever it has nothing (thousands of views): each view of
+                // that one is guarded by itself.
+                if shown.len() < 2 || shown.len() > MANY_VIEWS {
+                    continue;
+                }
+                #[cfg(feature = "diagnostics")]
+                ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                for alias in shown {
+                    let alias = alias / BLOCK;
+                    g.aliased.insert(alias);
+                    if alias != block && !g.protected.contains(&alias) {
+                        if g.rests(alias, rest) {
+                            // Written through that view a moment ago and left
+                            // open ([`rest`]): this one hears of no write
+                            // through it, so it is told as written again.
+                            if g.clean.remove(&block) {
+                                RESTED[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        } else {
+                            aliases.push(alias);
                         }
-                    } else {
-                        aliases.push(alias);
                     }
                 }
             }
         }
-    }
+    });
     aliases.sort_unstable();
     aliases.dedup();
     protect_aliases(g, &aliases);
@@ -1155,22 +1157,23 @@ fn runs_in_views(blocks: &[usize]) -> Vec<(usize, usize)> {
     if !guard_runs() || blocks.len() == 1 {
         return blocks.iter().map(|&b| (b, b + 1)).collect();
     }
-    let views = crate::inplace::views_between(first * BLOCK, (last + 1) * BLOCK);
-    let mut at = 0;
-    // (from, to, the view's index; usize::MAX: none)
-    let mut runs: Vec<(usize, usize, usize)> = Vec::new();
-    for &block in blocks {
-        let start = block * BLOCK;
-        while at < views.len() && views[at].0 + views[at].1 <= start {
-            at += 1;
+    crate::inplace::with_views_between(first * BLOCK, (last + 1) * BLOCK, |views| {
+        let mut at = 0;
+        // (from, to, the view's index; usize::MAX: none)
+        let mut runs: Vec<(usize, usize, usize)> = Vec::new();
+        for &block in blocks {
+            let start = block * BLOCK;
+            while at < views.len() && views[at].0 + views[at].1 <= start {
+                at += 1;
+            }
+            let view = views.get(at).filter(|v| v.0 <= start && start + BLOCK <= v.0 + v.1).map_or(usize::MAX, |_| at);
+            match runs.last_mut() {
+                Some((_, to, v)) if *to == block && *v == view && view != usize::MAX => *to = block + 1,
+                _ => runs.push((block, block + 1, view)),
+            }
         }
-        let view = views.get(at).filter(|v| v.0 <= start && start + BLOCK <= v.0 + v.1).map_or(usize::MAX, |_| at);
-        match runs.last_mut() {
-            Some((_, to, v)) if *to == block && *v == view && view != usize::MAX => *to = block + 1,
-            _ => runs.push((block, block + 1, view)),
-        }
-    }
-    runs.into_iter().map(|(from, to, _)| (from, to)).collect()
+        runs.into_iter().map(|(from, to, _)| (from, to)).collect()
+    })
 }
 
 /// [`protect`] for one range, without the other views of its pages.

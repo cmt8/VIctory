@@ -467,22 +467,45 @@ pub(crate) fn write_kept_with(write: impl FnOnce(usize, u64, &[u8]) -> bool, at:
     true
 }
 
-/// The title views that overlap `[start, end)`, as `(address, bytes)`.
+/// `f` of the title views that overlap `[start, end)`, as `(address,
+/// bytes)` in address order: taken under the views' lock into a buffer the
+/// thread keeps, and given to `f` after the lock is let go (`f` may ask of
+/// the views again). Each call made a vector of its own: some 4.5 ms a
+/// frame of the submitting thread in cutscenes.
+pub(crate) fn with_views_between<R>(start: usize, end: usize, f: impl FnOnce(&[(usize, usize)]) -> R) -> R {
+    thread_local! {
+        static FOUND: std::cell::RefCell<Vec<(usize, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    // Taken out, not borrowed: a call from inside `f` finds an empty
+    // buffer of its own.
+    let mut out = FOUND.try_with(|b| std::mem::take(&mut *b.borrow_mut())).unwrap_or_default();
+    out.clear();
+    if start < end {
+        let v = views();
+        if let Some((&base, &(bytes, _, _))) = v.views.range(..=start).next_back()
+            && base + bytes > start
+        {
+            out.push((base, bytes));
+        }
+        for (&base, &(bytes, _, _)) in v.views.range(start.saturating_add(1)..end) {
+            out.push((base, bytes));
+        }
+    }
+    let r = f(&out);
+    let _ = FOUND.try_with(|b| {
+        let mut b = b.borrow_mut();
+        if b.capacity() < out.capacity() {
+            *b = out;
+        }
+    });
+    r
+}
+
+/// The title views that overlap `[start, end)`, as `(address, bytes)`
+/// ([`with_views_between`] into a vector of its own).
+#[cfg(test)]
 pub(crate) fn views_between(start: usize, end: usize) -> Vec<(usize, usize)> {
-    if start >= end {
-        return Vec::new();
-    }
-    let v = views();
-    let mut out = Vec::new();
-    if let Some((&base, &(bytes, _, _))) = v.views.range(..=start).next_back()
-        && base + bytes > start
-    {
-        out.push((base, bytes));
-    }
-    for (&base, &(bytes, _, _)) in v.views.range(start.saturating_add(1)..end) {
-        out.push((base, bytes));
-    }
-    out
+    with_views_between(start, end, <[_]>::to_vec)
 }
 
 /// The address of the 64 KiB page shown at `page` in every title view that
@@ -672,16 +695,18 @@ pub(crate) fn mapped_parts(at: usize, len: usize) -> Option<Vec<(usize, usize)>>
         return None;
     }
     let mut parts: Vec<(usize, usize)> = Vec::new();
-    for (base, bytes) in views_between(at, end) {
-        let (lo, hi) = (base.max(at), base.saturating_add(bytes).min(end));
-        if lo >= hi {
-            continue;
+    with_views_between(at, end, |views| {
+        for &(base, bytes) in views {
+            let (lo, hi) = (base.max(at), base.saturating_add(bytes).min(end));
+            if lo >= hi {
+                continue;
+            }
+            match parts.last_mut() {
+                Some((first, n)) if *first + *n == lo => *n += hi - lo,
+                _ => parts.push((lo, hi - lo)),
+            }
         }
-        match parts.last_mut() {
-            Some((first, n)) if *first + *n == lo => *n += hi - lo,
-            _ => parts.push((lo, hi - lo)),
-        }
-    }
+    });
     Some(parts)
 }
 
@@ -1613,6 +1638,31 @@ mod tests {
         assert_eq!(cover(at + 4 * K64, K64), Cover::Run(77, 4 * K64 as u64));
         views_gone(at + 4 * K64, K64);
         assert_eq!(cover(at + 4 * K64, K64), Cover::None);
+    }
+
+    /// The views over a range, in address order: the one the range starts
+    /// in and those starting inside it, none past its end; a call from
+    /// inside another (the guards ask of the pages while they go through
+    /// the views) finds its own, and leaves the outer one's as it was.
+    #[test]
+    fn views_between_names_the_views_over_a_range() {
+        let at = 0x7_6000_0000usize;
+        title_memory_view(at, 2 * K64, 81, 0);
+        title_memory_view(at + 3 * K64, K64, 81, 5 * K64 as u64);
+        title_memory_view(at + 4 * K64, 2 * K64, 82, 0);
+        assert_eq!(views_between(at + K64, at + 5 * K64), [(at, 2 * K64), (at + 3 * K64, K64), (at + 4 * K64, 2 * K64)]);
+        assert_eq!(views_between(at + 2 * K64, at + 3 * K64), [], "a gap");
+        assert_eq!(views_between(at + 3 * K64, at + 4 * K64), [(at + 3 * K64, K64)], "ends where the next starts");
+        assert_eq!(views_between(at + K64, at + K64), [], "empty");
+        let outer = with_views_between(at, at + 6 * K64, |outer| {
+            let inner = with_views_between(at + 4 * K64, at + 5 * K64, <[_]>::to_vec);
+            assert_eq!(inner, [(at + 4 * K64, 2 * K64)]);
+            outer.to_vec()
+        });
+        assert_eq!(outer.len(), 3);
+        assert_eq!(views_between(at, at + K64), [(at, 2 * K64)], "the buffer kept is cleared for each call");
+        views_gone(at, 6 * K64);
+        assert_eq!(views_between(at, at + 6 * K64), []);
     }
 
     /// Only private memory committed whole, read-write, is taken for a part.
