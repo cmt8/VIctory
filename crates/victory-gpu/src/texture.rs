@@ -332,6 +332,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             .ResourceBarrier(&[crate::host::transition(&through.buffer, read, common)]);
     }
     list.keep(&through.buffer);
+    crate::resource::note_written(placed);
     // A draw that also writes the source (a view of it handled before
     // this one) needs it in that state again; the next read of the alias
     // then copies once more, as it must after a write.
@@ -548,6 +549,7 @@ static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::ne
 
 /// A host copy or resolve writes `resource`.
 pub(crate) fn host_written(resource: This) {
+    crate::resource::note_written(resource);
     let new = {
         let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
         set.get_or_insert_with(Default::default).insert(resource as usize)
@@ -802,6 +804,9 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     // title memory changes (including 3-buffer Bink video rings) and eliminates
     // the race with `VICTORY_JOIN_PARTS` / `VICTORY_THIN`.
     let on_demand = if staging.on_demand { crate::resource::host_tiled(resource) } else { None };
+    // A list is given its bytes: a slot may show it from here on
+    // (`crate::descriptor::host::unwritten_null`).
+    copy.note_written();
     list.defer_texture(PreludeUpload {
         staging,
         copy,

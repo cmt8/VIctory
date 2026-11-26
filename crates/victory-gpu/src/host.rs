@@ -9832,6 +9832,18 @@ impl Meter {
                         );
                     }
                 }
+                {
+                    let [sync, read, again, fresh, remade] =
+                        [0, 1, 2, 3, 4].map(|i| crate::descriptor::host::UNWRITTEN[i].load(Ordering::Relaxed));
+                    tracing::info!(
+                        "slots that would have shown a texture's host copy no list had written into (VICTORY_UNWRITTEN_NULL={}; \
+                         shown all the same: {}), since the start: {sync} as the title wrote the view, {read} by the texture \
+                         pass or a draw reading the slot in place, {again} asked again after the submissions on the card, \
+                         {fresh} in tables made afresh (null there); {remade} made right after their upload was recorded",
+                        u8::from(crate::descriptor::host::unwritten_null()),
+                        crate::descriptor::host::UNWRITTEN_SHOWN.load(Ordering::Relaxed)
+                    );
+                }
                 tracing::info!("textures shown, since the start (crate::texlate): {}", crate::texlate::line());
                 if let Some(line) = crate::texstore::line() {
                     tracing::info!("{line}");

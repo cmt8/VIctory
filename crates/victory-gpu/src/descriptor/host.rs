@@ -238,6 +238,10 @@ pub(crate) struct HostHeap {
     /// made from another view then. One entry a slot; the newest request
     /// wins ([`HostHeap::hold`]). Locked inside a slot's lock ([`Made`]),
     /// never around one.
+    /// View heaps, per title slot: left as it was because the host copy of
+    /// its texture had not been written ([`Make::Unwritten`]), until
+    /// [`HostHeap::remake_written`] makes it.
+    unwritten: Vec<std::sync::atomic::AtomicBool>,
     deferred: Mutex<std::collections::BTreeMap<u32, Held>>,
     /// How many entries `deferred` has (changed under its lock): a write
     /// of a slot asks it only when there are any.
@@ -319,6 +323,76 @@ enum Make {
     Made(Kept),
     None,
     Deferred(u64),
+    /// A texture the title fills whose host copy no list has been given
+    /// anything to write into yet ([`unwritten_null`]): the slot is not to
+    /// show it until its first upload is recorded.
+    Unwritten,
+}
+
+/// Whether a slot is never made with a host copy of a texture the title
+/// fills that no list has written into (`VICTORY_UNWRITTEN_NULL=0`: made
+/// all the same, as before; such makes are counted either way).
+///
+/// Such a copy holds what its memory on the card held before: another
+/// texture's texels where it was made in a pool block (`crate::pool`),
+/// zeros where vkd3d-proton clears new memory. A slot was made with such a
+/// copy by the texture pass or a draw reading it in place just before they
+/// recorded its upload (the descriptor is in the heap at once, the upload
+/// runs with the list; a list already on the card that picks the slot by
+/// index reads it in between), by the heap's pass for a view of a texture
+/// object whose copy was made, and for a table made afresh before the
+/// draw's upload was recorded. Now a title slot stays as it was (null, or
+/// the view it showed) and a table's slot reads the null view of its kind
+/// until then; the title slot is made right after the upload is recorded
+/// ([`HostHeap::remake_written`]) and asked again whenever the submissions
+/// on the card have finished ([`HostHeap::flush_deferred`]).
+///
+/// `VICTORY_SHOW_AFTER=1` (off) is the stricter rule for one case: a
+/// texture new to a slot in the texture pass or a draw's table, shown once
+/// the submission with its upload has finished, the neutral texture
+/// meanwhile. It is left as it is: off it costs nothing, on it works above
+/// this (a flip is made from a copy that is written).
+pub(crate) fn unwritten_null() -> bool {
+    #[cfg(test)]
+    {
+        UNWRITTEN_IN_TEST.get()
+    }
+    #[cfg(not(test))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_UNWRITTEN_NULL").is_none_or(|v| v != "0"))
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`unwritten_null`] for what this thread makes: off unless a test
+    /// turns it on (the other tests make slots from textures they never
+    /// upload).
+    static UNWRITTEN_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Since the start: slots that would have shown a host copy no list has
+/// written into ([`Make::Unwritten`]), by the way they were being made:
+/// `[from the title's write of the view (the heap's pass over records, a
+/// texture object's copy made), by the texture pass or a draw reading the
+/// slot in place, asked again after the submissions on the card, a table
+/// made afresh, slots made after their texture's first upload was
+/// recorded (`HostHeap::remake_written`)]`.
+pub(crate) static UNWRITTEN: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// With `VICTORY_UNWRITTEN_NULL=0`: slots made all the same with such a
+/// host copy, since the start.
+pub(crate) static UNWRITTEN_SHOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether the host texture a slot made from record `key` shows holds
+/// something a slot may show (`crate::resource::host_written_to`), for
+/// [`HostHeap::texture_slot_gone`].
+fn shows_written(key: u64) -> bool {
+    view_at(key as u32, (key >> 32) as u32).is_some_and(|view| match placed_texture(&view).unwrap_or(view) {
+        View::Shader(texture, _) => crate::resource::host_written_to(texture as crate::object::This),
+        _ => false,
+    })
 }
 
 thread_local! {
@@ -326,6 +400,11 @@ thread_local! {
     /// while this thread is in [`make_checked`]; and the newest it found.
     static BORN_CHECK: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     static BORN_FOUND: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// The submissions finished, while this thread is in a [`make_checked`]
+    /// that asks whether a texture's host copy was written
+    /// ([`unwritten_null`]); and whether one was not.
+    static WRITTEN_CHECK: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    static UNWRITTEN_FOUND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Tests: when every host resource counts as made.
     #[cfg(test)]
     static BORN_IN_TEST: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
@@ -348,21 +427,28 @@ fn too_new(born: u64) -> bool {
 
 /// [`make_twinned`]; with `max_born` (the submissions finished) a view of
 /// a host resource made after more than those had begun is not made:
-/// nothing is written at `at` or `twin` ([`defer_new_views`]).
+/// nothing is written at `at` or `twin` ([`defer_new_views`]). With
+/// `written` (the submissions finished) nor is a view of a texture the
+/// title fills whose host copy was not written ([`unwritten_null`]).
 fn make_checked(
     view: &View,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
     twin: Option<D3D12_CPU_DESCRIPTOR_HANDLE>,
     max_born: Option<u64>,
+    written: Option<u64>,
 ) -> Make {
     BORN_FOUND.set(0);
     BORN_CHECK.set(max_born);
+    UNWRITTEN_FOUND.set(false);
+    WRITTEN_CHECK.set(written);
     let kept = make_twinned(view, at, twin);
     BORN_CHECK.set(None);
-    match (kept, BORN_FOUND.replace(0)) {
-        (Some(kept), _) => Make::Made(kept),
-        (None, 0) => Make::None,
-        (None, born) => Make::Deferred(born),
+    WRITTEN_CHECK.set(None);
+    match (kept, BORN_FOUND.replace(0), UNWRITTEN_FOUND.replace(false)) {
+        (Some(kept), ..) => Make::Made(kept),
+        (None, 0, false) => Make::None,
+        (None, 0, true) => Make::Unwritten,
+        (None, born, _) => Make::Deferred(born),
     }
 }
 
@@ -1977,6 +2063,7 @@ impl HostHeap {
                 spans
             },
             spanned: Slots::new((count + extra) as usize),
+            unwritten: (0..if sampler { 0 } else { count }).map(|_| std::sync::atomic::AtomicBool::new(false)).collect(),
             deferred: Mutex::default(),
             held: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
@@ -2468,13 +2555,13 @@ impl HostHeap {
             let Some(view) = view_at(key as u32, (key >> 32) as u32) else {
                 continue;
             };
-            match make_checked(&view, self.at(slot), None, max_born) {
+            match make_checked(&view, self.at(slot), None, max_born, None) {
                 Make::Made(kept) => {
                     self.put(slot);
                     self.keep(slot, kept);
                     remade += 1;
                 }
-                Make::None => {}
+                Make::None | Make::Unwritten => {}
                 // Of a host copy made since: the texture's slots are made
                 // again when the submissions begun before it have finished
                 // ([`defer_new_views`]).
@@ -2514,6 +2601,17 @@ impl HostHeap {
             return false;
         };
         let now = crate::host::now_ms();
+        // Only a texture that holds what a list wrote into it is shown on.
+        // A slot may be made from a placed view before the texture's pages
+        // are mapped, and the upload waits for them: shown on, its host
+        // copy held whatever its memory on the card held before. Such a
+        // slot is made null at the first look, as before the wait was.
+        if wait > 0 && !shows_written(key) {
+            self.away.lock().unwrap_or_else(|e| e.into_inner()).remove(&index);
+            self.unmake(index);
+            STALE[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return true;
+        }
         {
             let mut away = self.away.lock().unwrap_or_else(|e| e.into_inner());
             match away.get(&index) {
@@ -2702,9 +2800,9 @@ impl HostHeap {
                     continue;
                 }
             }
-            let kept = match make_checked(&view, self.at(f.index), None, max_born) {
+            let kept = match make_checked(&view, self.at(f.index), None, max_born, None) {
                 Make::Made(kept) => Some(kept),
-                Make::None => None,
+                Make::None | Make::Unwritten => None,
                 // Of a host copy made since (the texture was made again
                 // with more levels, say): when the submissions begun
                 // before that have finished ([`defer_new_views`]).
@@ -2882,6 +2980,49 @@ impl HostHeap {
         if let Some(held) = held.get_mut(&index) {
             held.clear = None;
         }
+    }
+
+    /// Title slot `index` was made from the title's record now, under its
+    /// lock: nothing waits to make it any more (what is left of an entry
+    /// held back for it goes with the next flush that finds it due).
+    fn made_now(&self, index: u32) {
+        use std::sync::atomic::Ordering::{Acquire, Relaxed};
+        if let Some(flag) = self.unwritten.get(index as usize)
+            && flag.load(Relaxed)
+        {
+            flag.store(false, Relaxed);
+        }
+        if self.held.load(Acquire) == 0 {
+            return;
+        }
+        let mut held = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(held) = held.get_mut(&index) {
+            held.mirror = None;
+        }
+    }
+
+    /// After a caller recorded what title slot `index` (its record at
+    /// `handle`) reads (`draw.rs` `readable`: the upload of its texture): a
+    /// slot left as it was because its texture's host copy had not been
+    /// written ([`Make::Unwritten`]) is made now, as `mirror` would make
+    /// it. Nothing for any other slot (one flag read).
+    pub(crate) fn remake_written(&self, index: u32, handle: u64, required: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(flag) = self.unwritten.get(index as usize) else { return };
+        if !flag.load(Relaxed) || !flag.swap(false, Relaxed) {
+            return;
+        }
+        self.mirror_in(index, handle, true, required, false);
+        if self.made.get(index).is_some_and(|key| key != 0 && key == record_key(handle)) {
+            UNWRITTEN[4].fetch_add(1, Relaxed);
+        }
+    }
+
+    /// Whether title slot `index` was left for an unwritten texture
+    /// ([`HostHeap::remake_written`]; tests).
+    #[cfg(test)]
+    fn left_unwritten(&self, index: u32) -> bool {
+        self.unwritten.get(index as usize).is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// Whether any held-back title-slot view is needed by a draw before
@@ -3217,7 +3358,16 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
-        let kept = make_twinned(view, self.at(index), self.twin(index));
+        let written = (!self.sampler).then(|| self.finished());
+        let kept = match make_checked(view, self.at(index), self.twin(index), None, written) {
+            Make::Made(kept) => Some(kept),
+            // (Null of its kind: [`unwritten_null`].)
+            Make::Unwritten => {
+                UNWRITTEN[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                None
+            }
+            Make::None | Make::Deferred(_) => None,
+        };
         if kept.is_none() {
             null_for(view, self.at(index));
         }
@@ -3254,7 +3404,13 @@ impl HostHeap {
                     return None;
                 }
                 let twin = twinned(&view);
-                let kept = make_twinned(&view, views.slot(at), Some(views.slot(at + 1)))?;
+                // (Not of a texture no list has written into yet: the
+                // table's slot is made the long way, after what it reads
+                // was recorded: [`unwritten_null`].)
+                let written = Some(self.finished());
+                let Make::Made(kept) = make_checked(&view, views.slot(at), Some(views.slot(at + 1)), None, written) else {
+                    return None;
+                };
                 let listed = Listed {
                     kind: crate::draw::view_kind(&view),
                     texture: is_texture_view(&view),
@@ -3876,8 +4032,28 @@ impl HostHeap {
                 // what the slot shows ([`HostHeap::clear`]).
                 self.clear(index, Null::of(&view));
             } else {
-                let max_born = (!self.sampler && defer_new_views()).then(|| self.finished());
-                match make_checked(&view, self.at(index), self.twin(index), max_born) {
+                let finished = (!self.sampler).then(|| self.finished());
+                let max_born = finished.filter(|_| defer_new_views());
+                match make_checked(&view, self.at(index), self.twin(index), max_born, finished) {
+                    // Of a texture's host copy no list has written into
+                    // ([`unwritten_null`]): the slot, what it holds and
+                    // what it is made from stay as they are. The caller
+                    // that records the upload asks again at once
+                    // ([`HostHeap::remake_written`]); else it is asked
+                    // again when the submissions on the card have finished.
+                    Make::Unwritten => {
+                        let path = if publishing { 2 } else if for_draw { 1 } else { 0 };
+                        UNWRITTEN[path].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if let Some(flag) = self.unwritten.get(index as usize) {
+                            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        let (started, finished, _) = self.card();
+                        let again = Remirror { handle, for_draw, required: false, replace: false };
+                        self.hold(index, started.max(finished + 1), Pending::Mirror(again));
+                        drop(held);
+                        self.unmake_stale(index, stale);
+                        return Some(view);
+                    }
                     // Of a host resource made while submissions begun
                     // before it may still run ([`defer_new_views`]): the
                     // slot, what it holds and what it is made from stay as
@@ -3897,6 +4073,7 @@ impl HostHeap {
                         self.put(index);
                         self.twin_made(index, twinned(&view));
                         self.keep(index, kept);
+                        self.made_now(index);
                     }
                     // (A sampler the host cannot make: the slot as it was.)
                     Make::None if self.sampler => {
@@ -4908,6 +5085,21 @@ fn make_twinned(
                 if too_new(copy.born_after) {
                     return None;
                 }
+                // Not before a list has been given its bytes
+                // ([`unwritten_null`]). A texture the host renders to or
+                // writes holds what the host does to it.
+                const TARGET_DEPTH_UNORDERED: u32 = 0x7;
+                if let Some(finished) = WRITTEN_CHECK.get()
+                    && copy.flags() & TARGET_DEPTH_UNORDERED == 0
+                    && !copy.is_written(finished)
+                    && !crate::texture::host_wrote(resource as usize)
+                {
+                    if unwritten_null() {
+                        UNWRITTEN_FOUND.set(true);
+                        return None;
+                    }
+                    UNWRITTEN_SHOWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 // Levels on demand (`crate::tiles`): a texture made level by
                 // level is shown from the first level that is the title's
                 // and has memory, if the title's view starts before it (a
@@ -5842,6 +6034,143 @@ mod tests {
         assert_eq!(shown(&heap, index), after);
         heap.release(index, 1);
         BORN_IN_TEST.set(None);
+    }
+
+    /// With [`unwritten_null`], a slot the title writes with a placed view
+    /// reads nothing while the texture's host copy has not been written,
+    /// whether the heap's pass or the texture pass makes it, and is made
+    /// as soon as the upload is recorded.
+    #[test]
+    fn a_placed_view_reads_nothing_until_its_texture_is_written() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        UNWRITTEN_IN_TEST.set(true);
+        static BYTES: [u8; 65536] = [7; 65536];
+        let (view, record) = placed_record(&BYTES);
+        let handle = descriptor(record);
+        let key = u64::from(record[2]) << 32 | u64::from(record[1]);
+        let slot = 3;
+        let null = |heap: &HostHeap| heap.made.get(slot) == Some(0) && heap.kept_in(slot).is_none();
+        // Nothing on the card: no view is held back for a new host copy.
+        set_card(&heap, ON_CARD, ON_CARD, 1);
+        // As the title writes it: left to the texture pass, as every placed
+        // view is (not for want of a write).
+        assert_eq!(heap.mirror(slot, handle, false), Some(view.clone()));
+        assert!(null(&heap) && !heap.left_unwritten(slot));
+        // The texture pass makes it before it records the upload: null,
+        // and left for the upload.
+        assert_eq!(heap.mirror(slot, handle, true), Some(view.clone()));
+        assert!(null(&heap) && heap.left_unwritten(slot));
+        assert!(!heap.has_required_deferred(ON_CARD), "nothing settles for it");
+        // A slot that waits for nothing is left as it is.
+        heap.remake_written(slot + 1, handle, false);
+        assert!(heap.made.get(slot + 1) == Some(0));
+        // Not written yet: asked again, it stays null.
+        heap.remake_written(slot, handle, false);
+        assert!(null(&heap));
+        heap.mirror(slot, handle, true);
+        // Nor when the submissions on the card have finished.
+        set_card(&heap, ON_CARD + 1, ON_CARD + 1, 1);
+        assert_eq!(heap.flush_deferred(ON_CARD + 1), 1);
+        assert!(null(&heap) && heap.left_unwritten(slot));
+        // The upload is recorded: made at once.
+        let Some(View::Shader(texture, _)) = placed_texture(&view) else { panic!("a placed texture") };
+        crate::resource::note_written(texture as crate::object::This);
+        heap.remake_written(slot, handle, false);
+        assert_eq!(heap.made.get(slot), Some(key));
+        assert!(heap.kept_in(slot).is_some(), "made with its host copy");
+        assert!(!heap.left_unwritten(slot));
+        assert!(heap.held_mirror(slot).is_none(), "nothing asks again");
+        assert_eq!(super::device_removed(), None);
+        UNWRITTEN_IN_TEST.set(false);
+    }
+
+    /// With [`unwritten_null`], a slot left for an unwritten texture that
+    /// nothing asks about again is made when the submissions on the card
+    /// have finished, once the texture was written.
+    #[test]
+    fn a_slot_left_unwritten_is_asked_again_after_the_card() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        UNWRITTEN_IN_TEST.set(true);
+        static BYTES: [u8; 65536] = [8; 65536];
+        let (view, record) = placed_record(&BYTES);
+        let handle = descriptor(record);
+        set_card(&heap, ON_CARD + 1, ON_CARD, 1);
+        assert_eq!(heap.mirror(2, handle, true), Some(view.clone()));
+        assert!(!heap.made(2) && heap.left_unwritten(2));
+        let Some(View::Shader(texture, _)) = placed_texture(&view) else { panic!("a placed texture") };
+        crate::resource::note_written(texture as crate::object::This);
+        assert_eq!(heap.flush_deferred(ON_CARD), 0, "not before");
+        set_card(&heap, ON_CARD + 1, ON_CARD + 1, 1);
+        assert_eq!(heap.flush_deferred(ON_CARD + 1), 1);
+        assert!(heap.made(2) && !heap.left_unwritten(2));
+        assert!(heap.kept_in(2).is_some());
+        assert!(heap.deferred.lock().unwrap().is_empty());
+        assert_eq!(super::device_removed(), None);
+        UNWRITTEN_IN_TEST.set(false);
+    }
+
+    /// With [`unwritten_null`], a table made afresh reads nothing for a
+    /// texture whose host copy has not been written, and its texture once
+    /// it has.
+    #[test]
+    fn a_table_made_afresh_reads_nothing_until_its_texture_is_written() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        UNWRITTEN_IN_TEST.set(true);
+        static BYTES: [u8; 65536] = [9; 65536];
+        let (view, record) = placed_record(&BYTES);
+        set_card(&heap, ON_CARD, ON_CARD, 1);
+        let Some(index) = heap.dynamic(1) else { return };
+        heap.make_at(index, &view);
+        assert!(heap.kept_in(index).is_none(), "null while unwritten");
+        // (Nor from a list's own descriptor of it.)
+        assert!(heap.make_listed(u64::MAX - 7, record, index).is_none());
+        assert!(heap.kept_in(index).is_none());
+        let Some(View::Shader(texture, _)) = placed_texture(&view) else { panic!("a placed texture") };
+        crate::resource::note_written(texture as crate::object::This);
+        heap.make_at(index, &view);
+        assert!(heap.kept_in(index).is_some(), "the texture once written");
+        assert!(heap.make_listed(u64::MAX - 7, record, index).is_some());
+        assert!(heap.kept_in(index).is_some());
+        heap.release(index, 1);
+        assert_eq!(super::device_removed(), None);
+        UNWRITTEN_IN_TEST.set(false);
+    }
+
+    /// A made slot whose host texture no list has written into yet (its
+    /// view written before its memory was mapped) is made null at the
+    /// first look that finds the memory away, whatever the wait: its host
+    /// copy holds what its memory on the card held before. One that was
+    /// written is shown on for the wait.
+    #[test]
+    fn a_slot_never_written_is_not_shown_on_after_its_memory_went() {
+        let Some(heap) = HostHeap::new(false, 8) else { return };
+        static BYTES: [u8; 65536] = [10; 65536];
+        let (view, record) = placed_record(&BYTES);
+        let handle = descriptor(record);
+        let key = u64::from(record[2]) << 32 | u64::from(record[1]);
+        set_card(&heap, ON_CARD, ON_CARD, 1);
+        for slot in [2, 4] {
+            assert_eq!(heap.mirror(slot, handle, false), Some(view.clone()));
+            assert_eq!(heap.mirror(slot, handle, true), Some(view.clone()));
+            assert!(heap.kept_in(slot).is_some(), "made, never uploaded");
+        }
+        assert!(!shows_written(key));
+        assert!(heap.texture_slot_gone(2), "made null at the first look");
+        assert_eq!(heap.made.get(2), Some(0));
+        assert!(heap.away.lock().unwrap().is_empty());
+        let Some(View::Shader(texture, _)) = placed_texture(&view) else { panic!("a placed texture") };
+        crate::resource::note_written(texture as crate::object::This);
+        assert!(shows_written(key));
+        if std::env::var_os("VICTORY_TEXTURE_AWAY_MS").is_none() {
+            assert!(!heap.texture_slot_gone(4), "shown on for the wait");
+            assert_eq!(heap.made.get(4), Some(key));
+        }
     }
 
     /// A structured view of `bytes`, 16-byte elements (a buffer the title

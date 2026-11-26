@@ -2735,6 +2735,11 @@ impl State {
                 let _ = crate::residency::take_staging_deferred();
                 readable(list, sampled.kind, view);
                 crate::texture::PICKING.set(None);
+                // Made now if it was left until its upload was recorded
+                // (`HostHeap::remake_written`).
+                if let Some(handle) = heap.handle(index) {
+                    host.remake_written(index, handle, false);
+                }
             }
             // A staging buffer refused or put off (`crate::residency`) leaves
             // the slot due: marking it served would lose its only retry.
@@ -3475,6 +3480,7 @@ impl State {
                 }
             }
             readable(list, u.kind, &view);
+            host.remake_written(index, handle, true);
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
@@ -3754,13 +3760,17 @@ impl State {
                         host.constant_at(index, &buffer, gpu, size);
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
+                        // What it reads is made ready first (a texture's
+                        // upload recorded), so that the slot is made with a
+                        // host copy that has been written
+                        // (`descriptor::host::unwritten_null`).
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
                         if let Some(kind) = kind {
                             readable(list, kind, &view);
                         }
+                        host.make_at(index, &view);
                         // The title's slot is a table's: out of the queue
                         // of textures picked by index if the draw read it
                         // (its texture is up to date now), and made in
