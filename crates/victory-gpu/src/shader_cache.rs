@@ -126,6 +126,9 @@ fn build() -> [u8; 32] {
             // Compute programs with wave operations declare the console's
             // wave (`victory_shader::emit::wave_pin`).
             "VICTORY_WAVE_PIN",
+            // 16-bit halves through a table's views as their bits
+            // (`victory_shader::emit::half_bits`).
+            "VICTORY_HALF_BITS",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');

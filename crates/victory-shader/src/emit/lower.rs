@@ -7782,39 +7782,6 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, is_zero, zero, bits)
     }
 
-    /// Channels of buffer format `format`, as [`Self::format_load`] gives
-    /// them, as d16 data: 16 bits each, two per dword, low half first (an
-    /// odd last high half 0). Integer formats keep their low 16 bits; the
-    /// others become f16.
-    fn d16_channels(&mut self, format: u8, channels: Vec<V>) -> Result<Vec<V>, Why> {
-        let (_, numeric) = buffer_format(format).ok_or("a buffer format")?;
-        let c = self.cur;
-        let mut halves = Vec::new();
-        for x in channels {
-            halves.push(if matches!(numeric, Numeric::Uint | Numeric::Sint) {
-                let m = self.s.m.i32(0xFFFF);
-                self.s.m.bin(c, Bin::And, x, m)
-            } else {
-                let (f, i32t) = (self.as_float(x), self.s.t.i32);
-                self.s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
-            });
-        }
-        let mut out = Vec::new();
-        for pair in halves.chunks(2) {
-            out.push(match *pair {
-                [lo, hi] => {
-                    let k16 = self.s.m.i32(16);
-                    let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
-                    self.s.m.bin(c, Bin::Or, lo, hi)
-                }
-                [lo] => lo,
-                _ => unreachable!("chunks of one or two"),
-            });
-        }
-        Ok(out)
-    }
-
     /// The byte offset a buffer descriptor built around a root descriptor adds
     /// (constant and computed parts); none for other descriptors.
     fn built_offset(&mut self, src: &Source) -> Result<(u32, Option<V>), Why> {
@@ -7856,22 +7823,6 @@ impl<'a> Lower<'a> {
             .find(|u| u.user_data == rp.user_data)
             .map(|u| u.kind);
         (kind == Some(ResourceType::Uav)).then(|| self.host_word(RootType::Other(USER_VIEW_BIAS), rp.slot, 0))
-    }
-
-    /// The table descriptor `src` is, as (root parameter, dword in the
-    /// table), when the code loads it from a fixed place in a table: the
-    /// load's own place, not the start of the range its used-resource
-    /// entry describes (a range of several descriptors starts before most
-    /// of them). `None` for a descriptor picked at run time, built in the
-    /// code or chosen by control flow.
-    fn table_place(&self, src: &Source) -> Option<(u8, u32)> {
-        let Source::Loaded { load, first } = src else {
-            return None;
-        };
-        let a = self.scalar.get(load)?;
-        let rp = self.x.native.layout.get(a.param)?;
-        (rp.root == RootType::Table && a.dynamic.is_none())
-            .then(|| (rp.slot, a.offset / 4 + u32::from(*first)))
     }
 
     /// The used-resource entry a descriptor loaded from a table falls in.
@@ -12385,23 +12336,7 @@ impl<'a> Lower<'a> {
             .copied()
             .ok_or("an untracked buffer")?;
         let used = self.used_kind(src);
-        // Sixteen bits a channel through a view of a table: the bits go as
-        // they are, as unsigned integers, and the host is told, which shows
-        // the shader a 16-bit float view there as its unsigned twin
-        // ([`super::HostShader::half_views`]).
-        // A format load of whole dwords whose every use reads one half of a
-        // result as a half float moves 16-bit integers too (the head
-        // program's reads of the face network's output), where every
-        // access through its view does ([`Self::places_read_as_halves`]).
-        // A d16 access too only where every access does: a whole float
-        // read through the same place would see the unsigned twin.
-        let place = typed.then(|| self.table_place(src)).flatten().filter(|p| {
-            self.halves_only.contains(p) && (d16 || self.format_load_read_as_halves(inst))
-        });
-        let halves = place.is_some();
-        if let Some(place) = place {
-            self.half_views.insert(place);
-        }
+        let halves = self.moves_halves(inst, src, typed, d16);
         let (base, extra) = self.built_offset(src)?;
         if base != 0 {
             let b = self.s.m.i32(base);

@@ -224,6 +224,16 @@ thread_local! {
     pub(crate) static WAVE_PIN_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// Whether 16-bit typed buffer accesses through a table's views move their
+/// bits as unsigned integers (`HostShader::half_views`; tippythetaidum's
+/// fix for the faces' network). `VICTORY_HALF_BITS`: on, `=0` moves them
+/// by way of floats as before, for A/B runs. Part of the translation: the
+/// shader cache keys on it.
+pub fn half_bits() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HALF_BITS").is_none_or(|v| v != "0"))
+}
+
 /// The clean-up passes that run over a translated program before it is
 /// written (`bitcode::opt`): a set of that module's pass bits. Every pass
 /// is exact, so the switch is for telling a translator fault from a
