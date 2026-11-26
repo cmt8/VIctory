@@ -45,8 +45,48 @@ impl<'a> Lower<'a> {
         if let Some(place) = place {
             self.half_views.insert(place);
         }
+        // (A tbuffer load names its format and decodes it exactly.)
+        let tbuffer = matches!(inst.fields, Fields::Buffer { format: Some(_), .. });
+        if super::super::half_report() && typed && !tbuffer {
+            // (`take_half_report`: d16 as bits, d16 by way of floats, a
+            // format load read as halves as bits, and by way of floats.)
+            let as_halves = d16 || self.format_load_read_as_halves(inst);
+            if as_halves {
+                let k = usize::from(!d16) * 2 + usize::from(place.is_none());
+                self.half_counts[k] += 1;
+            }
+        }
         place.is_some()
     }
+
+    /// Hands the counts of the program's 16-bit typed buffer accesses to
+    /// [`take_half_report`] (`VICTORY_HALF_REPORT=1`), as the lowering
+    /// that succeeded made them.
+    pub(super) fn report_halves(&mut self) {
+        if super::super::half_report() {
+            HALF_REPORT.set(Some(std::mem::take(&mut self.half_counts)));
+        }
+    }
+}
+
+thread_local! {
+    /// See [`take_half_report`].
+    static HALF_REPORT: std::cell::Cell<Option<[u32; 4]>> = const { std::cell::Cell::new(None) };
+}
+
+/// With `VICTORY_HALF_REPORT=1`: of the program this thread translated
+/// last (since the last call), its typed buffer accesses that move 16-bit
+/// halves, as (d16 accesses moved as bits, d16 accesses moved by way of
+/// floats, format loads read only as halves moved as bits, such loads
+/// moved by way of floats). An access by way of floats through one of the
+/// title's 16-bit unsigned views does not keep its bits (the face network
+/// computed zeros so). `None` without the switch, or with nothing
+/// translated since.
+pub fn take_half_report() -> Option<[u32; 4]> {
+    HALF_REPORT.take()
+}
+
+impl<'a> Lower<'a> {
 
     /// Channels of buffer format `format`, as [`Self::format_load`] gives
     /// them, as d16 data: 16 bits each, two per dword, low half first (an

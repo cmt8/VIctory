@@ -126,7 +126,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::{host_max_wave_set, set_host_max_wave};
+pub use lower::{host_max_wave_set, set_host_max_wave, take_half_report};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDE_CONSTANT,
@@ -260,6 +260,26 @@ pub fn early_depth_on() -> bool {
 pub fn half_bits() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_HALF_BITS").is_none_or(|v| v != "0"))
+}
+
+/// Whether the translation counts each program's 16-bit typed buffer
+/// accesses by how they move their halves, for the host to log
+/// ([`take_half_report`]). `VICTORY_HALF_REPORT=1`: on (a diagnostic, off
+/// by default). The shader cache keys on it, so a run with it translates
+/// every program again and logs each.
+pub fn half_report() -> bool {
+    #[cfg(test)]
+    if let Some(on) = HALF_REPORT_TEST.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HALF_REPORT").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`half_report`] on its thread (`None`: the switch's).
+    pub(crate) static HALF_REPORT_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// Whether a raw unordered buffer the program loads past the cache (GLC)
