@@ -1707,6 +1707,44 @@ pub(crate) fn compile(
     entry: windows::core::PCSTR,
     target: windows::core::PCSTR,
 ) -> windows::core::Result<Vec<u8>> {
+    compile_told(source, entry, target).map_err(|(e, text)| {
+        if !text.is_empty() {
+            tracing::warn!("a shader of ours: {text}");
+        }
+        e
+    })
+}
+
+/// [`compile`] of the first of `forms` the system's compiler builds, and
+/// which one that was: a shader whose first form uses what only Microsoft's
+/// compiler has (`GetDimensions` of a writable texture), and whose next
+/// form gives the same program by other means for Wine's (`D3DCompile`
+/// under Wine). Warned of only if none builds.
+pub(crate) fn compile_first(
+    forms: &[String],
+    entry: windows::core::PCSTR,
+    target: windows::core::PCSTR,
+) -> windows::core::Result<(Vec<u8>, usize)> {
+    let mut failed = Vec::new();
+    for (i, source) in forms.iter().enumerate() {
+        match compile_told(source, entry, target) {
+            Ok(code) => return Ok((code, i)),
+            Err(e) => failed.push(e),
+        }
+    }
+    for (i, (_, text)) in failed.iter().enumerate() {
+        tracing::warn!(form = i, "a shader of ours: {text}");
+    }
+    Err(failed.pop().map_or_else(windows::core::Error::empty, |(e, _)| e))
+}
+
+/// [`compile`]'s work: the compiled bytes, or the error and the compiler's
+/// messages.
+fn compile_told(
+    source: &str,
+    entry: windows::core::PCSTR,
+    target: windows::core::PCSTR,
+) -> Result<Vec<u8>, (windows::core::Error, String)> {
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
     use windows::Win32::Graphics::Direct3D::ID3DBlob;
     let mut code: Option<ID3DBlob> = None;
@@ -1728,7 +1766,7 @@ pub(crate) fn compile(
         )
     };
     if let Err(e) = compiled {
-        if let Some(errors) = errors {
+        let text = errors.map_or_else(String::new, |errors| {
             // SAFETY: the blob's own bytes.
             let text = unsafe {
                 std::slice::from_raw_parts(
@@ -1736,11 +1774,11 @@ pub(crate) fn compile(
                     errors.GetBufferSize(),
                 )
             };
-            tracing::warn!("a shader of ours: {}", String::from_utf8_lossy(text));
-        }
-        return Err(e);
+            String::from_utf8_lossy(text).into_owned()
+        });
+        return Err((e, text));
     }
-    let code = code.ok_or_else(windows::core::Error::empty)?;
+    let code = code.ok_or_else(|| (windows::core::Error::empty(), String::new()))?;
     // SAFETY: the blob's own bytes.
     let bytes = unsafe {
         std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())

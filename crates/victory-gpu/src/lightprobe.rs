@@ -103,7 +103,9 @@ RWByteAddressBuffer ring : register(u0);
 #ifdef EXPOSURE
 Texture2D<float4> average : register(t0);
 Texture2D<float4> before : register(t1);
-RWByteAddressBuffer stats : register(u1);
+// The stand-in's sums (`crate::ambient`'s stats), in words: Wine's
+// compiler has no Load* on a writable buffer.
+RWStructuredBuffer<uint> stats : register(u1);
 RWStructuredBuffer<float4> mean : register(u2);
 [RootSignature(RS)]
 [numthreads(1, 1, 1)]
@@ -112,8 +114,11 @@ void exposure() {
     ring.Store4(at, asuint(average.Load(int3(0, 0, 0))));
     ring.Store4(at + 16, asuint(before.Load(int3(0, 0, 0))));
     if (has_stats != 0) {
-        ring.Store4(at + 64, stats.Load4(0));
-        stats.Store4(0, uint4(0, 0, 0, 0));
+        ring.Store4(at + 64, uint4(stats[0], stats[1], stats[2], stats[3]));
+        stats[0] = 0;
+        stats[1] = 0;
+        stats[2] = 0;
+        stats[3] = 0;
         ring.Store4(at + 80, asuint(mean[cells]));
     } else {
         ring.Store4(at + 64, uint4(0, 0, 0, 0));
@@ -129,7 +134,13 @@ RWByteAddressBuffer output : register(u3);
 [numthreads(1, 1, 1)]
 void lux() {
     uint at = record * 256;
+#ifdef WINE_HLSL
+    // The title's output is a byte address view, which Wine's compiler
+    // cannot read (no Load* on a writable buffer): told as all ones.
+    ring.Store4(at + 32, uint4(~0u, ~0u, ~0u, ~0u));
+#else
     ring.Store4(at + 32, output.Load4(0));
+#endif
     ring.Store4(at + 48, asuint(input.Load(int3(0, 0, 0))));
 }
 #endif
@@ -146,16 +157,39 @@ unsafe impl Send for Pass {}
 // SAFETY: as above.
 unsafe impl Sync for Pass {}
 
+/// The root signature of [`RS_EXPOSURE`] or [`RS_LUX`], made in code
+/// (Wine's compiler puts none in the blob).
+fn root(device: &ID3D12Device, code: &[u8], rs: &str) -> windows::core::Result<ID3D12RootSignature> {
+    use crate::host::{root_constants, root_range, root_table, root_view};
+    let t0 = [root_range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 0, 1)];
+    let t1 = [root_range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1)];
+    let u3 = [root_range(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3, 1)];
+    let uav = |register| root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, register);
+    if rs == RS_EXPOSURE {
+        let params = [root_constants(0, 4), root_table(&t0), root_table(&t1), uav(0), uav(1), uav(2)];
+        crate::host::root_of(device, code, &params, "light probe exposure")
+    } else {
+        let params = [root_constants(0, 4), root_table(&t0), root_table(&u3), uav(0)];
+        crate::host::root_of(device, code, &params, "light probe lux")
+    }
+}
+
 fn pipeline(
     device: &ID3D12Device,
     part: &str,
     rs: &str,
     entry: windows::core::PCSTR,
 ) -> windows::core::Result<(ID3D12RootSignature, ID3D12PipelineState)> {
-    let code = crate::host::compile(&format!("#define {part}\n#define RS \"{rs}\"\n{SOURCE}"), entry, s!("cs_5_1"))?;
-    // SAFETY: the root signature is inside the shader; plain creations.
+    // As Microsoft's compiler takes it, else the form for Wine's (`WINE_HLSL`).
+    let source = format!("#define {part}\n#define RS \"{rs}\"\n{SOURCE}");
+    let forms = [source.clone(), format!("#define WINE_HLSL\n{source}")];
+    let (code, form) = crate::host::compile_first(&forms, entry, s!("cs_5_1"))?;
+    if form > 0 && part == "LUX" {
+        tracing::info!("the light probe's lux pass cannot read the title's output with Wine's compiler: its columns are all ones");
+    }
+    // SAFETY: plain creations.
     unsafe {
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, &code)?;
+        let root = root(device, &code, rs)?;
         let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },

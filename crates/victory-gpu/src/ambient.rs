@@ -199,7 +199,7 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=15, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3)"
+#define RS "RootConstants(num32BitConstants=16, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -210,6 +210,12 @@ cbuffer Set : register(b0) {
     float near; float tan_y; uint width; uint height;
     float follow; float most; float air; uint probe;
     float jump; float fresh; float dt;
+    // The image's slices (`width` and `height` are its size): what
+    // `GetDimensions` of the writable image gives, in the form for Wine's
+    // compiler (WINE_HLSL), which has no such method on it. That form
+    // also tests floats for NaN and infinity on their bits (no isnan or
+    // isinf there).
+    uint slices;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -218,8 +224,10 @@ RWStructuredBuffer<float4> cells : register(u1);
 // Three a point: red, green and blue, each a mean and a direction.
 RWStructuredBuffer<float4> points : register(u2);
 // For the light probe (`crate::lightprobe`): sampled pixels, and the sums of
-// what the title's resolve left, what was found and what was written.
-RWByteAddressBuffer stats : register(u3);
+// what the title's resolve left, what was found and what was written. In
+// words: Wine's compiler has Interlocked* only as functions on a UAV's
+// element, not as methods of a byte address buffer.
+RWStructuredBuffer<uint> stats : register(u3);
 static const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
 
 // The point seen at a texel, in metres from the eye (x right, y up, z away).
@@ -236,12 +244,24 @@ RWTexture2D<float3> radiance : register(u0);
 [numthreads(8, 4, 1)]
 void keep(uint3 at : SV_DispatchThreadID) {
     uint w, h;
+#ifdef WINE_HLSL
+    w = width;
+    h = height;
+#else
     radiance.GetDimensions(w, h);
+#endif
     float3 sum = 0;
     for (uint y = 0; y < 5; y++) for (uint x = 0; x < 5; x++) {
         uint2 p = uint2((float2(at.xy) + (float2(x, y) + 0.5) / 5.0) * float2(w, h) / float2(CX, CY));
         float3 c = max(radiance[p], 0.0);
+#ifdef WINE_HLSL
+        // (Wine's compiler has no isnan or isinf: the same tests on the
+        // bits, all exponent bits set and the mantissa not zero or zero.)
+        uint3 bits = asuint(c) & 0x7fffffffu;
+        c = any(bits > 0x7f800000u) || any(bits == 0x7f800000u) ? 0.0 : c;
+#else
         c = any(isnan(c)) || any(isinf(c)) ? 0.0 : c;
+#endif
         // Lamps and glints count, but not for everything.
         sum += c / max(1.0, dot(c, LUMA) / 20.0);
     }
@@ -317,7 +337,13 @@ RWTexture3D<float3> scattered : register(u0);
 [numthreads(8, 8, 2)]
 void clear_air(uint3 at : SV_DispatchThreadID) {
     uint w, h, d;
+#ifdef WINE_HLSL
+    w = width;
+    h = height;
+    d = slices;
+#else
     scattered.GetDimensions(w, h, d);
+#endif
     if (at.x >= w || at.y >= h || at.z >= d) return;
     uint2 q = min(uint2((float2(at.xy) + 0.5) / float2(w, h) * float2(PX, PY)), uint2(PX - 1, PY - 1));
     uint at0 = (q.y * PX + q.x) * 3;
@@ -419,10 +445,10 @@ void raise(uint3 at : SV_DispatchThreadID) {
     light[p] = pack(written);
     if (probe != 0 && (at.x & 15) == 0 && (at.y & 15) == 0) {
         uint ignored;
-        stats.InterlockedAdd(0, 1, ignored);
-        stats.InterlockedAdd(4, uint(min(left, 1000.0) * 256.0), ignored);
-        stats.InterlockedAdd(8, uint(min(dot(found, LUMA), 1000.0) * 256.0), ignored);
-        stats.InterlockedAdd(12, uint(min(dot(written, LUMA), 1000.0) * 256.0), ignored);
+        InterlockedAdd(stats[0], 1, ignored);
+        InterlockedAdd(stats[1], uint(min(left, 1000.0) * 256.0), ignored);
+        InterlockedAdd(stats[2], uint(min(dot(found, LUMA), 1000.0) * 256.0), ignored);
+        InterlockedAdd(stats[3], uint(min(dot(written, LUMA), 1000.0) * 256.0), ignored);
     }
 }
 #endif
@@ -452,14 +478,39 @@ unsafe impl Send for Pass {}
 // SAFETY: as above.
 unsafe impl Sync for Pass {}
 
+/// The passes' root signature (the `[RootSignature]` of [`SOURCE`], made in
+/// code: Wine's compiler puts none in the blob): the constants (16 at b0),
+/// the depth's and the image's tables (t0, u0), the cells, points and
+/// stats as root UAVs (u1-u3).
+fn root(device: &ID3D12Device, code: &[u8]) -> windows::core::Result<ID3D12RootSignature> {
+    use crate::host::{root_constants, root_range, root_table, root_view};
+    let srv = [root_range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 0, 1)];
+    let uav = [root_range(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 0, 1)];
+    let params = [
+        root_constants(0, 16),
+        root_table(&srv),
+        root_table(&uav),
+        root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 1),
+        root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 2),
+        root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 3),
+    ];
+    crate::host::root_of(device, code, &params, "indirect light stand-in")
+}
+
 fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -> windows::core::Result<Pass> {
     let mut root: Option<ID3D12RootSignature> = None;
     let mut pipeline = |part: &str, entry| -> windows::core::Result<ID3D12PipelineState> {
-        let code = crate::host::compile(&format!("#define {part}\n{SOURCE}"), entry, s!("cs_5_1"))?;
-        // SAFETY: the root signature is inside the shader; plain creations.
+        // A writable image's size from `GetDimensions` where the compiler
+        // has it (Microsoft's), else from the constants (Wine's).
+        let forms = [format!("#define {part}\n{SOURCE}"), format!("#define {part}\n#define WINE_HLSL\n{SOURCE}")];
+        let (code, form) = crate::host::compile_first(&forms, entry, s!("cs_5_1"))?;
+        if form > 0 {
+            tracing::info!(part, "the indirect light stand-in takes its image's size from its constants (Wine's compiler)");
+        }
+        // SAFETY: plain creations.
         unsafe {
             if root.is_none() {
-                root = Some(device.CreateRootSignature(0, &code)?);
+                root = Some(self::root(device, &code)?);
             }
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
@@ -563,7 +614,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     list.keep(&pass.stats);
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 15];
+    let mut words = [0u32; 16];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
@@ -576,6 +627,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[12] = settle().map_or(0.0, |s| s.jump).to_bits();
     words[13] = settle().map_or(0.0, |s| s.fresh).to_bits();
     words[14] = (frame_ms(role) / 1000.0).to_bits();
+    words[15] = views.slices;
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -583,7 +635,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 15, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 16, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
