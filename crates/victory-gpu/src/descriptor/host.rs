@@ -2679,10 +2679,7 @@ impl HostHeap {
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
         self.keep(index, None);
         let Some(host) = host() else { return };
-        let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
-            BufferLocation: gpu,
-            SizeInBytes: constant_view_size(size),
-        };
+        let desc = constant_desc(gpu, size);
         // SAFETY: a slot of our heap; the memory is the caller's.
         unsafe {
             host.device
@@ -3902,6 +3899,27 @@ fn constant_view_size(size: u32) -> u32 {
     size.max(1).next_multiple_of(256)
 }
 
+/// The host's description of a constant buffer view of `size` bytes at
+/// `gpu`. A view of no bytes is a null view (`VICTORY_CBV_EMPTY_NULL`, on;
+/// `=0`: 256 bytes at its address, as before): a shader reads zeros
+/// through it, as on the console. Rounded up to 256 bytes it read whatever
+/// lay at its address in the host copy, the ring of per-draw constants
+/// among it, other bytes every frame (fxceless 619b2dc5: a floor in the
+/// first rooms flickered). A null location, not a size of 0: vkd3d-proton
+/// writes its null descriptor for that, and a range of 0 is not a valid
+/// Vulkan buffer descriptor.
+fn constant_desc(gpu: u64, size: u32) -> D3D12_CONSTANT_BUFFER_VIEW_DESC {
+    static NULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let null = *NULL.get_or_init(|| std::env::var_os("VICTORY_CBV_EMPTY_NULL").is_none_or(|v| v != "0"));
+    if size == 0 && null {
+        return D3D12_CONSTANT_BUFFER_VIEW_DESC { BufferLocation: 0, SizeInBytes: 0 };
+    }
+    D3D12_CONSTANT_BUFFER_VIEW_DESC {
+        BufferLocation: gpu,
+        SizeInBytes: constant_view_size(size),
+    }
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -3935,10 +3953,7 @@ fn make_checked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE, max_born: Option<u
             if max_born.is_some_and(|done| shadow.born_after() > done) {
                 return Make::Deferred(shadow.born_after());
             }
-            let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
-                BufferLocation: gpu,
-                SizeInBytes: constant_view_size(size),
-            };
+            let desc = constant_desc(gpu, size);
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
             Make::Made(Some(shadow.buffer.clone()))
@@ -4470,6 +4485,19 @@ mod tests {
         assert_eq!(constant_view_size(65_536), 65_536);
         assert_eq!(constant_view_size(1_306_368), 65_536);
         assert_eq!(constant_view_size(u32::MAX), 65_536);
+    }
+
+    /// A constant view of no bytes is a null view (with
+    /// `VICTORY_CBV_EMPTY_NULL` unset, as in tests); one of a byte or more
+    /// keeps its location and the host's size.
+    #[test]
+    fn an_empty_constant_view_is_a_null_view() {
+        let empty = constant_desc(0x1_0000, 0);
+        assert_eq!((empty.BufferLocation, empty.SizeInBytes), (0, 0));
+        let one = constant_desc(0x1_0000, 1);
+        assert_eq!((one.BufferLocation, one.SizeInBytes), (0x1_0000, 256));
+        let big = constant_desc(0x2_0000, 1_306_368);
+        assert_eq!((big.BufferLocation, big.SizeInBytes), (0x2_0000, 65_536));
     }
 
     /// The unsigned twin of a 16-bit float or signed format has its layout,
