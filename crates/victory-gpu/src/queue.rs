@@ -1479,8 +1479,19 @@ extern "system" fn copy_page_mappings(
     pool_pages: u32,
     _flags: u32,
 ) -> HRESULT {
-    let Some(map) = crate::resource::page_mapper() else {
+    let Some(mapper) = crate::resource::page_mapper() else {
         return E_INVALIDARG;
+    };
+    // `VICTORY_REMAP_BATCH=1`: the call's ranges gathered, then made under
+    // one hold of the runtime's locks.
+    let batch = crate::resource::remap_batch().then(crate::resource::page_batch_mapper).flatten();
+    let mut ops: Vec<(u64, u64, u64)> = Vec::new();
+    let mut map = |to: u64, from: u64, len: u64| match batch {
+        Some(_) => {
+            ops.push((to, from, len));
+            true
+        }
+        None => mapper(to, from, len),
     };
     if batches.is_null() && count > 0 {
         return E_INVALIDARG;
@@ -1510,6 +1521,9 @@ extern "system" fn copy_page_mappings(
             };
             at += len;
         }
+    }
+    if let Some(batch) = batch {
+        ok &= batch(&ops);
     }
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();

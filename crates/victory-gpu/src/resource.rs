@@ -969,6 +969,21 @@ pub(crate) fn page_mapper() -> Option<PageMapper> {
     PAGE_MAPPER.get().copied()
 }
 
+/// Maps several ranges as a [`PageMapper`] does, in order, under one hold
+/// of the runtime's locks ([`remap_batch`]); false if any failed (the
+/// others are still made).
+pub type PageBatchMapper = fn(&[(u64, u64, u64)]) -> bool;
+static PAGE_BATCH_MAPPER: std::sync::OnceLock<PageBatchMapper> = std::sync::OnceLock::new();
+
+/// The runtime's [`PageBatchMapper`].
+pub fn use_page_batch_mapper(mapper: PageBatchMapper) {
+    let _ = PAGE_BATCH_MAPPER.set(mapper);
+}
+
+pub(crate) fn page_batch_mapper() -> Option<PageBatchMapper> {
+    PAGE_BATCH_MAPPER.get().copied()
+}
+
 /// Whether the changes to title memory that one call asks for are made
 /// under one hold of the runtime's physical-page state and remapping lock
 /// (`title_memory_remapping`), not one per range or page

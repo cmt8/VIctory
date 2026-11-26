@@ -719,6 +719,11 @@ page, and unmapping a range took one call per view.
   pages per view, pages kept, placeholder joins, protections set again and
   faults that waited out a change; the frame log (`VICTORY_FRAME_LOG=1`)
   has the same per frame under "views:".
+- `VICTORY_REMAP_BATCH=1` (off by default; after vxlayer d5106b6e4): a
+  page-mapping copy's ranges, and with the switch above a scatter call's
+  pages, are made under one hold of the physical-page state and the
+  remapping lock instead of one per range, so texture refreshes do not
+  take turns with every page.
 - Also on this branch: our coarse clock ticks every 10 ms instead of 2,
   and it and the GameInput poller sleep through `Sleep`, which under Wine
   makes no wineserver request (`std::thread::sleep` made three a sleep).
