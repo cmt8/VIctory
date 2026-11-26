@@ -3011,6 +3011,12 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror_required(index, handle, true) {
+            // Counted only: the title's slot is read in place by others too.
+            if matches!(u.kind, ResourceType::Srv | ResourceType::Uav | ResourceType::Cbv)
+                && crate::descriptor::host::kind_mismatch(&view, u.dwords)
+            {
+                crate::descriptor::host::KIND_MISMATCHES[1].fetch_add(1, Ordering::Relaxed);
+            }
             readable(list, u.kind, &view);
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
@@ -3181,6 +3187,25 @@ impl State {
                         };
                         list.defer_fill(to, address as *const u8, size as usize);
                         host.constant_at(index, gpu, size);
+                    }
+                    Some(view)
+                        if read_as_buffer(entries.iter().copied(), k)
+                            && crate::descriptor::host::kind_mismatch(&view, 4) =>
+                    {
+                        // A texture view where the shader reads a buffer: its
+                        // descriptor's upper half read as a buffer's is
+                        // address 0 with a large size on RADV (a page
+                        // fault); the console read whatever its first
+                        // dwords said. Read as nothing instead.
+                        crate::descriptor::host::KIND_MISMATCHES[0].fetch_add(1, Ordering::Relaxed);
+                        let uav = entries
+                            .iter()
+                            .any(|u| u.table_offset_dwords / 8 == k && u.kind == ResourceType::Uav);
+                        if uav {
+                            host.null_raw_uav_at(index);
+                        } else {
+                            host.null_raw_at(index);
+                        }
                     }
                     Some(view) => {
                         host.make_at(index, &view);
@@ -3829,6 +3854,20 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     let signature = signature?;
     made.push(((kind, stride), signature.clone()));
     Some(signature)
+}
+
+/// Whether the shader reads table slot `k` only through console buffer
+/// descriptors (4 dwords: constant, shader-resource or unordered buffers),
+/// by the used-resource `entries` there; false if none is there.
+fn read_as_buffer<'a>(entries: impl Iterator<Item = &'a UsedResource>, k: u32) -> bool {
+    let mut any = false;
+    for u in entries.filter(|u| u.table_offset_dwords / 8 == k) {
+        if u.dwords != 4 || !matches!(u.kind, ResourceType::Srv | ResourceType::Uav | ResourceType::Cbv) {
+            return false;
+        }
+        any = true;
+    }
+    any
 }
 
 /// Gets what a shader reads or writes through a view ready: buffer data
