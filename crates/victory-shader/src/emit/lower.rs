@@ -80,6 +80,10 @@ pub(crate) struct Lowered {
     /// Buffer handles guarded by the stride table (`Lower::buffer_guard`).
     #[cfg(test)]
     pub buffer_guards: usize,
+    /// Scalar loads from slots picked in the view heap read as a constant
+    /// buffer only where the stride table marks one (`Lower::smem`).
+    #[cfg(test)]
+    pub marked_constant_reads: usize,
 }
 
 pub(crate) struct Parts<'a> {
@@ -225,6 +229,8 @@ struct Lower<'a> {
     /// Element strides read from the host's table by heap slot
     /// ([`super::shader::SLOT_STRIDES`]), by block and descriptor load.
     strides: HashMap<(usize, Site, u8), V>,
+    /// Whether those slots hold [`super::shader::SLOT_STRIDE_CONSTANT`].
+    constant_slots: HashMap<(usize, Site, u8), V>,
     /// Blocks splitting the edge from one IR block to another (flag distinguishes
     /// the second edge when a conditional branch targets the same block twice).
     edges: HashMap<(usize, usize, bool), usize>,
@@ -234,6 +240,8 @@ struct Lower<'a> {
     smem_raw_uavs: usize,
     #[cfg(test)]
     buffer_guards: usize,
+    #[cfg(test)]
+    marked_constant_reads: usize,
     /// Per IR block: a `done` export is behind every lane entering it.
     exported: Vec<bool>,
     /// Reverse-postorder index per IR block.
@@ -1624,6 +1632,7 @@ impl<'a> Lower<'a> {
             },
             handles: HashMap::new(),
             strides: HashMap::new(),
+            constant_slots: HashMap::new(),
             edges: HashMap::new(),
             #[cfg(test)]
             scalar_wave_first: 0,
@@ -1631,6 +1640,8 @@ impl<'a> Lower<'a> {
             smem_raw_uavs: 0,
             #[cfg(test)]
             buffer_guards: 0,
+            #[cfg(test)]
+            marked_constant_reads: 0,
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
@@ -2401,6 +2412,8 @@ impl<'a> Lower<'a> {
             smem_raw_uavs: self.smem_raw_uavs,
             #[cfg(test)]
             buffer_guards: self.buffer_guards,
+            #[cfg(test)]
+            marked_constant_reads: self.marked_constant_reads,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -5713,13 +5726,15 @@ impl<'a> Lower<'a> {
         // batch records, mesh headers and instance transforms this way, so
         // it passed no meshlet and every indirect mesh draw ran empty.
         // The host's table of strides by heap slot tells a buffer view
-        // (not 0) from anything else, which is still read as a constant
-        // buffer; only the load that fits the slot runs.
+        // (a stride) from a constant buffer view (`SLOT_STRIDE_CONSTANT`)
+        // and from anything else (0: zeros; a texture read as a constant
+        // buffer is a wild address); only the load that fits runs.
         let picked = match kind {
             None => self.slot_stride(src)?,
             Some(_) => None,
         };
         if let Some(stride) = picked {
+            let marked = self.slot_is_constant(src);
             let zero = self.s.m.i32(0);
             let is_buffer = self.s.m.cmp(self.cur, pred::NE, stride, zero);
             let at = self.begin_guarded(Some(is_buffer));
@@ -5744,7 +5759,16 @@ impl<'a> Lower<'a> {
                 raw.push((x, zero));
             }
             let raw = self.end_guarded(at, &raw);
-            let other = self.s.m.cmp(self.cur, pred::EQ, stride, zero);
+            let other = match marked {
+                Some(marked) => {
+                    #[cfg(test)]
+                    {
+                        self.marked_constant_reads += 1;
+                    }
+                    marked
+                }
+                None => self.s.m.cmp(self.cur, pred::EQ, stride, zero),
+            };
             let at = self.begin_guarded(Some(other));
             let h = self.handle(site, src, false, (13, 0x1_0000))?;
             let mut both = Vec::new();
@@ -6893,8 +6917,16 @@ impl<'a> Lower<'a> {
         let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[h, byte, iu, mask, align]);
         let f = self.s.m.extract(c, r, 0);
         let stride = self.as_int(f);
-        let zero = self.s.m.i32(0);
-        let none = self.s.m.cmp(c, pred::EQ, stride, zero);
+        let none = if super::constant_marks() {
+            // 0 and `SLOT_STRIDE_CONSTANT` (all ones): stride + 1 below 2.
+            let one = self.s.m.i32(1);
+            let wrapped = self.s.m.bin(c, Bin::Add, stride, one);
+            let two = self.s.m.i32(2);
+            self.s.m.cmp(c, pred::IULT, wrapped, two)
+        } else {
+            let zero = self.s.m.i32(0);
+            self.s.m.cmp(c, pred::EQ, stride, zero)
+        };
         let null = self.s.m.i32(if props.0 & 0x1000 != 0 { null_uav } else { null_srv });
         self.s.m.select(c, none, null, index)
     }
@@ -6984,9 +7016,26 @@ impl<'a> Lower<'a> {
             &[h, byte, iu, mask, align],
         );
         let f = self.s.m.extract(c, r, 0);
-        let v = self.as_int(f);
+        let mut v = self.as_int(f);
+        if super::constant_marks() {
+            // A constant buffer view's mark is no stride.
+            let mark = self.s.m.i32(super::shader::SLOT_STRIDE_CONSTANT);
+            let marked = self.s.m.cmp(c, pred::EQ, v, mark);
+            let zero = self.s.m.i32(0);
+            v = self.s.m.select(c, marked, zero, v);
+            self.constant_slots.insert(key, marked);
+        }
         self.strides.insert(key, v);
         Ok(Some(v))
+    }
+
+    /// Whether the slot [`Self::slot_stride`] read here is marked as a
+    /// constant buffer view (with [`super::constant_marks`]).
+    fn slot_is_constant(&self, src: &Source) -> Option<V> {
+        let Source::Loaded { load, first } = src else {
+            return None;
+        };
+        self.constant_slots.get(&(self.cur, *load, *first)).copied()
     }
 
     /// The heap index of a descriptor that may differ between lanes,

@@ -17,7 +17,8 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// reads buffers through descriptors it picks from the view heap at an
 /// index it computes (SM 6.6 dynamic resources): a raw buffer of
 /// [`SLOT_STRIDES_COUNT`] dwords the host keeps, dword `i` the bytes per
-/// element of the buffer view at heap slot `i` (0: none or not a buffer).
+/// element of the buffer view at heap slot `i` (0: none or not a buffer;
+/// [`SLOT_STRIDE_CONSTANT`]: a constant buffer view).
 /// The console's descriptor holds that stride and its hardware multiplies
 /// the element index by it; the program's code does not say it, and the
 /// used-resource list only names what tables hold. A shader that has this
@@ -26,6 +27,16 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 pub const SLOT_STRIDES: u8 = 255;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
+/// The [`SLOT_STRIDES`] dword of a slot that shows a constant buffer view
+/// (with [`super::constant_marks`]): a program reads a slot it picks from
+/// the heap as a constant buffer only where this mark is, and reads zeros
+/// where the dword is 0. Under vkd3d-proton's descriptor heap a constant
+/// buffer's descriptor is the second half of the slot, which for a texture
+/// is the upper half of its image descriptor: on RADV a base address of 0
+/// and, for a compressed render target or depth texture, a large size.
+/// Never a stride, and no buffer to the buffer guard (as 0 was before).
+/// After fxceless/victory-fork #1216 (GamingRipperDoc) and #1195 (IxMxAMAR).
+pub const SLOT_STRIDE_CONSTANT: u32 = u32::MAX;
 
 /// Title addresses of the buffer views of the view heap by slot, for
 /// console code that reads a descriptor's address out of a table at an

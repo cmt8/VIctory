@@ -661,6 +661,288 @@ fn heap_buffers_read_at_computed_indices_are_guarded() {
     }
 }
 
+/// A scalar load through a descriptor the program takes from the view heap
+/// at an index it computes reads the slot as a constant buffer only where
+/// the stride table marks a constant buffer view
+/// (`SLOT_STRIDE_CONSTANT`), with the marks on; with them off, wherever the
+/// table says no buffer view (a texture's slot too). A table's descriptor
+/// is read by its used-resource entry either way. What the loads give is
+/// `heap_slot_tests` (on the host GPU).
+#[test]
+fn heap_constant_reads_wait_for_the_mark() {
+    // The descriptor of slot 3 of the view heap into s[8:11], a scalar
+    // buffer load through it, and the result into LDS.
+    let words = [
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0060, // s_load_dwordx4 s[8:11], s[4:5], 0x60
+        0xF420_0304,
+        0xFA00_0000, // s_buffer_load_dword s12, s[8:11], 0x0
+        0x7E02_020C, // v_mov_b32 v1, s12
+        0xD834_0000,
+        0x0000_0100, // ds_write_b32 v0, v1
+        S_ENDPGM,
+    ];
+    let heap = || vec![root(RootType::ResourceHeap, 0, 0)];
+    let table = || vec![root(RootType::Table, 0, 0)];
+    let table_used = || {
+        vec![UsedResource {
+            kind: ResourceType::Cbv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }]
+    };
+    let marks = |on: Option<bool>| super::super::CONSTANT_MARKS_TEST.with(|c| c.set(on));
+    marks(Some(true));
+    let marked = lower_with(&words, heap(), vec![]).expect("a heap read lowers");
+    let tabled = lower_with(&words, table(), table_used()).expect("a table read lowers");
+    marks(Some(false));
+    let unmarked = lower_with(&words, heap(), vec![]).expect("a heap read lowers");
+    marks(None);
+    assert_eq!(marked.marked_constant_reads, 1, "read as a constant buffer where marked");
+    assert_eq!(unmarked.marked_constant_reads, 0, "the marks off: as before");
+    assert_eq!(tabled.marked_constant_reads, 0, "a table's constant buffer as before");
+    assert_ne!(marked.dxil, unmarked.dxil);
+    use super::super::validator::Validator;
+    if let Ok(mut v) = Validator::load(Validator::default_path().as_deref()) {
+        v.validate(&mut marked.dxil.clone()).expect("the marked heap read validates");
+        eprintln!("the marked heap read validates");
+    }
+}
+
+/// Lowers a wave32 compute program of 32 threads that takes a descriptor
+/// from the view heap itself (s0) and a raw UAV from entry 0 of a table at
+/// s1, with the constant-buffer marks on or off, for the host GPU.
+#[cfg(windows)]
+fn heap_slot_shader(words: &[u32], marks: bool) -> super::super::HostShader {
+    let param = |root, user_data| RootParam {
+        root,
+        table_offset_dwords: 0,
+        sgprs: 1,
+        base_register: 0,
+        user_data,
+        slot: user_data,
+    };
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 32,
+        layout: vec![param(RootType::ResourceHeap, 0), param(RootType::Table, 1)],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 1,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 2 << 1,
+            threads: [32, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, false, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    super::super::CONSTANT_MARKS_TEST.with(|c| c.set(Some(marks)));
+    // Heap slot 2 stands in for the host's null buffer views.
+    super::GUARD_NULLS.with(|c| c.set(Some((2, 2))));
+    let lowered = lower(&Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![],
+        prims: vec![],
+        mesh_stride: 0,
+    });
+    super::GUARD_NULLS.with(|c| c.set(None));
+    super::super::CONSTANT_MARKS_TEST.with(|c| c.set(None));
+    let lowered = lowered.expect("lower");
+    let shader = super::super::HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        root_indexed_views: Vec::new(),
+    };
+    use super::super::validator::Validator;
+    if let Ok(mut v) = Validator::load(Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+    }
+    shader
+}
+
+/// Runs `shader` on the hardware GPU with `probe` at view heap slot 1 (the
+/// UAV at 0, zeros at 2) and `entry` as slot 1's dword of the stride table;
+/// the UAV's 32 dwords, `None` without a device.
+#[cfg(windows)]
+fn heap_slot_run(
+    shader: &super::super::HostShader,
+    probe: super::super::host::View,
+    entry: u32,
+) -> Option<Vec<u32>> {
+    use super::super::host::{Dispatch, Host, Root, Stride, View};
+    let _one = super::super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return None;
+    };
+    let (root, pso) = host.compute_pipeline(shader).expect("compute_pipeline");
+    let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    let mut roots = vec![(0, Root::Constants(ud))];
+    // Root views follow the user data, by slot and then kind.
+    let mut views: Vec<(u8, u8)> = shader.root_cbvs.iter().map(|&r| (r, 0)).collect();
+    views.extend(shader.root_srvs.iter().map(|&r| (r, 1)));
+    views.extend(shader.root_uavs.iter().map(|&r| (r, 2)));
+    views.sort_unstable();
+    views.dedup();
+    for (n, (slot, kind)) in views.into_iter().enumerate() {
+        assert_eq!((slot, kind), (super::super::SLOT_STRIDES, 1), "root view");
+        let mut table = vec![0u32; 64];
+        table[1] = entry;
+        roots.push((1 + n as u32, Root::View { srv: true, data: table }));
+    }
+    let zeros = [0u32; 64];
+    let heap = [
+        View::RawUav(32),
+        probe,
+        View::Buffer {
+            data: &zeros,
+            stride: Stride::Raw,
+        },
+    ];
+    let words = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots,
+                views: &heap,
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("dispatch");
+    Some(words[0].clone())
+}
+
+/// What a scalar load reads through heap slot 1, picked by the index the
+/// program computes, for each kind of view there and each stride table
+/// dword: a constant buffer only where the table marks it
+/// (`SLOT_STRIDE_CONSTANT`), zeros where the table says 0 (a texture's slot
+/// read as a constant buffer was its image descriptor read as a buffer's:
+/// GPU page faults at address 0 plus a small offset under vkd3d-proton on
+/// RADV), the buffer where it holds a stride. With the marks off, as before:
+/// a constant buffer wherever the table says 0.
+#[cfg(windows)]
+#[test]
+fn heap_slots_read_as_constant_buffers_only_where_marked() {
+    use super::super::host::{Stride, View};
+    use super::super::shader::SLOT_STRIDE_CONSTANT as MARK;
+    let words = [
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0xF408_0202,
+        0xFA00_0020, // s_load_dwordx4 s[8:11], s[4:5], 0x20 (heap slot 1)
+        0xF408_0A03,
+        0xFA00_0000, // s_load_dwordx4 s[40:43], s[6:7], 0x0 (the UAV)
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xF420_0304,
+        0xFA00_0004, // s_buffer_load_dword s12, s[8:11], 0x4
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E02_020C, // v_mov_b32 v1, s12
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0xE070_1000,
+        0x800A_0110, // buffer_store_dword v1, v16, s[40:43], 0 offen
+        S_ENDPGM,
+    ];
+    let marked = heap_slot_shader(&words, true);
+    let unmarked = heap_slot_shader(&words, false);
+    let constants: Vec<u32> = (0..64).map(|i| 0x1000 + i).collect();
+    let texels = [[1.0f32, 2.0, 3.0, 4.0]];
+    let buffer: Vec<u32> = (0..64).map(|i| 0x2000 + i).collect();
+    let raw = || View::Buffer {
+        data: &buffer,
+        stride: Stride::Raw,
+    };
+    let cases = [
+        ("marked constant buffer", &marked, View::Cbv(&constants), MARK, 0x1001),
+        ("unmarked constant buffer", &marked, View::Cbv(&constants), 0, 0),
+        ("texture", &marked, View::Texture(1, 1, &texels), 0, 0),
+        ("buffer", &marked, raw(), 1, 0x2001),
+        ("constant buffer, marks off", &unmarked, View::Cbv(&constants), 0, 0x1001),
+        ("buffer, marks off", &unmarked, raw(), 1, 0x2001),
+    ];
+    for (name, shader, probe, entry, want) in cases {
+        let Some(got) = heap_slot_run(shader, probe, entry) else {
+            return;
+        };
+        assert_eq!(got, vec![want; 32], "{name}");
+    }
+}
+
+/// A buffer read through heap slot 1 reads the null buffer view (slot 2,
+/// zeros here) where the stride table marks a constant buffer view, as
+/// where it says 0: the mark is no stride.
+#[cfg(windows)]
+#[test]
+fn a_marked_slot_is_no_buffer_to_the_guard() {
+    use super::super::host::{Stride, View};
+    use super::super::shader::SLOT_STRIDE_CONSTANT as MARK;
+    let words = [
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0xF408_0202,
+        0xFA00_0020, // s_load_dwordx4 s[8:11], s[4:5], 0x20 (heap slot 1)
+        0xF408_0A03,
+        0xFA00_0000, // s_load_dwordx4 s[40:43], s[6:7], 0x0 (the UAV)
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0xE030_1000,
+        0x8002_0C10, // buffer_load_dword v12, v16, s[8:11], 0 offen
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xE070_1000,
+        0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+        S_ENDPGM,
+    ];
+    let shader = heap_slot_shader(&words, true);
+    let buffer: Vec<u32> = (0..64).map(|i| 0x2000 + i).collect();
+    let raw = || View::Buffer {
+        data: &buffer,
+        stride: Stride::Raw,
+    };
+    let lanes: Vec<u32> = (0..32).map(|i| 0x2000 + i).collect();
+    for (entry, want) in [(1, lanes), (MARK, vec![0; 32]), (0, vec![0; 32])] {
+        let Some(got) = heap_slot_run(&shader, raw(), entry) else {
+            return;
+        };
+        assert_eq!(got, want, "table dword {entry:#x}");
+    }
+}
+
 #[test]
 fn all_lane_mesh_gs_alloc_req_preserves_lds_barrier() {
     let lower_mesh = |words: &[u32]| -> Lowered {

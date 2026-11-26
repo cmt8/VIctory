@@ -57,6 +57,10 @@
 //!   buffer SRV (UAV) at [`null_buffer_views`] instead, two slots the host
 //!   keeps right below the null slot. Only with a null slot set
 //!   ([`view_heap_limit`]) and [`buffer_guard`] on.
+//!   A scalar load through such a descriptor whose slot holds no buffer
+//!   view reads it as a constant buffer only where the table holds
+//!   [`SLOT_STRIDE_CONSTANT`] (the host's mark of a constant buffer view),
+//!   and zeros elsewhere ([`constant_marks`]).
 //!
 //! * **Texture atomics** use a scalar integer UAV. The host binds R32_UINT
 //!   for 32-bit operations and R32G32_UINT for 64-bit operations. The latter
@@ -123,8 +127,8 @@ pub use sampler::StaticSampler;
 pub use lower::{host_max_wave_set, set_host_max_wave};
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, SLOT_VIEWS, SLOT_VIEWS_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
+    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDE_CONSTANT,
+    SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_VIEWS, SLOT_VIEWS_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
     USER_VIEW_BIAS, NULL_BUFFER_SLOTS,
     null_buffer_views, set_view_heap_limit, view_heap_limit,
 };
@@ -205,6 +209,33 @@ pub fn group_sync() -> u8 {
 pub fn buffer_guard() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_BUFFER_GUARD").is_none_or(|v| v != "0"))
+}
+
+/// Whether a scalar load through a descriptor the program picks from the
+/// view heap at an index it computes reads a slot that holds no buffer view
+/// as a constant buffer only where the stride table marks one
+/// ([`SLOT_STRIDE_CONSTANT`]), and zeros elsewhere
+/// (`VICTORY_CONSTANT_MARKS`; on, `=0` off: every such slot is read as a
+/// constant buffer, as before). A slot that shows a texture has no stride
+/// either, and its image descriptor read as a constant buffer's is a wild
+/// address on RADV (base 0, a large size for compressed targets): GPU page
+/// faults at address 0 plus a small offset. The host writes the mark
+/// (`victory-gpu`, `descriptor::host`) by the same switch. After
+/// fxceless/victory-fork #1216 (GamingRipperDoc) and #1195 (IxMxAMAR).
+/// Part of the translation: the shader cache keys on it.
+pub fn constant_marks() -> bool {
+    #[cfg(test)]
+    if let Some(on) = CONSTANT_MARKS_TEST.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CONSTANT_MARKS").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`constant_marks`] on its thread (`None`: the switch's).
+    pub(crate) static CONSTANT_MARKS_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// Whether pixel programs the console depth-tests before they run
