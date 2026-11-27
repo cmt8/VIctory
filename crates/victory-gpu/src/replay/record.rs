@@ -1913,7 +1913,17 @@ unsafe extern "system" fn copy_descriptors(
 unsafe extern "system" fn execute(this: Ptr, n: u32, lists: *const Ptr) {
     // SAFETY: `n` closed lists, as D3D12 asks; the state is the queue's.
     unsafe {
-        let go = || own!(this, ID3D12CommandQueue_Vtbl.ExecuteCommandLists)(this, n, lists);
+        let all: &[Ptr] = if n == 0 || lists.is_null() {
+            &[]
+        } else {
+            std::slice::from_raw_parts(lists, n as usize)
+        };
+        // The lists go to the queue with their own tables (`hook::bare`).
+        let go = || {
+            hook::bare(all, || {
+                own!(this, ID3D12CommandQueue_Vtbl.ExecuteCommandLists)(this, n, lists)
+            })
+        };
         let Some(r) = recorder().filter(|_| !ours()) else {
             return go();
         };
@@ -1922,7 +1932,6 @@ unsafe extern "system" fn execute(this: Ptr, n: u32, lists: *const Ptr) {
             snap::other_queue(r, n);
             return go();
         }
-        let all = std::slice::from_raw_parts(lists, n as usize);
         snap::submit(r, &borrow::<ID3D12CommandQueue>(this), all, go);
     }
 }
