@@ -19,8 +19,13 @@ with this fork's changes on top. Upstream's README follows this section,
 unchanged; it describes the Windows build.
 
 Both of those repositories, and their owners' GitHub accounts, stopped being
-reachable on 2026-11-27 (HTTP 404); no public explanation was found. Their
-history, with its authorship, is kept in this fork's branches.
+reachable on 2026-11-27 (HTTP 404). The tracker
+[PortWatch VI](https://portwatch-vi.xyz/) reports that GitHub removed
+Belobug's repository and account that day for a Terms of Service violation;
+it does not say which term, no notice from GitHub is known here, and nothing
+is known about avatarmanz's. Their history, with its authorship, is kept in
+this fork's branches; it holds source code only, no files of the title
+(`cargo xtask policy` passes on it).
 
 ## Status (2026-11-27)
 
