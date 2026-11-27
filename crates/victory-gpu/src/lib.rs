@@ -28,6 +28,9 @@ mod capture;
 #[cfg(windows)]
 mod compose;
 pub mod console;
+mod wc;
+#[cfg(windows)]
+mod census;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -138,6 +141,7 @@ pub fn frames_begun() -> u64 {
 }
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
+pub use wc::title_memory_protection;
 #[cfg(windows)]
 pub use watch::reserved::title_memory_holes_compared;
 #[cfg(windows)]
