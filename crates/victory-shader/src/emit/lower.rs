@@ -343,7 +343,7 @@ struct Lower<'a> {
     typed_rw: bool,
     /// The handles that have their load and store that never run.
     rw_handles: HashSet<V>,
-    /// The LDS dword a program without LDS of its own stores to at its start
+    /// The LDS dword a program without LDS of its own adds to at its start
     /// ([`super::group_cu`]): the host then runs the group in one compute unit.
     cu_word: Option<u32>,
     /// src0 of the current instruction as DPP fetched it.
@@ -3000,15 +3000,18 @@ impl<'a> Lower<'a> {
             }
         }
         if let Some(word) = self.cu_word {
-            // Every thread that runs stores a zero to the group's one dword of shared
-            // memory: nothing reads it. A program that uses LDS is run in one compute
-            // unit by RADV ([`super::group_cu`]).
+            // Every thread that runs adds one, atomically, to the group's one dword of
+            // shared memory, and nothing uses what the dword holds. A program that uses
+            // LDS is run in one compute unit by RADV ([`super::group_cu`]). A plain
+            // store would not do: Mesa drops a shared variable that is only stored to
+            // (`nir_remove_dead_variables`), and the program then has no LDS again; an
+            // atomic counts as a use there.
             let e = self.s.entry;
             let lds = self.s.lds();
             let k = self.s.m.i32(word);
             let ptr = self.s.m.element(e, lds, k);
-            let zero = self.s.m.i32(0);
-            self.s.m.store(e, ptr, zero);
+            let one = self.s.m.i32(1);
+            self.s.m.atomic(e, Rmw::Add, ptr, one);
         }
         self.find_coherent();
         let order = crate::ir::reverse_postorder(&p.blocks);
@@ -14261,7 +14264,7 @@ mod tests {
 
     /// `VICTORY_GROUP_CU`: a compute program that stores to a UAV and meets
     /// its group at an `s_barrier` without any LDS is given a dword of
-    /// group-shared memory and a store to it. Only with the switch on, not
+    /// group-shared memory and an atomic add to it. Only with the switch on, not
     /// without a barrier, and not where the program has LDS already.
     #[test]
     fn a_group_with_a_barrier_and_no_lds_gets_a_dword_of_it_only_when_asked() {
@@ -14334,7 +14337,7 @@ mod tests {
         assert_ne!(
             lowered(false, true, false),
             lowered(true, true, false),
-            "a barrier, a UAV store and no LDS: the dword and its store"
+            "a barrier, a UAV store and no LDS: the dword and the add to it"
         );
         assert_eq!(lowered(false, false, false), lowered(true, false, false), "no barrier: as before");
         assert_eq!(lowered(false, true, true), lowered(true, true, true), "LDS of its own: as before");

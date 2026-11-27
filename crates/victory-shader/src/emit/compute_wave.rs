@@ -282,7 +282,7 @@ const EVEN_BARRIERS: &str = "VICTORY_WAVE_EVEN_BARRIERS: a form's barriers where
 const TYPED_RW: &str = "VICTORY_TYPED_RW: typed unordered buffer views read behind a barrier are not read-only";
 /// [`keyed_apart`]'s mark of a compute program with an `s_barrier` that may
 /// get a dword of group-shared memory it does not need ([`super::group_cu`]).
-const GROUP_CU: &str = "VICTORY_GROUP_CU: a group with a barrier and no LDS uses a dword of it";
+const GROUP_CU: &str = "VICTORY_GROUP_CU: a group with a barrier and no LDS adds to a dword of it";
 
 /// What of the translation of `container` whoever caches translations keys
 /// apart, beside what it keys every program by: a mark for each change of

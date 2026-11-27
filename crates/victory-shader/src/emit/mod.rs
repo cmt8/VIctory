@@ -365,8 +365,8 @@ thread_local! {
 }
 
 /// Whether a compute program that writes UAVs, has an `s_barrier` and uses
-/// no LDS gets one dword of thread-group shared memory and a store to it at
-/// its start (`lower`: `cu_word`), so that the host runs the group's waves
+/// no LDS gets one dword of thread-group shared memory and an atomic add to
+/// it at its start (`lower`: `cu_word`), so that the host runs the group's waves
 /// in one compute unit.
 ///
 /// Why (Mesa 26.3.1, read in its sources; the RX 7900 XTX is GFX11): RADV
@@ -392,8 +392,13 @@ thread_local! {
 /// The face network's first stage (0aa7934094794dbf: 1,024 threads in one
 /// group, no LDS, 14 typed stores and 16 typed loads around one barrier in a
 /// loop, loads before the barrier too) gave different results from the same
-/// memory on that card. Not shown yet: that this switch ends it (the replays
-/// that would tell were not run).
+/// memory on that card. Not shown yet: that this switch ends it.
+///
+/// The dword is added to atomically, once by every thread, and what it holds
+/// is used by nothing. A plain store to it does not keep it: Mesa drops a
+/// shared variable that is only stored to (`nir_remove_dead_variables`,
+/// `deref_used_for_not_store`), seen in RADV's dump of the face program with
+/// such a store added (no shared store left, the divergence as before).
 ///
 /// `VICTORY_GROUP_CU`: off, `=1` on. Part of the translation: the shader
 /// cache keys the programs it can change apart ([`keyed_apart`]).
