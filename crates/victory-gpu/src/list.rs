@@ -800,6 +800,12 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
         }
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| {
+            let kinds: Vec<u32> = barriers.iter().map(|b| b.kind).collect();
+            let waits = host.iter().filter(|b| b.kind == 2).count();
+            format!("wait barrier kinds {kinds:?} host {} ({waits} for shader writes)", host.len())
+        });
         if !host.is_empty() {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
             const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
@@ -1581,6 +1587,7 @@ extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size
                     );
                 }
                 crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
+                list.note_op(|| format!("wait sync flags {flags:#x} control {control:#x}"));
             }
             // SAFETY: the same layout; no resource named.
             let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
@@ -2170,6 +2177,8 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         with_state(this, |_, state| state.synced());
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| format!("wait groups {count}"));
         // SAFETY: the same layout; no resource named.
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
