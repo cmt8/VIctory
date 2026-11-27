@@ -878,6 +878,14 @@ fn drop_why(why: &'static str) {
     DROP_WHY.set(Some(why));
 }
 
+/// A draw or dispatch of the title's pipeline at `pipeline` was not run:
+/// told to `crate::dropwhy` with why it has no host pipeline, else with
+/// what [`drop_why`] noted last.
+fn tell_dropped(pipeline: usize, kind: crate::dropwhy::Kind) {
+    let why = DROP_WHY.take();
+    crate::dropwhy::not_run(pipeline as This, kind, why);
+}
+
 /// A root descriptor of the draw being prepared has nothing to bind: the
 /// draw is dropped (`why` in the drop reasons) rather than run with the
 /// parameter unbound. A root descriptor has no size and no null form; left
@@ -3001,6 +3009,7 @@ impl State {
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::framewatch::add(crate::framewatch::Count::DroppedBuilder, 1);
+            crate::dropwhy::dropped(self.pipeline as This, crate::dropwhy::Kind::Dispatch, crate::dropwhy::Cause::BuilderOff);
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
@@ -3015,6 +3024,7 @@ impl State {
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::framewatch::add(crate::framewatch::Count::Dropped, 1);
+            tell_dropped(self.pipeline, crate::dropwhy::Kind::Dispatch);
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_drop(self.pipeline as This);
@@ -3024,11 +3034,17 @@ impl State {
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
+            crate::dropwhy::dropped(
+                self.pipeline as This,
+                crate::dropwhy::Kind::Dispatch,
+                crate::dropwhy::Cause::Other("a dispatch with a graphics pipeline"),
+            );
             return;
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::framewatch::add(crate::framewatch::Count::DroppedOther, 1);
+            tell_dropped(self.pipeline, crate::dropwhy::Kind::Dispatch);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
             if crate::pipeline::is_builder(self.pipeline as This) {
@@ -3073,6 +3089,7 @@ impl State {
         }
         self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        crate::dropwhy::ran(self.pipeline as This);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
             && crate::ambient::on()
             && self.ambient(list, p, role)
@@ -3521,6 +3538,7 @@ impl State {
                     self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
+                    crate::dropwhy::ran(self.pipeline as This);
                     true
                 }
                 Err(_) => false,
@@ -3528,6 +3546,7 @@ impl State {
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::framewatch::add(self.dropped_why(), 1);
+            tell_dropped(self.pipeline, crate::dropwhy::Kind::Mesh);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -4112,10 +4131,12 @@ impl State {
             };
             self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            crate::dropwhy::ran(self.pipeline as This);
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::framewatch::add(self.dropped_why(), 1);
+            tell_dropped(self.pipeline, crate::dropwhy::Kind::Draw);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -4219,10 +4240,12 @@ impl State {
             };
             self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            crate::dropwhy::ran(self.pipeline as This);
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::framewatch::add(self.dropped_why(), 1);
+            tell_dropped(self.pipeline, crate::dropwhy::Kind::Indexed);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -4330,6 +4353,11 @@ impl State {
             return false;
         }
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+            crate::dropwhy::dropped(
+                self.pipeline as This,
+                crate::dropwhy::Kind::Indirect(kind),
+                crate::dropwhy::Cause::BuilderOff,
+            );
             return false;
         }
         const DRAW: u32 = 0;
@@ -4340,7 +4368,14 @@ impl State {
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
+        // For `crate::dropwhy`: the pipeline has a host pipeline, and the
+        // execution is not run for `what`.
+        let pipeline = self.pipeline;
+        let tell = |what: &'static str| {
+            crate::dropwhy::dropped(pipeline as This, crate::dropwhy::Kind::Indirect(kind), crate::dropwhy::Cause::Other(what));
+        };
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            tell_dropped(self.pipeline, crate::dropwhy::Kind::Indirect(kind));
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
@@ -4373,11 +4408,13 @@ impl State {
                 "pipeline mismatch (compute {}, mesh {}, topology {})",
                 p.compute, p.mesh, self.topology
             ));
+            tell("the pipeline is of another kind than the arguments");
             return false;
         }
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find_any(arguments, len) else {
             why("arguments outside title buffers");
+            tell("arguments outside title buffers");
             return false;
         };
         let counter = match count {
@@ -4385,6 +4422,7 @@ impl State {
                 Some(s) => Some((s, at)),
                 None => {
                     why("count outside title buffers");
+                    tell("count outside title buffers");
                     return false;
                 }
             },
@@ -4395,10 +4433,12 @@ impl State {
             .flatten()
         else {
             why("no host signature");
+            tell("no host signature");
             return false;
         };
         if kind == MESH && (mesh_test() == 1 || !mesh_kept(self.pipeline)) {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
+            tell("mesh draws are switched off");
             return false;
         }
         // Renderer port 1: arguments (or their count) in the title's memory
@@ -4496,6 +4536,7 @@ impl State {
                 let Some(bounded) = bounded else {
                     self.window = None;
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
+                    tell("not bounded (no clamp, or arguments not 4-byte aligned)");
                     return false;
                 };
                 self.host_pipeline = 0;
@@ -4520,6 +4561,7 @@ impl State {
         };
         if !ran {
             why("prepare failed");
+            tell_dropped(self.pipeline, crate::dropwhy::Kind::Indirect(kind));
             return false;
         }
         #[cfg(feature = "diagnostics")]
@@ -4565,6 +4607,7 @@ impl State {
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
+        crate::dropwhy::ran(self.pipeline as This);
         true
     }
 }

@@ -473,6 +473,37 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
+/// For `crate::dropwhy`: why the title's pipeline `this` has no host
+/// pipeline now, without waiting for one; `None` if it has one.
+#[cfg(windows)]
+pub(crate) fn lack(this: This) -> Option<crate::dropwhy::Cause> {
+    if this.is_null() {
+        return Some(crate::dropwhy::Cause::NoPipeline);
+    }
+    pipeline(this).host.lack()
+}
+
+/// For `crate::dropwhy`: what identifies the title's pipeline `this`
+/// across runs (empty for none).
+#[cfg(windows)]
+pub(crate) fn drop_key<'a>(this: This) -> &'a str {
+    if this.is_null() { "" } else { pipeline(this).host.key() }
+}
+
+/// For `crate::dropwhy`: the programs and formats of the title's pipeline
+/// `this`.
+#[cfg(windows)]
+pub(crate) fn drop_what(this: This) -> String {
+    if this.is_null() { "no pipeline".to_owned() } else { pipeline(this).host.what() }
+}
+
+/// For `crate::dropwhy`: when the host pipeline of `this` was asked for
+/// and made.
+#[cfg(windows)]
+pub(crate) fn drop_times(this: This) -> crate::dropwhy::Times {
+    if this.is_null() { Default::default() } else { pipeline(this).host.times() }
+}
+
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
 /// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -567,6 +598,16 @@ fn copy(stage: &'static str, code: &Bytecode) -> Option<Arc<Shader>> {
     }))
 }
 
+/// Pipelines the title created since the start: graphics ones, compute
+/// ones, and of both those of the structure builder ([`Builder`]).
+static CREATED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// See [`CREATED`].
+#[cfg(windows)]
+pub(crate) fn created() -> [u64; 3] {
+    CREATED.each_ref().map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 fn hand_out(
     shaders: Vec<Arc<Shader>>,
     #[cfg(windows)] graphics: Option<Box<host::GraphicsState>>,
@@ -574,6 +615,8 @@ fn hand_out(
     out: *mut This,
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
+    let compute = shaders.iter().any(|s| s.stage == "compute");
+    CREATED[usize::from(compute)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
     #[cfg(windows)]
@@ -584,6 +627,7 @@ fn hand_out(
     let builder = of_builder(&shaders);
     #[cfg(windows)]
     if builder {
+        CREATED[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Another stage: the group is looked at again at its next dispatch.
         let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
         b.pipelines.push(host.clone());

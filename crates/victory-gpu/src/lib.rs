@@ -72,6 +72,8 @@ mod picked;
 mod pool;
 #[cfg(windows)]
 mod framewatch;
+#[cfg(windows)]
+mod dropwhy;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod popwatch;
 #[cfg(windows)]

@@ -43,6 +43,10 @@ pub(crate) struct Pending {
     used: AtomicBool,
     /// A pass over the screen ([`GraphicsState::screen_pass`]).
     screen: bool,
+    /// For `crate::dropwhy`: when a draw first asked for it while it was not
+    /// made, when it was made, and how long the making took, in ms
+    /// (`crate::host::now_ms`; 0: not yet).
+    times: [AtomicU64; 3],
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -68,6 +72,38 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            times: [const { AtomicU64::new(0) }; 3],
+        }
+    }
+
+    /// What it is, for `crate::dropwhy`: its programs, and a graphics
+    /// pipeline's target and depth formats.
+    pub(super) fn what(&self) -> String {
+        match &self.graphics {
+            Some(g) => {
+                let targets: Vec<i32> =
+                    g.targets.RTFormats.iter().take(g.targets.NumRenderTargets as usize).map(|f| f.0).collect();
+                format!("{:?} targets {targets:?} depth {}", self.shaders, g.depth_format.0)
+            }
+            None => format!("{:?}", self.shaders),
+        }
+    }
+
+    /// See [`Pending::times`].
+    pub(super) fn times(&self) -> crate::dropwhy::Times {
+        let [asked, made, took] = self.times.each_ref().map(|t| t.load(Ordering::Relaxed));
+        crate::dropwhy::Times { asked, made, took }
+    }
+
+    /// Why it has no host pipeline now, without waiting for one; `None` if
+    /// it has one.
+    pub(super) fn lack(&self) -> Option<crate::dropwhy::Cause> {
+        use crate::dropwhy::Cause;
+        match self.made.get() {
+            Some(Some(_)) => None,
+            None => Some(Cause::Making),
+            Some(None) if self.shaders.iter().any(|s| matches!(s.translated.get(), Some(None))) => Some(Cause::Untranslated),
+            Some(None) => Some(Cause::Refused),
         }
     }
 
@@ -95,9 +131,13 @@ impl Pending {
                 } else {
                     HostPipeline::new(&self.shaders, self.graphics.as_deref())
                 };
-                super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
+                let took = began.elapsed().as_millis() as u64;
+                super::library::note_time(&self.key, took);
+                self.times[2].store(took, Ordering::Relaxed);
+                crate::dropwhy::made(took);
                 made
             };
+            self.times[1].store(crate::host::now_ms().max(1), Ordering::Relaxed);
             let _ = self.made.set(made);
         }
         let (lock, done) = &DONE;
@@ -409,6 +449,9 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         super::library::note_used(&p.key);
     }
     if p.made.get().is_none() {
+        if crate::dropwhy::on() {
+            let _ = p.times[0].compare_exchange(0, crate::host::now_ms().max(1), Ordering::Relaxed, Ordering::Relaxed);
+        }
         start(p, REQUESTED);
         wait(p, crate::frame::current());
     }

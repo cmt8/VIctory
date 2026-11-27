@@ -67,6 +67,11 @@ pub(crate) fn add(what: Count, n: u64) {
     COUNTED[what as usize].fetch_add(n, Relaxed);
 }
 
+/// How many of `what` were counted since the start.
+pub(crate) fn counted(what: Count) -> u64 {
+    COUNTED[what as usize].load(Relaxed)
+}
+
 /// Whether the lines are written.
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();

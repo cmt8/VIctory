@@ -1913,6 +1913,10 @@ extern "system" fn execute_indirect(
     let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
     let mut ran = false;
     #[cfg(windows)]
+    if crate::dropwhy::on() {
+        crate::dropwhy::take_noted();
+    }
+    #[cfg(windows)]
     if let ([[kind, ..]], Some(address)) = (args, address)
         && (count.is_null() || counter.is_some())
     {
@@ -1935,7 +1939,18 @@ extern "system" fn execute_indirect(
     }
     INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     #[cfg(windows)]
-    crate::framewatch::add(crate::framewatch::Count::IndirectDropped, 1);
+    {
+        crate::framewatch::add(crate::framewatch::Count::IndirectDropped, 1);
+        // (One that `State::execute_indirect` did not come to tell of.)
+        if crate::dropwhy::on() && !crate::dropwhy::take_noted() {
+            let kind = args.first().map_or(u32::MAX, |a| a[0]);
+            crate::dropwhy::dropped(
+                std::ptr::null(),
+                crate::dropwhy::Kind::Indirect(kind),
+                crate::dropwhy::Cause::Other("its signature, arguments or count could not be used"),
+            );
+        }
+    }
     static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if !seen.contains(&(signature as usize)) {

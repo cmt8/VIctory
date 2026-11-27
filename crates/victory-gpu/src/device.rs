@@ -346,6 +346,16 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
+/// Calls of device methods 0x1c8 and 0x218 since the start
+/// ([`unknown_pipeline`]).
+static UNKNOWN_PIPELINES: [std::sync::atomic::AtomicU32; 2] = [const { std::sync::atomic::AtomicU32::new(0) }; 2];
+
+/// See [`UNKNOWN_PIPELINES`].
+#[cfg(windows)]
+pub(crate) fn unknown_pipelines() -> [u32; 2] {
+    UNKNOWN_PIPELINES.each_ref().map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 /// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
 /// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
 /// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
@@ -362,9 +372,8 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
     _iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static CALLS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
-    let calls = CALLS[usize::from(SLOT == 0x218)].fetch_add(1, Ordering::Relaxed) + 1;
+    use std::sync::atomic::Ordering;
+    let calls = UNKNOWN_PIPELINES[usize::from(SLOT == 0x218)].fetch_add(1, Ordering::Relaxed) + 1;
     if !out.is_null() {
         // SAFETY: the title's out pointer (a local of its own).
         unsafe { *out = std::ptr::null() };
