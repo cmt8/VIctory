@@ -931,11 +931,15 @@ pub(crate) fn with_view_heap<T>(f: impl FnOnce(&host::HostHeap) -> T) -> Option<
 }
 
 /// Makes dynamic slot `index` of the host heap behind the title heap at
-/// `heap`, if that heap still exists, the constant buffer view of `size`
-/// bytes of `buffer` at `gpu`.
+/// `heap`, if that host heap instance (`id`) still exists, the constant
+/// buffer view of `size` bytes of `buffer` at `gpu`. (A heap the title made
+/// where the one the slot was taken from had been is another: its slot of
+/// that number is some list's that knows nothing of this view. As
+/// [`release_dynamic`], after fxceless/victory-fork#1324.)
 #[cfg(windows)]
 pub(crate) fn constant_slot(
     heap: usize,
+    id: u64,
     index: u32,
     buffer: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     gpu: u64,
@@ -946,7 +950,7 @@ pub(crate) fn constant_slot(
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
     {
-        host.constant_at(index, buffer, gpu, size);
+        host.constant_for(id, index, buffer, gpu, size);
     }
 }
 

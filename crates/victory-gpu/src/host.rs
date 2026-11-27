@@ -7694,12 +7694,13 @@ impl HostList {
     }
 
     /// As [`HostList::defer_fill`], for upload memory that only `slot` (a
-    /// title heap's address, and the slot) shows.
-    pub(crate) fn defer_constants(&self, dst: *mut u8, src: *const u8, len: usize, slot: (usize, u32)) {
+    /// title heap's address, the identity of its host heap, and the slot)
+    /// shows.
+    pub(crate) fn defer_constants(&self, dst: *mut u8, src: *const u8, len: usize, slot: (usize, u64, u32)) {
         let src = self.forward_fill(src as usize, len);
         self.deferred()
             .copies
-            .push(Step::Fill(dst as usize, src, len, Some(card_steps::FillTo::Slot(slot.0, slot.1))));
+            .push(Step::Fill(dst as usize, src, len, Some(card_steps::FillTo::Slot(slot.0, slot.1, slot.2))));
     }
 
     /// As [`HostList::defer_fill`], for the beginning of a buffer

@@ -3992,7 +3992,7 @@ impl State {
                             host.make_null(index);
                             continue;
                         };
-                        let slot = (std::ptr::from_ref(heap) as usize, index);
+                        let slot = (std::ptr::from_ref(heap) as usize, host.id(), index);
                         list.defer_constants(to, address as *const u8, size as usize, slot);
                         host.constant_at(index, &buffer, gpu, size);
                     }

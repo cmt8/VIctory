@@ -122,8 +122,10 @@ const MOST: usize = 12288;
 #[derive(Clone)]
 pub(super) enum FillTo {
     /// A descriptor slot that shows the fill's memory, and nothing else does
-    /// (title heap, slot): it is made to show our buffer instead.
-    Slot(usize, u32),
+    /// (title heap, the identity of the host heap behind it when the slot
+    /// was taken, slot): it is made to show our buffer instead, in that host
+    /// heap and no other the title has made at the same address since.
+    Slot(usize, u64, u32),
     /// A buffer the card can write, filled from its beginning.
     Buffer(ID3D12Resource),
 }
@@ -531,8 +533,8 @@ struct Op {
 enum To {
     /// A host copy, and the title address.
     Copy(Arc<Shadow>, usize),
-    /// A descriptor slot (title heap, slot).
-    Slot(usize, u32),
+    /// A descriptor slot (title heap, its host heap's identity, slot).
+    Slot(usize, u64, u32),
     /// A buffer's beginning.
     Buffer(ID3D12Resource),
 }
@@ -781,7 +783,7 @@ impl Host {
                     To::Copy(to, dst)
                 }
                 _ => match fill_to(runs, steps[i]) {
-                    Some(FillTo::Slot(heap, index)) => To::Slot(heap, index),
+                    Some(FillTo::Slot(heap, id, index)) => To::Slot(heap, id, index),
                     Some(FillTo::Buffer(buffer)) => To::Buffer(buffer),
                     None => continue,
                 },
@@ -854,11 +856,12 @@ impl Host {
         let parts = if ops.len() < 256 { 1 } else { 8 };
         crate::land::each_under(parts, &|part| {
             for op in &ops {
-                if let To::Slot(heap, index) = &op.to
+                if let To::Slot(heap, id, index) = &op.to
                     && *index as usize / 4 % parts == part
                 {
-                    // (A heap that is gone: nothing can read the slot.)
-                    crate::descriptor::constant_slot(*heap, *index, &own.between, gpu + op.at, op.len as u32);
+                    // (A heap that is gone, or another one made where it
+                    // was: nothing of this submission can read the slot.)
+                    crate::descriptor::constant_slot(*heap, *id, *index, &own.between, gpu + op.at, op.len as u32);
                 }
             }
         });
