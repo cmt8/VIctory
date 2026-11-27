@@ -394,6 +394,16 @@ const BPERM32: &[u32] = &[
     0xBF81_0000, // s_endpgm
 ];
 
+/// Every thread stores its index: no wave operation, no lane read, no LDS (the
+/// same words for both console waves).
+const PLAIN: &[u32] = &[
+    0xBE85_0380, // s_mov_b32 s5, 0
+    0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+    0x3414_0084, // v_lshlrev_b32 v10, 4, v0
+    0xE070_1000, 0x8002_000A, // buffer_store_dword v0, v10, s[8:11], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
 /// The 16-bit float sum over the wave (`v_add_f16` in [`super::wave::WAVE_OR_V7_TO_S7`]'s
 /// steps) of 0x3C00 + 37 t, which the console adds as a tree of pairs, each addition
 /// rounded: every thread stores it.
@@ -504,6 +514,7 @@ fn console(name: &str, wave: u32, threads: u32) -> Vec<u32> {
                 o[0] = lane;
                 o[1] = (picked(base) & ((1u64 << lane) - 1)).count_ones();
             }
+            "plain" => o[0] = t,
             _ => unreachable!(),
         }
     }
@@ -515,8 +526,11 @@ fn console(name: &str, wave: u32, threads: u32) -> Vec<u32> {
 enum Form {
     /// For a host of 64-lane waves, as before (`VICTORY_COMPUTE_WAVE=0` on RADV).
     Host64,
-    /// For host waves of 32 on a host that also runs 64 (`VICTORY_COMPUTE_WAVE`).
+    /// For host waves of 32 on a host that also runs 64 (`VICTORY_COMPUTE_WAVE=32`).
     Waves32,
+    /// On such a host with `VICTORY_COMPUTE_WAVE` unset: a console wave64 program for
+    /// host waves of 64, which it declares; a console wave32 program as `Waves32`.
+    Console,
     /// For a host of at most 32 lanes (`VICTORY_HOST_WAVE=32`, NVIDIA's forms), which
     /// on RADV runs what declares no size in the driver's waves.
     Host32,
@@ -592,16 +606,19 @@ fn translated(
         version: (1, 0),
         parts: Vec::new(),
     };
-    let (host, mode) = match form {
-        Form::Host64 => (64, false),
-        Form::Waves32 => (64, true),
-        Form::Host32 => (32, false),
+    let (host, mode, console) = match form {
+        Form::Host64 => (64, false, false),
+        Form::Waves32 => (64, true, false),
+        Form::Console => (64, true, true),
+        Form::Host32 => (32, false, false),
     };
     let host_was = lower::TEST_HOST_WAVE.replace(Some(host));
     let mode_was = compute_wave::TEST.replace(Some(mode));
+    let console_was = compute_wave::TEST_CONSOLE.replace(console);
     let r = super::emit_sized(&c, &native, &p, &st, &io, &res);
     lower::TEST_HOST_WAVE.set(host_was);
     compute_wave::TEST.set(mode_was);
+    compute_wave::TEST_CONSOLE.set(console_was);
     let r = r?;
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut dxil = r.0.dxil.clone();
@@ -676,6 +693,8 @@ fn cases() -> Vec<(&'static str, &'static [u32], bool, &'static [u32], bool)> {
         ("ballot", BALLOT64, true, &[64, 96], true),
         ("mbcnt", MBCNT64, true, &[64, 96], true),
         ("sum", SUM64, true, &[64, 96], true),
+        // (a group of half a console wave too)
+        ("plain", PLAIN, true, &[32, 64, 96], false),
         ("first", FIRST32, false, G32, false),
         ("ballot", BALLOT32, false, G32, false),
         ("branch", BRANCH32, false, G32, false),
@@ -689,13 +708,14 @@ fn cases() -> Vec<(&'static str, &'static [u32], bool, &'static [u32], bool)> {
         ("ballot", BALLOT32, false, &[48, 64], true),
         ("mbcnt", MBCNT32, false, &[48, 64], true),
         ("sum", SUM32, false, &[48, 64], true),
+        ("plain", PLAIN, false, G32, false),
     ]
 }
 
 /// Every case through every form on the hardware device: one line each,
 /// with the declared wave and where the result differs from the console's.
 /// Asserted: the forms for a host of 64-lane waves and those of
-/// [`super::compute_wave_32`] give the console's results in every case but
+/// [`super::compute_wave_32`] (`=32`, and unset) give the console's results in every case but
 /// `branch`, which is lowered per lane in every form (`structure`: a branch
 /// on VCC is taken to test a value the same in every lane, which is what
 /// the console's compiler branches on that way); its lines show what a
@@ -715,7 +735,7 @@ fn the_wave_forms_on_the_card_give_the_consoles_results() {
         let wave = if wave64 { 64 } else { 32 };
         for &threads in groups {
             let want = console(name, wave, threads);
-            for form in [Form::Host64, Form::Waves32, Form::Host32] {
+            for form in [Form::Host64, Form::Waves32, Form::Console, Form::Host32] {
                 let shape = if flat { format!("8x{}", threads / 8) } else { format!("x{threads}") };
                 let label = format!("wave{wave} {name} {shape} {form:?}");
                 let asserted = form != Form::Host32 && name != "branch";
@@ -780,7 +800,7 @@ fn the_wave_forms_give_the_consoles_results_in_every_group_of_a_dispatch() {
         let words = adding(words);
         for &threads in groups {
             let want: Vec<u32> = console(name, wave, threads).iter().map(|v| v.wrapping_mul(GROUPS)).collect();
-            for form in [Form::Host64, Form::Waves32] {
+            for form in [Form::Host64, Form::Waves32, Form::Console] {
                 let shape = if flat { format!("8x{}", threads / 8) } else { format!("x{threads}") };
                 let label = format!("wave{wave} {name} {shape} {form:?} in {GROUPS} groups");
                 let (shader, declared) = match translated(&words, wave64, threads, flat, form) {
@@ -899,4 +919,70 @@ fn the_switch_can_leave_one_kind_of_program_as_before() {
     assert!(code(Form::Waves32, pin) == code(Form::Host64, None));
     assert!(code(Form::Waves32, forms) == code(Form::Waves32, None));
     assert!(code(Form::Waves32, forms) != code(Form::Host64, None));
+}
+
+/// A wave64 barrier only some threads reach, as [`BARRIER32`].
+const BARRIER64: &[u32] = &[
+    0xBE85_0380, // s_mov_b32 s5, 0
+    0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+    0x3414_0084, // v_lshlrev_b32 v10, 4, v0
+    0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+    0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+    0xBF88_0001, // s_cbranch_execz end
+    0xBF8A_0000, // s_barrier
+    0xBEFE_040C, // end: s_mov_b64 exec, s[12:13]
+    0xE070_1000, 0x8002_000A, // buffer_store_dword v0, v10, s[8:11], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
+/// `VICTORY_COMPUTE_WAVE` unset on a host of waves of 32 and 64 (no device needed): a
+/// console wave32 program declares 32 as with `=32` and `=pin`; a console wave64 program
+/// declares 64 whether or not it uses wave operations, whatever its group and whether or
+/// not the host leaves out a barrier of its, and its code is the one for a host of
+/// 64-lane waves: none of the forms for host waves of 32. The wave is the whole
+/// difference from `=pin`, which declares 64 only where the program did before.
+#[test]
+fn unset_the_switch_declares_the_consoles_wave_and_uses_no_form_for_waves_of_32() {
+    let made = |words: &[u32], wave64: bool, threads: u32, form: Form, only: Option<bool>| {
+        let was = compute_wave::TEST_ONLY.replace(only);
+        let r = translated(words, wave64, threads, false, form);
+        compute_wave::TEST_ONLY.set(was);
+        r.unwrap_or_else(|e| panic!("{form:?}: {e}"))
+    };
+    let declared = |words: &[u32], wave64: bool, threads: u32, form: Form| made(words, wave64, threads, form, None).1;
+    let pin = Some(false);
+    // console wave32 programs
+    assert_eq!(declared(BRANCH32, false, 64, Form::Console), Some(32));
+    assert_eq!(declared(PLAIN, false, 64, Form::Console), Some(32));
+    assert_eq!(declared(FIRST32, false, 64, Form::Console), Some(32));
+    assert_eq!(declared(BARRIER32, false, 64, Form::Console), None);
+    for words in [BRANCH32, PLAIN, FIRST32, BARRIER32, BALLOT32] {
+        assert!(
+            made(words, false, 64, Form::Console, None).0.dxil == made(words, false, 64, Form::Waves32, None).0.dxil,
+            "a console wave32 program is what it is with =32"
+        );
+    }
+    // console wave64 programs with wave operations: 64, and the code of a host of 64-lane waves
+    for words in [BALLOT64, FIRST64, SUM64, MBCNT64, LDS64] {
+        let threads = if words == LDS64 { 64 } else { 128 };
+        let (console, wave) = made(words, true, threads, Form::Console, None);
+        assert_eq!(wave, Some(64));
+        assert_eq!(declared(words, true, threads, Form::Host64), Some(64));
+        assert!(console.dxil == made(words, true, threads, Form::Host64, None).0.dxil, "the code for a host of 64-lane waves");
+        assert!(console.dxil == made(words, true, threads, Form::Waves32, pin).0.dxil, "and of =pin");
+        assert!(console.dxil != made(words, true, threads, Form::Waves32, None).0.dxil, "not a form for waves of 32");
+    }
+    // ... without any: 64 too, where `=pin` and a host of 64-lane waves leave the size to
+    // the driver (in a group of several console waves; these programs have LDS, and with
+    // LDS a group of one console wave declared it before)
+    for (words, threads) in [(BRANCH64, 128), (PLAIN, 128), (PLAIN, 96), (BARRIER64, 128)] {
+        assert_eq!(declared(words, true, threads, Form::Console), Some(64), "{threads}");
+        assert_eq!(declared(words, true, threads, Form::Host64), None, "{threads}");
+        assert_eq!(made(words, true, threads, Form::Waves32, pin).1, None, "{threads}");
+    }
+    for threads in [64, 32, 8] {
+        assert_eq!(declared(PLAIN, true, threads, Form::Console), Some(64), "{threads}");
+    }
+    // `=forms` is what it was (a test's choice of the switch unset is made with the form)
+    assert_eq!(made(BALLOT64, true, 128, Form::Waves32, Some(true)).1, Some(32));
 }

@@ -1133,12 +1133,15 @@ fn create() -> windows::core::Result<Host> {
             victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
             victory_shader::emit::set_host_min_wave(o1.WaveLaneCountMin);
             // `VICTORY_COMPUTE_WAVE` (on; `=0` or `=host`: off): on a host of waves of 32
-            // and 64 (RADV) compute programs are translated for and declare waves of 32
-            // (`victory_shader::emit::compute_wave_32`).
+            // and 64 (RADV) compute programs declare the wave they are written for
+            // (`victory_shader::emit::compute_wave_32`): unset, the console's own, a
+            // console wave64 program in host waves of 64 (`wave64_as_console`); `=32`,
+            // the forms for host waves of 32.
             tracing::info!(
                 min = o1.WaveLaneCountMin,
                 max = o1.WaveLaneCountMax,
                 compute_wave_32 = victory_shader::emit::compute_wave_32(),
+                wave64_as_console = victory_shader::emit::wave64_as_console(),
                 "host wave lanes"
             );
             // (RDNA has waves of 32 and 64, the vendor's older cards of 64 alone.)

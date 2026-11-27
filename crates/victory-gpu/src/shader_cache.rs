@@ -162,16 +162,22 @@ fn build() -> [u8; 32] {
     for value in victory_shader::emit::host_settings() {
         hash.update(&value.to_le_bytes());
     }
-    // Whether compute programs take waves of 32 (`VICTORY_COMPUTE_WAVE`,
+    // Whether compute programs declare their waves (`VICTORY_COMPUTE_WAVE`,
     // keyed above too), which depends on the host's narrowest wave as well.
+    // (What the switch means unset for console wave64 programs is keyed per
+    // program: `named`.)
     hash.update(&victory_shader::emit::host_min_wave_set().to_le_bytes());
     hash.update(&[u8::from(victory_shader::emit::compute_wave_32())]);
     *hash.finalize().as_bytes()
 }
 
-/// What tells one set of translations from another ([`build`]).
+/// What tells one set of translations from another: [`build`], and whether
+/// console wave64 compute programs are translated for host waves of 64 that
+/// they declare (`VICTORY_COMPUTE_WAVE` unset on a host of waves of 32 and
+/// 64, `victory_shader::emit::wave64_as_console`). That is not in [`build`],
+/// which every other program's translation stays keyed by ([`named`]).
 pub(crate) fn translation() -> [u8; 32] {
-    build()
+    wave64_key(build(), victory_shader::emit::wave64_as_console())
 }
 
 /// Puts the translation of `container` into the cache before any title asks
@@ -208,10 +214,33 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
 /// (`victory_shader::emit::named`) and so kept apart from the translation a
 /// run without the variable makes of it. Every other program keeps its key,
 /// and its cached translation.
+///
+/// A console wave64 compute program is keyed apart too where it is
+/// translated for host waves of 64 that it declares
+/// (`victory_shader::emit::wave64_keyed_apart`, `VICTORY_COMPUTE_WAVE` unset
+/// on a host of waves of 32 and 64): the switch unset used to mean a form
+/// for host waves of 32 for it, and that translation sits in the cache under
+/// [`build`]. The other programs' translations are the same as then, and
+/// keep their key. (One `VICTORY_WAVE_KEEP` lists is translated as before in
+/// both cases.)
 fn named(container: &[u8]) -> (String, [u8; 32]) {
     let name = blake3::hash(container).to_hex()[..16].to_owned();
-    let build = kept_key(build(), victory_shader::emit::wave_kept(&name));
+    let kept = victory_shader::emit::wave_kept(&name);
+    let build = kept_key(build(), kept);
+    let build = wave64_key(build, !kept && victory_shader::emit::wave64_keyed_apart(container));
     (name, build)
+}
+
+/// `build`, or the key beside it for a console wave64 compute program
+/// translated for host waves of 64 that it declares.
+fn wave64_key(build: [u8; 32], console: bool) -> [u8; 32] {
+    if !console {
+        return build;
+    }
+    let mut hash = blake3::Hasher::new();
+    hash.update(&build);
+    hash.update(b"VICTORY_COMPUTE_WAVE=console: wave64 compute programs declare 64");
+    *hash.finalize().as_bytes()
 }
 
 /// `build`, or the key beside it for a program translated as before.
@@ -558,6 +587,17 @@ mod tests {
         assert_ne!(kept_key(build, true), build);
         assert_eq!(kept_key(build, true), kept_key(build, true));
         assert_ne!(kept_key(build, true), kept_key([8u8; 32], true));
+    }
+
+    #[test]
+    fn a_wave64_program_in_console_waves_is_keyed_apart_and_no_other() {
+        let build = [7u8; 32];
+        assert_eq!(wave64_key(build, false), build);
+        assert_ne!(wave64_key(build, true), build);
+        assert_eq!(wave64_key(build, true), wave64_key(build, true));
+        assert_ne!(wave64_key(build, true), wave64_key([8u8; 32], true));
+        // (nor is it the key of a program `VICTORY_WAVE_KEEP` lists)
+        assert_ne!(wave64_key(build, true), kept_key(build, true));
     }
 
     #[test]

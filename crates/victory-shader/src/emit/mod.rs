@@ -123,7 +123,9 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use compute_wave::{compute_wave_32, host_min_wave_set, named, set_host_min_wave, wave_kept};
+pub use compute_wave::{
+    compute_wave_32, host_min_wave_set, named, set_host_min_wave, wave64_as_console, wave64_keyed_apart, wave_kept,
+};
 pub use lower::{host_settings, set_host_max_wave, set_host_rdna, set_thread_max_wave};
 pub use rect::rect_list_gs;
 pub use shader::{
@@ -372,6 +374,7 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
     out.extend_from_slice(&host_min_wave_set().to_le_bytes());
     out.push(u8::from(compute_wave_32()));
+    out.push(u8::from(wave64_as_console()));
     out.extend_from_slice(&lower::host_rdna().to_le_bytes());
     out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());
     out.extend_from_slice(&shader::raw_views().to_le_bytes());
@@ -566,9 +569,12 @@ pub fn emit(
 }
 
 /// [`emit`], with the wave size the program declares. With
-/// [`compute_wave_32`] a console wave64 compute program that the 32-lane
-/// forms take only approximately, or not at all, is translated as before
-/// (in waves of 64 where it declares a size).
+/// [`compute_wave_32`] a console wave64 compute program is translated for
+/// host waves of 64 and declares them ([`wave64_as_console`], the switch
+/// unset); with `VICTORY_COMPUTE_WAVE=32` or `=forms` it takes a form for
+/// host waves of 32, and one that those forms take only approximately, or
+/// not at all, is translated as before (in waves of 64 where it declares a
+/// size).
 pub(crate) fn emit_sized(
     c: &Container,
     native: &NativeProgram,
@@ -594,6 +600,12 @@ pub(crate) fn emit_sized(
             );
         }
     };
+    if waves && native.wave64 && compute_wave::wave64_as_console() {
+        // (the switch unset: a host wave is a console wave, declared)
+        let own = compute_wave::in_console_waves(|| emit_forms(c, native, p, st, io, res));
+        say("for host waves of 64, its console wave declared", &own);
+        return own;
+    }
     if waves && !compute_wave::takes(native.wave64) {
         // (`VICTORY_COMPUTE_WAVE=pin` or `=forms`: this kind is left as it was)
         let before = compute_wave::without(|| emit_forms(c, native, p, st, io, res));
