@@ -3036,6 +3036,9 @@ impl State {
             }
             return;
         }
+        if crate::twinwhy::on(true) {
+            self.twin_why(p, true);
+        }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         #[cfg(feature = "diagnostics")]
@@ -3459,6 +3462,36 @@ impl State {
         }
     }
 
+    /// `VICTORY_TWIN_WHY` ([`crate::twinwhy`]): where each buffer view the
+    /// tables of `p`'s programs hold begins in its host copy.
+    fn twin_why(&self, p: &HostPipeline, compute: bool) {
+        for stage in &p.stages {
+            for u in &stage.translated().used {
+                let kind = match u.kind {
+                    ResourceType::Srv => 'S',
+                    ResourceType::Uav => 'U',
+                    _ => continue,
+                };
+                let (RootType::Table, Some(Root::Table(table))) = (u.root, self.roots_ref(compute).get(usize::from(u.slot))) else {
+                    continue;
+                };
+                let handle = table + u64::from(u.table_offset_dwords) * 4;
+                if let Some(start) = crate::descriptor::view(handle).as_ref().and_then(crate::descriptor::host::start_in_copy) {
+                    crate::twinwhy::bound((stage.shader.hash.clone(), kind, u.slot, u.table_offset_dwords, u.stride), start);
+                }
+            }
+        }
+    }
+
+    /// [`Self::twin_why`] of a draw's pipeline, where draws are asked about.
+    fn twin_why_draw(&self) {
+        if crate::twinwhy::on(false)
+            && let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
+        {
+            self.twin_why(p, false);
+        }
+    }
+
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
@@ -3470,6 +3503,7 @@ impl State {
             && self.prepare_for(list, false, true)
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
+                    self.twin_why_draw();
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     self.mesh_scissor(list, true);
@@ -4068,6 +4102,7 @@ impl State {
             } else {
                 (vertices, first)
             };
+            self.twin_why_draw();
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
             // SAFETY: an open list with everything set.
@@ -4174,6 +4209,7 @@ impl State {
         }
         let ran = !lost && self.prepare(list, true);
         if ran {
+            self.twin_why_draw();
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
             // SAFETY: an open list with everything set.

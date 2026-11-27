@@ -4770,6 +4770,15 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     ))
 }
 
+/// Where buffer view `view` begins in the host copy its slot shows, in
+/// bytes; `None` for other views and for one whose copy is not there. Its
+/// raw twin is a raw view from there on ([`twin_window`]), which a host
+/// makes on 16 bytes only, or on any dword ([`twin_dwords`]).
+pub(crate) fn start_in_copy(view: &View) -> Option<u64> {
+    let (copy, address, _) = buffer_copy(view)?;
+    Some(copy.offset_in(address).map_or(0, |_| copy.offset(address)))
+}
+
 /// The host resource a slot made by [`make`] views, if any.
 type Kept = Option<ID3D12Resource>;
 
@@ -4832,9 +4841,10 @@ fn buffer_view_ok(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw:
 }
 
 /// Raw twins ([`raw_twins`]) made since the last frame line, and those of them that
-/// do not begin on 16 bytes, as a raw view must ([`move_raw`]), and those of
-/// these that could not be moved there (null).
-pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+/// do not begin on 16 bytes, as a raw view must ([`move_raw`]), those of
+/// these that could not be moved there (null), and those made on their own
+/// first dword instead ([`twin_dwords`]).
+pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// Moves the raw view at `at`, a slot of our heaps the card does not see,
 /// which shows `bytes` from `start` on (GPU address), `by` bytes on: for a
@@ -4893,6 +4903,121 @@ fn twin_window(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw: bo
         TWINS[1].fetch_add(1, Relaxed);
     }
     Some((from / 4, dwords, (start - from) as u32))
+}
+
+/// Whether the raw twin of a view that begins on a dword between two
+/// multiples of 16 is made where the view begins. Windows makes no raw view
+/// there (`D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT`; the device is removed for one),
+/// so such a twin is made from the 16 bytes below and its descriptor moved on
+/// where it is AMD's own ([`move_raw`]), and is a null view anywhere else:
+/// under vkd3d-proton too, where what a descriptor handle points at is no
+/// driver's descriptor. There every such twin read zeros and dropped its
+/// writes: 200 to 600 views in every frame of the title's world (runs c1,
+/// g1 and i1 on RADV), each a buffer some shader reads as raw bytes through
+/// a table or picks by index, whose bytes do not happen to begin on 16.
+///
+/// vkd3d-proton makes a raw view at any dword: the view is its buffer's
+/// address plus the first element's bytes, and its size, with no alignment
+/// asked for (libs/vkd3d/resource.c,
+/// `vkd3d_get_metadata_buffer_view_for_resource_heap` and `_legacy`), bound
+/// as a storage buffer at that offset where the device takes storage buffers
+/// on 4 bytes and as a texel buffer of dwords where it does not
+/// (`d3d12_resource_desc_supports_heap_raw_ssbo`). So on that host
+/// ([`crate::host::vkd3d_proton`]) the twin is made on the view's own first
+/// dword. A view that begins off a dword still has a null twin.
+/// `VICTORY_TWIN_DWORDS=0`: null there too, as before.
+fn twin_dwords() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TWIN_DWORDS_HERE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let asked = std::env::var_os("VICTORY_TWIN_DWORDS").is_none_or(|v| v != "0");
+        let on = asked && crate::host::vkd3d_proton();
+        tracing::info!(
+            on,
+            asked,
+            "raw twins of buffer views that begin on a dword off 16 bytes are made there on a host that takes raw views on any dword (vkd3d-proton; VICTORY_TWIN_DWORDS=0: null views, as before)"
+        );
+        on
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// For a test's thread alone: [`twin_dwords`].
+    static TWIN_DWORDS_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Makes at `twin` the raw twin of a view of `buffer`: a raw view (an
+/// unordered access one if `unordered`) of the bytes `window` names
+/// ([`twin_window`]: first dword, dwords, and the bytes past that dword the
+/// view begins), or a null view where none can be made. Whether it shows the
+/// view's bytes.
+fn make_twin(
+    buffer: &ID3D12Resource,
+    unordered: bool,
+    window: Option<(u64, u32, u32)>,
+    twin: D3D12_CPU_DESCRIPTOR_HANDLE,
+) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (Some(host), Some((first, count, by))) = (host(), window) else {
+        null_buffer_view(twin);
+        return false;
+    };
+    // Where the view begins, on a host that makes a raw view there
+    // ([`twin_dwords`]): nothing is left to move then.
+    let on_dword = by > 0 && by.is_multiple_of(4) && count > by / 4 && twin_dwords();
+    let (first, count, by) = if on_dword {
+        (first + u64::from(by / 4), count - by / 4, 0)
+    } else {
+        (first, count, by)
+    };
+    // SAFETY: a live buffer and a slot of our heap; the range lies in the
+    // buffer ([`twin_window`]).
+    let start = unsafe {
+        if unordered {
+            let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_TYPELESS,
+                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_UAV {
+                        FirstElement: first,
+                        NumElements: count,
+                        StructureByteStride: 0,
+                        CounterOffsetInBytes: 0,
+                        Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                    },
+                },
+            };
+            host.device.CreateUnorderedAccessView(buffer, None::<&ID3D12Resource>, Some(&desc), twin);
+        } else {
+            let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_TYPELESS,
+                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_SRV {
+                        FirstElement: first,
+                        NumElements: count,
+                        StructureByteStride: 0,
+                        Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                    },
+                },
+            };
+            host.device.CreateShaderResourceView(buffer, Some(&desc), twin);
+        }
+        buffer.GetGPUVirtualAddress() + first * 4
+    };
+    if on_dword {
+        TWINS[3].fetch_add(1, Relaxed);
+    } else if by > 0 && !(staged(false, 1).is_some_and(|s| s.ptr == twin.ptr) && move_raw(twin, start, count.saturating_mul(4), by)) {
+        TWINS[2].fetch_add(1, Relaxed);
+        null_buffer_view(twin);
+        return false;
+    }
+    true
 }
 
 fn buffer_srv(
@@ -4975,26 +5100,9 @@ fn buffer_srv(
     };
     if let Some(twin) = twin {
         let window = twin_window(desc.Format, first, count, stride, raw, width);
-        if let Some((first, count, by)) = window {
-            desc.Format = DXGI_FORMAT_R32_TYPELESS;
-            desc.Anonymous.Buffer = D3D12_BUFFER_SRV {
-                FirstElement: first,
-                NumElements: count,
-                StructureByteStride: 0,
-                Flags: D3D12_BUFFER_SRV_FLAG_RAW,
-            };
-            // SAFETY: a live buffer and a slot of our heap.
-            let start = unsafe {
-                host.device
-                    .CreateShaderResourceView(&shadow.buffer, Some(&desc), twin);
-                shadow.buffer.GetGPUVirtualAddress() + first * 4
-            };
-            if by > 0 && !(staged(false, 1).is_some_and(|s| s.ptr == twin.ptr) && move_raw(twin, start, count.saturating_mul(4), by)) {
-                TWINS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                null_buffer_view(twin);
-            }
-        } else {
-            null_buffer_view(twin);
+        let shown = make_twin(&shadow.buffer, false, window, twin);
+        if let Some((_, _, by)) = window.filter(|w| w.2 > 0 && crate::twinwhy::on(true)) {
+            crate::twinwhy::twin(false, kind, (start % 16) as u8, by as u8, shown);
         }
     }
     Some(Some(shadow.buffer.clone()))
@@ -5101,27 +5209,9 @@ fn buffer_uav(
     };
     if let Some(twin) = twin {
         let window = twin_window(desc.Format, first, count, stride, raw, width);
-        if let Some((first, count, by)) = window {
-            desc.Format = DXGI_FORMAT_R32_TYPELESS;
-            desc.Anonymous.Buffer = D3D12_BUFFER_UAV {
-                FirstElement: first,
-                NumElements: count,
-                StructureByteStride: 0,
-                CounterOffsetInBytes: 0,
-                Flags: D3D12_BUFFER_UAV_FLAG_RAW,
-            };
-            // SAFETY: a live buffer and a slot of our heap.
-            let start = unsafe {
-                host.device
-                    .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), twin);
-                shadow.buffer.GetGPUVirtualAddress() + first * 4
-            };
-            if by > 0 && !(staged(false, 1).is_some_and(|s| s.ptr == twin.ptr) && move_raw(twin, start, count.saturating_mul(4), by)) {
-                TWINS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                null_buffer_view(twin);
-            }
-        } else {
-            null_buffer_view(twin);
+        let shown = make_twin(&shadow.buffer, true, window, twin);
+        if let Some((_, _, by)) = window.filter(|w| w.2 > 0 && crate::twinwhy::on(true)) {
+            crate::twinwhy::twin(true, kind, (start % 16) as u8, by as u8, shown);
         }
     }
     Some(Some(shadow.buffer.clone()))
@@ -7402,6 +7492,214 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_eq!(twin_window(none, 1, 3, 24, false, 4096), Some((4, 20, 8)));
         assert_eq!(twin_window(u32s, 1, 10, 0, false, 4096), Some((0, 11, 4)));
         assert_eq!(twin_window(u32s, 1, 10, 0, false, 4), None);
+    }
+
+    /// The raw twin of a view that begins on a dword between two multiples of
+    /// 16, read and written by a shader on the card: it shows the view's own
+    /// bytes or it is a null view (zeros read, nothing written), never other
+    /// bytes of the buffer. Under vkd3d-proton it shows the view's bytes
+    /// ([`twin_dwords`]); with `VICTORY_TWIN_DWORDS=0` it is what it was
+    /// there, which the test prints: a null view, as no descriptor of that
+    /// host is moved ([`move_raw`]).
+    #[test]
+    fn a_raw_twin_off_16_bytes_shows_its_views_bytes_or_none() {
+        const SOURCE: &str = r#"
+ByteAddressBuffer twin : register(t0);
+RWByteAddressBuffer through : register(u0);
+RWByteAddressBuffer seen : register(u1);
+[numthreads(16, 1, 1)]
+void main(uint3 t : SV_DispatchThreadID) {
+    seen.Store(4 * t.x, twin.Load(4 * t.x));
+    if (t.x < 4) through.Store(4 * t.x, 0xAB000000 + t.x);
+}
+"#;
+        const DWORDS: usize = 1024;
+        const BYTES: u64 = DWORDS as u64 * 4;
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let code = crate::host::compile(SOURCE, windows::core::s!("main"), windows::core::s!("cs_5_1"))
+            .expect("the test's shader");
+        let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        // SAFETY: plain creation calls; the ranges outlive the call that reads them.
+        let (heap, root, pso, step) = unsafe {
+            let heap: ID3D12DescriptorHeap = host
+                .device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: kind,
+                    NumDescriptors: 3,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .expect("a view heap");
+            let range = |kind, count| D3D12_DESCRIPTOR_RANGE1 {
+                RangeType: kind,
+                NumDescriptors: count,
+                BaseShaderRegister: 0,
+                RegisterSpace: 0,
+                Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+                OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
+            };
+            let ranges = [range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1), range(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2)];
+            let table = D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                        NumDescriptorRanges: ranges.len() as u32,
+                        pDescriptorRanges: ranges.as_ptr(),
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            };
+            let root: ID3D12RootSignature =
+                crate::host::root_signature(&host.device, &[table], "twins test").expect("a root signature");
+            let pso: ID3D12PipelineState = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.as_ptr().cast(),
+                        BytecodeLength: code.len(),
+                    },
+                    ..Default::default()
+                })
+                .expect("a pipeline");
+            let step = host.device.GetDescriptorHandleIncrementSize(kind) as usize;
+            (heap, root, pso, step)
+        };
+        // SAFETY: a plain query.
+        let slot = |i: usize| D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: unsafe { heap.GetCPUDescriptorHandleForHeapStart() }.ptr + i * step,
+        };
+        // A twin made as the heaps' are: beside the heap where this thread
+        // has a slot there, and copied in.
+        let twin_in = |to: usize, buffer: &ID3D12Resource, unordered: bool, window| {
+            let at = staged(false, 1).unwrap_or_else(|| slot(to));
+            let shown = make_twin(buffer, unordered, window, at);
+            if at.ptr != slot(to).ptr {
+                // SAFETY: a slot of the heap above and one of this thread's.
+                unsafe { host.device.CopyDescriptorsSimple(1, slot(to), at, kind) };
+            }
+            shown
+        };
+        // What the shader saw through the twins of a view with these fields:
+        // whether each twin shows the view, the 16 dwords read, and the
+        // buffer written through.
+        let run = |format: DXGI_FORMAT, first: u64, count: u32, stride: u32| {
+            let (from, filled) = host.shared_buffer(BYTES).expect("a buffer");
+            let (through, written) = host.shared_buffer(BYTES).expect("a buffer");
+            let (seen, result) = host.shared_buffer(BYTES).expect("a buffer");
+            // SAFETY: the three mappings hold `BYTES` bytes each; views of
+            // live buffers in slots of the heap above; an open list.
+            unsafe {
+                let filled = std::slice::from_raw_parts_mut(filled.cast::<u32>(), DWORDS);
+                for (i, dword) in filled.iter_mut().enumerate() {
+                    *dword = 0x5000_0000 + i as u32;
+                }
+                std::slice::from_raw_parts_mut(written.cast::<u32>(), DWORDS).fill(0xEEEE_EEEE);
+                std::slice::from_raw_parts_mut(result.cast::<u32>(), DWORDS).fill(0xDDDD_DDDD);
+                let read = twin_in(0, &from, false, twin_window(format, first, count, stride, false, BYTES));
+                let write = twin_in(1, &through, true, twin_window(format, first, count, stride, false, BYTES));
+                let all = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: DXGI_FORMAT_R32_TYPELESS,
+                    ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                    Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_UAV {
+                            NumElements: DWORDS as u32,
+                            Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                            ..Default::default()
+                        },
+                    },
+                };
+                if !write {
+                    // (The heaps' null twin is a null shader view, which a
+                    // shader that writes through it is not shown here: a
+                    // host may mind the kind. A null view to write through.)
+                    host.device.CreateUnorderedAccessView(None::<&ID3D12Resource>, None::<&ID3D12Resource>, Some(&all), slot(1));
+                }
+                host.device.CreateUnorderedAccessView(&seen, None::<&ID3D12Resource>, Some(&all), slot(2));
+                let list = host.new_list().expect("a host list");
+                list.list.SetDescriptorHeaps(&[Some(heap.clone())]);
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetPipelineState(&pso);
+                list.list.SetComputeRootDescriptorTable(0, heap.GetGPUDescriptorHandleForHeapStart());
+                list.list.Dispatch(1, 1, 1);
+                list.close();
+                host.execute(&[&list]);
+                assert!(host.device.GetDeviceRemovedReason().is_ok(), "the device, after a twin of {format:?} from {first}");
+                let seen: Vec<u32> = std::slice::from_raw_parts(result.cast::<u32>(), 16).to_vec();
+                let written: Vec<u32> = std::slice::from_raw_parts(written.cast::<u32>(), DWORDS).to_vec();
+                (read, write, seen, written)
+            }
+        };
+        let (u16s, u32s, none) = (DXGI_FORMAT(57), DXGI_FORMAT(42), DXGI_FORMAT_UNKNOWN);
+        // (format, first element, elements, stride): the bytes they begin at.
+        let views = [
+            (u32s, 4u64, 10u32, 0u32), // 16: on 16 bytes
+            (u32s, 1, 10, 0),          // 4
+            (u32s, 2, 10, 0),          // 8
+            (u32s, 3, 10, 0),          // 12
+            (none, 1, 3, 12),          // 12, structured
+            (none, 3, 2, 24),          // 72 = 64 + 8, structured
+            (u16s, 3, 8, 0),           // 6: off a dword
+        ];
+        let vkd3d = crate::host::vkd3d_proton();
+        // Made on its own dword only where the host is known to take that
+        // (elsewhere it is not tried: the device is removed for such a view).
+        let modes: &[bool] = if vkd3d { &[false, true] } else { &[false] };
+        for &on in modes {
+            TWIN_DWORDS_HERE.set(Some(on));
+            for &(format, first, count, stride) in &views {
+                let element = if stride > 0 { u64::from(stride) } else { crate::resource::element(format.0 as u32).unwrap().0 };
+                let (start, bytes) = (first * element, u64::from(count) * element);
+                let (read, write, seen, written) = run(format, first, count, stride);
+                eprintln!(
+                    "a twin of a view that begins at byte {start} ({} past 16), made on its own dword {on} (vkd3d-proton {vkd3d}): read {}, written {}",
+                    start % 16,
+                    if read { "the view's bytes" } else { "null" },
+                    if write { "the view's bytes" } else { "null" },
+                );
+                let what = format!("a view at byte {start}, dword twins {on}");
+                assert_eq!(read, write, "{what}: both twins alike");
+                if start.is_multiple_of(16) {
+                    assert!(read, "{what}: on 16 bytes");
+                }
+                if on && start.is_multiple_of(4) {
+                    assert!(read, "{what}: on a dword, where this host makes raw views");
+                }
+                if !start.is_multiple_of(4) {
+                    assert!(!(vkd3d && read), "{what}: off a dword");
+                    if read {
+                        // (A descriptor of AMD's own, moved on by bytes: the
+                        // dwords it shows are not the buffer's.)
+                        continue;
+                    }
+                }
+                let dwords = (bytes.div_ceil(4) as usize).min(16);
+                let at = (start / 4) as usize;
+                if read {
+                    for (i, &dword) in seen.iter().enumerate().take(dwords) {
+                        assert_eq!(dword, 0x5000_0000 + (at + i) as u32, "{what}: dword {i} read through the twin");
+                    }
+                    for (i, &dword) in written.iter().enumerate() {
+                        let expected = if (at..at + 4).contains(&i) { 0xAB00_0000 + (i - at) as u32 } else { 0xEEEE_EEEE };
+                        assert_eq!(dword, expected, "{what}: dword {i} of the buffer written through the twin");
+                    }
+                } else {
+                    assert!(seen.iter().all(|&dword| dword == 0), "{what}: a null twin reads zeros, not {seen:x?}");
+                    assert!(written.iter().all(|&dword| dword == 0xEEEE_EEEE), "{what}: nothing is written through a null twin");
+                }
+            }
+        }
+        TWIN_DWORDS_HERE.set(None);
+        // As the heaps make it, with nothing set: under vkd3d-proton a view
+        // that begins 4 bytes past 16 has a twin that shows it (it was a
+        // null view there, as it is with `VICTORY_TWIN_DWORDS=0`).
+        if vkd3d && std::env::var_os("VICTORY_TWIN_DWORDS").is_none() {
+            let (read, write, seen, _) = run(u32s, 1, 10, 0);
+            assert!(read && write, "a view 4 bytes past 16 under vkd3d-proton: its twin shows it");
+            assert_eq!(seen[0], 0x5000_0001, "its first dword");
+        }
     }
 
     /// What a slot is made as is made beside the heap and copied in whole: the
