@@ -2607,19 +2607,92 @@ impl Landed {
 
     /// Whether `page` was noted in a frame from `since` on, up to `now`.
     fn since(&self, page: usize, since: u64, now: u64) -> bool {
-        let Some(place) = self.0.get(page / Landed::PAGES) else {
-            return false;
-        };
+        self.at(page).is_some_and(|at| Landed::within(at.load(std::sync::atomic::Ordering::Relaxed), since, now))
+    }
+
+    /// As [`Landed::since`], and if so the note is taken away.
+    fn take(&self, page: usize, since: u64, now: u64) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.at(page).is_some_and(|at| Landed::within(at.load(Relaxed), since, now) && at.swap(0, Relaxed) != 0)
+    }
+
+    /// The note of `page`, if its piece was ever made.
+    fn at(&self, page: usize) -> Option<&std::sync::atomic::AtomicU32> {
+        let place = self.0.get(page / Landed::PAGES)?;
         // SAFETY: null, or a piece, which is never freed.
-        let Some(piece) = (unsafe { place.load(std::sync::atomic::Ordering::Acquire).as_ref() }) else {
-            return false;
-        };
-        let stamp = piece[page % Landed::PAGES].load(std::sync::atomic::Ordering::Relaxed);
+        let piece = unsafe { place.load(std::sync::atomic::Ordering::Acquire).as_ref() }?;
+        Some(&piece[page % Landed::PAGES])
+    }
+
+    fn within(stamp: u32, since: u64, now: u64) -> bool {
         stamp != 0 && u64::from(Landed::stamp(now).wrapping_sub(stamp) & 0x7fff_ffff) <= now.saturating_sub(since)
     }
 }
 
 static LANDED: Landed = Landed([const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; Landed::PIECES]);
+
+/// The pages of small reads that went on as the title's bytes while flights
+/// in the air were declared to write there ([`taken_as_titles`]), and the
+/// frame it last was.
+static GUESSED: Landed = Landed([const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; Landed::PIECES]);
+
+/// Whether any read ever was taken so: landings look at [`GUESSED`] only
+/// then.
+static GUESSING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Since the last frame-rate line: looks that took a read as the title's,
+/// and pages of them that a shader's write then landed in.
+static GUESSES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// A read of `[at, at + len)` goes on as the title's bytes although flights
+/// in the air are declared to write there (`VICTORY_FILL_TITLE`: no shader's
+/// write went into its pages lately, [`landed_lately`]). Noted, so that a
+/// landing that does put one there within a frame is counted
+/// ([`taken_as_titles_stats`]).
+pub(crate) fn taken_as_titles(at: usize, len: usize) {
+    guessed(at, len, crate::frame::current());
+}
+
+fn guessed(at: usize, len: usize, frame: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !GUESSING.load(Relaxed) {
+        GUESSING.store(true, Relaxed);
+    }
+    (at / KERNEL_PAGE..=(at + len.max(1) - 1) / KERNEL_PAGE).for_each(|page| GUESSED.note(page, frame));
+    GUESSES[0].fetch_add(1, Relaxed);
+}
+
+/// A shader's write lands in `page` (of 4 KiB, by number) in `frame`.
+///
+/// If a read took the page as the title's in this frame or the one before,
+/// that is counted, once: the read came before the bytes it should have
+/// had, unless the flight that wrote them was submitted after it, or the
+/// submission waited for another reason before it read (neither is told
+/// apart here: the count is the most that went wrong). The page is noted as
+/// landed in by this, so reads of it wait again for 600 frames.
+fn landed_in(page: usize, frame: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    LANDED.note(page, frame);
+    if GUESSING.load(Relaxed) && GUESSED.take(page, frame.saturating_sub(1), frame) {
+        GUESSES[1].fetch_add(1, Relaxed);
+        static WARNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if WARNED.fetch_add(1, Relaxed) < 16 {
+            tracing::warn!(
+                "a shader's write landed in a page that a small read took as the title's within a frame before \
+                 (VICTORY_FILL_TITLE): {:#x}, frame {frame}; the frame-rate line counts them",
+                page * KERNEL_PAGE
+            );
+        }
+    }
+}
+
+/// For the frame-rate line, since the last: looks that took a small read as
+/// the title's ([`taken_as_titles`]; a read is looked at several times), and
+/// pages of them a shader's write landed in within a frame.
+pub(crate) fn taken_as_titles_stats() -> [u64; 2] {
+    use std::sync::atomic::Ordering::Relaxed;
+    [GUESSES[0].swap(0, Relaxed), GUESSES[1].swap(0, Relaxed)]
+}
 
 /// A page's number, spread.
 #[derive(Default)]
@@ -2647,12 +2720,12 @@ pub(crate) fn landing(at: usize, len: usize) {
     {
         let frame = crate::frame::current();
         let (first, last) = (at / KERNEL_PAGE, (at + len.max(1) - 1) / KERNEL_PAGE);
-        (first..=last).for_each(|page| LANDED.note(page, frame));
+        (first..=last).for_each(|page| landed_in(page, frame));
         for (block, others) in elsewhere(at, len) {
             let block = block / KERNEL_PAGE;
             let here = first.max(block)..=last.min(block + BLOCK / KERNEL_PAGE - 1);
             for other in others {
-                here.clone().for_each(|page| LANDED.note(page - block + other / KERNEL_PAGE, frame));
+                here.clone().for_each(|page| landed_in(page - block + other / KERNEL_PAGE, frame));
             }
         }
     }
@@ -2686,12 +2759,12 @@ pub(crate) fn landed_beside(pages: &[usize], spans: &[(usize, usize)]) -> (u64, 
     {
         let frame = crate::frame::current();
         for &page in pages {
-            LANDED.note(page, frame);
+            landed_in(page, frame);
         }
         for (block, others) in &elsewhere {
             let first = block / KERNEL_PAGE;
             for &page in pages.iter().filter(|&&page| (first..first + BLOCK / KERNEL_PAGE).contains(&page)) {
-                others.iter().for_each(|other| LANDED.note(page - first + other / KERNEL_PAGE, frame));
+                others.iter().for_each(|other| landed_in(page - first + other / KERNEL_PAGE, frame));
             }
         }
     }
@@ -5723,6 +5796,34 @@ mod tests {
         assert!(told.iter().any(|w| w.0 == two / PAGE && w.1 > before), "{told:?} after {before}");
         assert!(landed_lately(two + 3 * 4096, 16, 1) && !landed_lately(two + 4 * 4096, 16, 1));
         drop_views(section, &[one, two], BLOCK);
+    }
+
+    /// A shader's write that lands in a page within a frame after a small
+    /// read took the page as the title's is counted, once; one that lands
+    /// later, or in a page no read took so, is not.
+    #[test]
+    fn a_write_landing_behind_a_read_taken_as_the_titles_is_counted_once() {
+        use std::sync::atomic::Ordering::Relaxed;
+        // Pages no other test notes, and frames of their own.
+        let page = 0x7_fe12_3450usize;
+        let frame = 1000;
+        let counted = || GUESSES[1].load(Relaxed);
+        let before = counted();
+        landed_in(page, frame);
+        assert_eq!(counted(), before, "no read took it");
+        // A read over the end of the page: both pages are noted.
+        guessed(page * KERNEL_PAGE + KERNEL_PAGE - 8, 16, frame);
+        assert!(GUESSING.load(Relaxed));
+        landed_in(page, frame + 1);
+        landed_in(page, frame + 1);
+        assert_eq!(counted(), before + 1, "once");
+        landed_in(page + 1, frame + 2);
+        assert_eq!(counted(), before + 1, "two frames later: another flight's");
+        guessed((page + 2) * KERNEL_PAGE, 16, frame);
+        landed_in(page + 2, frame);
+        assert_eq!(counted(), before + 2);
+        // And the pages count as landed in from then on.
+        assert!(LANDED.since(page, frame, frame + 1) && LANDED.since(page + 2, frame, frame));
     }
 
     /// A view is cut in two by the runtime: until that is done, its pages
