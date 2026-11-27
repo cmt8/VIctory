@@ -155,6 +155,12 @@ fn build() -> [u8; 32] {
         if victory_shader::emit::constants_raw() {
             bytes.extend_from_slice(b"VICTORY_PORT_CBV=1");
         }
+        // Early depth-stencil tests for the pixel programs the console
+        // tests first (`VICTORY_EARLY_DEPTH=1`). Only when on, for the same
+        // reason.
+        if victory_shader::emit::early_depth_on() {
+            bytes.extend_from_slice(b"VICTORY_EARLY_DEPTH=1");
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();

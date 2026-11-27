@@ -246,6 +246,32 @@ thread_local! {
     pub(crate) static WAVE_PIN_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// Whether a pixel program the console tests depth and stencil for before
+/// it runs (`lower::early_depth`: `DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER`)
+/// declares the host's early depth-stencil test (SpaghettiMaster545's fix,
+/// fxceless/victory-fork #907). Without it the host tests after the shader,
+/// and such a program writes its unordered views for pixels the test then
+/// rejects: the glass prepass's depth and motion vectors, which the title's
+/// temporal upscaler reads. `VICTORY_EARLY_DEPTH=1`: on; off by default
+/// here until a played run has shown what it does to the far trees' and
+/// signs' flicker. Part of the translation: the shader cache keys on the
+/// switch.
+pub fn early_depth_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = EARLY_DEPTH_TEST.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_EARLY_DEPTH").is_ok_and(|v| v.trim() == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`early_depth_on`] on its thread (`None`: the
+    /// switch's).
+    pub(crate) static EARLY_DEPTH_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// Whether 16-bit typed buffer accesses through a table's views move their
 /// bits as unsigned integers (`HostShader::half_views`; tippythetaidum's
 /// fix for the faces' network). `VICTORY_HALF_BITS`: on, `=0` moves them
@@ -1723,6 +1749,8 @@ mod tests {
             let io = io::raise(&p, &native).unwrap();
             emit(&c, &native, &p, &st, &io, &res).unwrap().dxil
         };
+        // The switch on, on this thread alone (`VICTORY_EARLY_DEPTH=1`).
+        let was = super::EARLY_DEPTH_TEST.replace(Some(true));
         let late = emitted(&color, el("SV_Target", 16, 4), 0x50);
         let early = emitted(&color, el("SV_Target", 16, 4), 0x1050);
         assert_ne!(late, early, "the early-depth flag changed nothing");
@@ -1735,6 +1763,13 @@ mod tests {
         let late = emitted(&depth, el("SV_Depth", 17, 1), 0x51);
         let early = emitted(&depth, el("SV_Depth", 17, 1), 0x1051);
         assert_eq!(late, early, "early depth declared for a depth export");
+        // The switch off: the bit declares nothing, and the module is the
+        // one made before there was a switch (the cached translations hold).
+        super::EARLY_DEPTH_TEST.set(Some(false));
+        let off = emitted(&color, el("SV_Target", 16, 4), 0x1050);
+        let plain = emitted(&color, el("SV_Target", 16, 4), 0x50);
+        assert_eq!(off, plain, "early depth declared with the switch off");
+        super::EARLY_DEPTH_TEST.set(was);
         // The rule alone: the bit, and no export of depth, stencil or coverage.
         let ps = |db| StageIo::Ps { inputs: vec![], input_addr: 0, db_shader_control: db, patches: vec![] };
         assert!(lower::early_depth(&ps(0x1450), &[]));
