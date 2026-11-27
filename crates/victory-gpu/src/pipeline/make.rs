@@ -133,6 +133,19 @@ impl Pending {
                 };
                 let took = began.elapsed().as_millis() as u64;
                 super::library::note_time(&self.key, took);
+                if self.was_slow.load(Ordering::Relaxed) {
+                    // (Two workers at once can lose one of the two: no matter.)
+                    let was = SLOW_MEAN_MS.load(Ordering::Relaxed);
+                    let now = slow_mean(was, took);
+                    SLOW_MEAN_MS.store(now, Ordering::Relaxed);
+                    if slow_quick(was) != slow_quick(now) {
+                        tracing::info!(
+                            mean_ms = now,
+                            quickly = slow_quick(now),
+                            "pipelines known to take long: how quickly they come has changed (VICTORY_PIPELINE_SLOW=auto follows it)"
+                        );
+                    }
+                }
                 self.times[2].store(took, Ordering::Relaxed);
                 crate::dropwhy::made(took);
                 made
@@ -565,16 +578,83 @@ const MAKING: u8 = 3;
 /// through the whole of the title's loading, 97 pipelines made in 20 s, and
 /// the first minute and a half of the world ran at 0.5 to 1.6 s a frame,
 /// dropping up to 2,900 draws a frame (run shaders-1).
-/// `VICTORY_PIPELINE_SLOW=0`: in the order the title creates them, as before.
+///
+/// With warm caches the quarter is what holds the world's first frames up:
+/// the list of those known to take long only grows (`library::note_time`
+/// keeps the longest time ever taken), so it still holds what took a second
+/// once: 296 pipelines on 2026-11-27, all on the early list, about half a
+/// second each then. Two workers of ten made them at some 22 in 5 s while
+/// the other eight stood idle, and 150 to 180 were not made when the
+/// world's first frame asked for them (runs p1, dr2): what drew with them
+/// was not run for the 8 to 25 s after, in frames of 0.3 to 0.6 s that
+/// waited for them.
+///
+/// `VICTORY_PIPELINE_SLOW=0`: in the order the title creates them, as it was
+/// at first; `VICTORY_PIPELINE_SLOW=<n>`: `n` of the workers at all times;
+/// `VICTORY_PIPELINE_SLOW=auto`: a quarter while those made lately took
+/// long, all but a quarter while they came quickly ([`slow_share`],
+/// [`slow_quick`]).
 fn slow_limit() -> usize {
-    static LIMIT: OnceLock<usize> = OnceLock::new();
-    *LIMIT.get_or_init(|| {
-        if std::env::var_os("VICTORY_PIPELINE_SLOW").is_some_and(|v| v == "0") {
-            usize::MAX
-        } else {
-            (worker_count(None, std::thread::available_parallelism().map_or(2, |n| n.get())) / 4).max(1)
+    static LIMIT: OnceLock<(usize, usize)> = OnceLock::new();
+    let (slowly, quickly) = *LIMIT.get_or_init(|| {
+        let workers = worker_count(None, std::thread::available_parallelism().map_or(2, |n| n.get()));
+        let limit = slow_share(std::env::var("VICTORY_PIPELINE_SLOW").ok().as_deref(), workers);
+        if limit.0 != usize::MAX {
+            tracing::info!(
+                while_they_take_long = limit.0,
+                while_they_come_quickly = limit.1,
+                workers,
+                "workers that may make pipelines known to take long at once (VICTORY_PIPELINE_SLOW)"
+            );
         }
-    })
+        limit
+    });
+    if quickly != slowly && slow_quick(SLOW_MEAN_MS.load(Ordering::Relaxed)) {
+        quickly
+    } else {
+        slowly
+    }
+}
+
+/// [`slow_limit`] of `workers` workers as `asked` (`VICTORY_PIPELINE_SLOW`),
+/// while those made lately took long and while they came quickly: `0` is no
+/// limit; a number is that many workers at all times (one at least, and
+/// never all of them where there are two or more: one stays for what draws
+/// ask for); `auto` is a quarter of them and all but a quarter; anything
+/// else or nothing is a quarter at all times.
+fn slow_share(asked: Option<&str>, workers: usize) -> (usize, usize) {
+    let quarter = (workers / 4).max(1);
+    match asked.map(str::trim) {
+        Some("0") => (usize::MAX, usize::MAX),
+        Some("auto") => (quarter, workers.saturating_sub(quarter).max(quarter)),
+        Some(n) => {
+            let n = n.parse::<usize>().map_or(quarter, |n| n.clamp(1, workers.saturating_sub(1).max(1)));
+            (n, n)
+        }
+        None => (quarter, quarter),
+    }
+}
+
+/// The mean time, in milliseconds, that the pipelines known to take long
+/// and made lately took ([`slow_mean`]): long until a run has shown
+/// otherwise.
+static SLOW_MEAN_MS: AtomicU64 = AtomicU64::new(SLOW_UNKNOWN_MS);
+const SLOW_UNKNOWN_MS: u64 = 8_000;
+
+/// The mean after one more took `took` ms: seven parts what it was, one
+/// part this one. One that took half a minute counts for no more than 16 s,
+/// so that a single one says "long" for a dozen quick ones after it and not
+/// for the rest of the loading.
+fn slow_mean(mean: u64, took: u64) -> u64 {
+    (mean * 7 + took.min(16_000)) / 8
+}
+
+/// Whether those known to take long come quickly now: a mean under a second
+/// and a half. From [`SLOW_UNKNOWN_MS`] that is 16 in a row at half a
+/// second each, 4 s of two workers; on a fresh cache, where they take 10 s
+/// and more each, never.
+fn slow_quick(mean: u64) -> bool {
+    mean < 1_500
 }
 
 struct Queue {
@@ -808,6 +888,66 @@ mod tests {
         assert_eq!(worker_count(None, 64), 16);
         assert_eq!(worker_count(Some(0), 24), 1);
         assert_eq!(worker_count(Some(20), 24), 20);
+    }
+
+    /// Pipelines known to take long get a quarter of the workers unless the
+    /// switch says otherwise: 0 is no limit, a number is the share at all
+    /// times and leaves one worker to what draws ask for, `auto` is a
+    /// quarter while they take long and all but a quarter while they come
+    /// quickly.
+    #[test]
+    fn the_share_for_long_pipelines_follows_the_switch() {
+        assert_eq!(slow_share(None, 10), (2, 2));
+        assert_eq!(slow_share(None, 2), (1, 1));
+        assert_eq!(slow_share(Some("0"), 10), (usize::MAX, usize::MAX));
+        assert_eq!(slow_share(Some("2"), 10), (2, 2));
+        assert_eq!(slow_share(Some("6"), 10), (6, 6));
+        assert_eq!(slow_share(Some(" 6 "), 10), (6, 6));
+        assert_eq!(slow_share(Some("64"), 10), (9, 9));
+        assert_eq!(slow_share(Some("3"), 1), (1, 1));
+        assert_eq!(slow_share(Some("many"), 10), (2, 2));
+        assert_eq!(slow_share(Some("auto"), 10), (2, 8));
+        assert_eq!(slow_share(Some("auto"), 16), (4, 12));
+        assert_eq!(slow_share(Some("auto"), 2), (1, 1));
+        assert_eq!(slow_share(Some("auto"), 1), (1, 1));
+    }
+
+    /// The larger share is for warm caches alone: nothing is known at the
+    /// start, 16 that took half a second each say "quickly", one that took
+    /// half a minute says "long" again for some quick ones after it, and on
+    /// a fresh cache, at 10 s and more each or one in four of them, it is
+    /// never said.
+    #[test]
+    fn the_larger_share_waits_for_long_pipelines_that_come_quickly() {
+        let mut mean = SLOW_UNKNOWN_MS;
+        assert!(!slow_quick(mean));
+        let mut quick = 0;
+        while !slow_quick(mean) {
+            mean = slow_mean(mean, 500);
+            quick += 1;
+        }
+        assert_eq!(quick, 16);
+        // One that took as long as puts it on the list changes nothing.
+        mean = slow_mean(mean, 1_000);
+        assert!(slow_quick(mean));
+        mean = slow_mean(mean, 30_000);
+        assert!(!slow_quick(mean));
+        let mut quick = 0;
+        while !slow_quick(mean) {
+            mean = slow_mean(mean, 500);
+            quick += 1;
+        }
+        assert!((4..=16).contains(&quick), "{quick}");
+        let mut mean = SLOW_UNKNOWN_MS;
+        for _ in 0..1000 {
+            mean = slow_mean(mean, 10_000);
+            assert!(!slow_quick(mean));
+        }
+        let mut mean = SLOW_UNKNOWN_MS;
+        for i in 0..1000 {
+            mean = slow_mean(mean, if i % 4 == 0 { 10_000 } else { 500 });
+            assert!(!slow_quick(mean), "{i}: {mean}");
+        }
     }
 
     /// A first use queues the pipeline and, within the budget, gets the
