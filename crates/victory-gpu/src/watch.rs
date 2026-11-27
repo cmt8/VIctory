@@ -579,6 +579,26 @@ pub(crate) fn lock_waits(frames: f64) -> String {
     format!("ranges held {}, journal read {}, journal noted in {}, guards {}", of(0), of(1), of(2), of(3))
 }
 
+/// Tests: a submission's one asking ([`ask_once`]) is one thread's at a
+/// time, as submissions are. A test that makes that asking holds this from
+/// before it until its end, and so does the test that calls the asking's
+/// second part alone ([`ask_rest`]).
+///
+/// That part takes the ranges that stand out of the journal while it asks,
+/// and puts them back with its own. Called alone beside another test's
+/// submission, it took that submission's ranges, the submission ended its
+/// asking and came to its next one (which waits for the part's hold), and
+/// the part then put the ended asking's ranges back as standing: the next
+/// asking found its ranges held, asked the kernel nothing, and its thread
+/// read the notes of the asking before. `port7_tests::no_write_is_lost_with_port_7`
+/// failed so in about one run in fifteen of the crate's tests together
+/// ("round 260, page 16: 135936 is not after 135938": the note of the
+/// asking before, and the number that asking stood under two later), and in
+/// none of 122 runs alone. In the runtime the second part is only ever
+/// called by the one asking itself, behind its first part and under its hold.
+#[cfg(test)]
+pub(crate) static ONE_SUBMISSION: Mutex<()> = Mutex::new(());
+
 /// The page ranges some thread is asking about: asking forgets what it
 /// answers, so until the answer is in the journal no other thread may ask
 /// about any of the same pages (it would be told they were not written).
@@ -4879,6 +4899,9 @@ mod tests {
     /// copied.
     #[test]
     fn the_rest_of_the_one_asking_has_a_number_of_its_own() {
+        // (The second part alone takes and puts back whatever asking stands:
+        // not beside another test's submission.)
+        let _one = ONE_SUBMISSION.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: a fresh write-watched allocation, freed at the end.
         let p = unsafe {
             VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
@@ -6511,6 +6534,10 @@ mod port7_tests {
                 let mut last = [0u64; HALF];
                 let mut seed = 99;
                 for round in 0..400 {
+                    // One submission at a time, as submissions are (other
+                    // tests make them too); the askers and writers of this
+                    // test go on beside it.
+                    let _one = ONE_SUBMISSION.lock().unwrap_or_else(|e| e.into_inner());
                     PORT_JOURNAL_IN_TEST.set(port == 1 || round % 2 == 0);
                     let before: Vec<usize> = (0..3).map(|_| rng(&mut seed, HALF)).collect();
                     for &p in &before {
