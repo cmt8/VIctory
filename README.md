@@ -31,7 +31,7 @@ vkd3d-proton 3.2; output at 4K, the scene drawn at 2/3 of that (the title's
 own scale). Other GPUs, drivers and Proton versions have not been tried.
 It boots, the opening cutscene plays and the open world is playable; the
 latest runs ended without a crash. About 23 fps in the opening cutscene, 20
-standing on water, 16-18 moving.
+idle on a boat, about 18 driving it.
 
 Fixed in this fork, on top of the engine (a named switch gives the old way):
 
@@ -109,9 +109,9 @@ You need your own legally obtained copy of the title's files; none are
 hosted or linked here (see [docs/asset-policy.md](docs/asset-policy.md)).
 Copy `victory.example.toml` to `victory.toml` and set its paths (outside the
 checkout). `linux/belo-next9` has no Linux launcher of its own; the Proton
-wrapper of the earlier line starts `victory.exe` under Proton's Wine, and
-this line keeps the same `config` and `run ... --execute` commands. With
-Proton Experimental installed from Steam:
+wrapper of the earlier line starts `victory.exe` under Proton's Wine (it is
+the script the owner's runs use), and this line keeps the same `config` and
+`run ... --execute` commands. With Proton Experimental installed from Steam:
 
 ```sh
 git clone -b linux/belo-next9 https://github.com/cmt8/VIctory.git && cd VIctory
@@ -128,6 +128,14 @@ The wrapper's notes (also a system Wine) are in
 [docs/linux-proton.md](https://github.com/cmt8/VIctory/blob/archive/fx-next22-picks/docs/linux-proton.md)
 at that tag. Tests run under Wine with `cargo xtask wine-test` (an `xwin
 splat` in `~/.xwin`; `--vkd3d-proton <dir>` for vkd3d-proton's D3D12).
+
+The owner's runs also set `VICTORY_NO_WATCHDOG=1 VICTORY_SHOW_AFTER=1
+VICTORY_UNDER_WIDE=0 VICTORY_LAND_ECHO=0`,
+`VKD3D_CONFIG=avoid_image_buffer_aliasing` and
+`WINEDLLOVERRIDES=d3dcompiler_47=n` (and `VICTORY_CARD_STEPS=1` in the
+latest); a run without them has not been compared. Some runs also used a
+wineserver patched to keep a process's mapped views in a tree; that patch is
+not in this repository.
 
 Switches worth knowing on this line (each is described where it is read):
 
