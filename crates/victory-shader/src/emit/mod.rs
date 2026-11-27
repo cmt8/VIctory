@@ -328,6 +328,42 @@ pub fn even_barriers() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_EVEN_BARRIERS").is_none_or(|v| v != "0"))
 }
 
+/// Whether the typed unordered buffer views of a compute program that
+/// writes UAVs and has an `s_barrier` are shown to the host as read and
+/// written through every handle (`lower::read_and_written`: a load and a
+/// store back through each handle that never run). vkd3d-proton's dxil-spirv
+/// declares a variable per combination of read and written, restrict as
+/// Vulkan's are, and Mesa takes one the program does not store through as
+/// memory the program does not write: a load through it may be joined with
+/// an earlier one or moved ahead of the group barrier it stands behind. The
+/// face network's first stage (0aa7934094794dbf) writes its 16-bit registers
+/// through one view of a buffer and reads them through another after its
+/// barrier; on the RX 7900 XTX its output differed between runs from the
+/// same memory. Anzymanz/VIctory-ox (after FoggySky222's fork) reads such
+/// values through the slot's raw twin instead and reports natural mouths on
+/// RADV with it.
+/// `VICTORY_TYPED_RW`: off, `=1` on. Part of the translation: the shader
+/// cache keys the programs it can change apart ([`keyed_apart`]).
+pub fn typed_rw() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TYPED_RW_TEST.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| typed_rw_said(std::env::var("VICTORY_TYPED_RW").ok().as_deref()))
+}
+
+/// What `VICTORY_TYPED_RW` says: on only when it is `1`.
+fn typed_rw_said(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim() == "1")
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`typed_rw`] on its thread (`None`: the switch's).
+    pub(crate) static TYPED_RW_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// Whether `ds_bpermute_b32` in a console wave64 program reads within the
 /// lane's own half of 32 lanes: lane l takes the data of lane
 /// (l & 32) | ((address + offset) / 4 & 31). That is what the console's
