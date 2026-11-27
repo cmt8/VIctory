@@ -164,6 +164,15 @@ pub(super) fn writers(items: &[Late]) -> Vec<Writer> {
                         });
                     }
                 }
+                // What its shaders drew into textures the title reads back
+                // lands in title memory, in no host copy (after
+                // SlaktarnVI's tree): a step that reads there waits.
+                out.extend(flight.texture_back_ranges.iter().map(|&(from, to)| Writer {
+                    shadow: None,
+                    from,
+                    to,
+                    copy: false,
+                }));
                 out.extend(flight.own.iter().flat_map(Taken::copied));
             }
             Late::Write(at, _, bytes) => out.push(Writer {
@@ -1304,6 +1313,34 @@ mod tests {
         assert!(!fits(width, 0u64.wrapping_sub(4096), 0, 4096));
         assert!(!fits(u64::MAX, u64::MAX - 1, 0, 2));
         assert!(!fits(width, 0, u64::MAX - 1, 2));
+    }
+
+    /// What a flight copies back from textures lands in title memory and in
+    /// no host copy: a step that reads any of it is not done on the card,
+    /// and one that reads beside it is not kept from it by that.
+    #[test]
+    fn nothing_is_read_on_the_card_where_a_texture_is_copied_back() {
+        const WHY: &str = "a read-back or a value behind a flight is written there";
+        let flight = Flight {
+            number: 1,
+            fence: 1,
+            lists: Vec::new(),
+            order: Vec::new(),
+            card: None,
+            back: Vec::new(),
+            own: None,
+            texture_back_ranges: vec![(100, 108)],
+        };
+        let writers = writers(&[Late::Run(flight)]);
+        assert_eq!(writers.len(), 1);
+        assert!(writers[0].shadow.is_none() && !writers[0].copy);
+        assert_eq!((writers[0].from, writers[0].to), (100, 108));
+        for (from, to) in [(96, 101), (100, 108), (104, 120), (0, 4096)] {
+            assert_eq!(holder(&writers, from, to).err(), Some(WHY), "[{from}, {to}) is written there");
+        }
+        for (from, to) in [(90, 100), (108, 120)] {
+            assert_ne!(holder(&writers, from, to).err(), Some(WHY), "[{from}, {to}) lies beside it");
+        }
     }
 
     /// A range that does not lie in its buffer never reaches the list (the
