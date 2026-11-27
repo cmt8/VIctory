@@ -14264,10 +14264,10 @@ mod tests {
 
     /// `VICTORY_GROUP_CU`: a compute program that stores to a UAV and meets
     /// its group at an `s_barrier` without any LDS is given a dword of
-    /// group-shared memory and an atomic add to it. Only with the switch on, not
-    /// without a barrier, and not where the program has LDS already.
+    /// group-shared memory and an atomic add to it. Not with the switch off
+    /// (`=0`), not without a barrier, and not where the program has LDS already.
     #[test]
-    fn a_group_with_a_barrier_and_no_lds_gets_a_dword_of_it_only_when_asked() {
+    fn a_group_with_a_barrier_and_no_lds_gets_a_dword_of_it_unless_turned_off() {
         const S_BARRIER: u32 = 0xBF8A_0000;
         let lowered = |on: bool, barrier: bool, lds: bool| {
             let mut words = vec![

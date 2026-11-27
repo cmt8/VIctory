@@ -249,8 +249,31 @@ fn named(container: &[u8]) -> (String, [u8; 32]) {
     let name = blake3::hash(container).to_hex()[..16].to_owned();
     let kept = victory_shader::emit::wave_kept(&name);
     let build = kept_key(build(), kept);
-    let build = victory_shader::emit::keyed_apart(container, kept).into_iter().fold(build, apart_key);
+    let marks = victory_shader::emit::keyed_apart(container, kept);
+    if marks.contains(&victory_shader::emit::GROUP_CU_MARK) {
+        group_cu_named(&name);
+    }
+    let build = marks.into_iter().fold(build, apart_key);
     (name, build)
+}
+
+/// Says once for each program, as it is first asked for, that it is one
+/// `VICTORY_GROUP_CU` reaches (a compute program with a group barrier that
+/// declares no LDS, `victory_shader::emit::group_cu`): at the level of the
+/// run's other lines in a diagnostics build, else for whoever asks for debug
+/// lines.
+fn group_cu_named(name: &str) {
+    static SAID: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
+    let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+    if !said.get_or_insert_default().insert(name.to_owned()) {
+        return;
+    }
+    const WHAT: &str = "a compute program with a group barrier and no LDS: it adds to a dword of LDS (VICTORY_GROUP_CU)";
+    if cfg!(feature = "diagnostics") {
+        tracing::info!(hash = name, "{WHAT}");
+    } else {
+        tracing::debug!(hash = name, "{WHAT}");
+    }
 }
 
 /// The key beside `build` for a program whose translation `mark` tells from

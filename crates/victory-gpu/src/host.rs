@@ -1123,6 +1123,19 @@ fn create() -> windows::core::Result<Host> {
             );
             tracing::info!(ok = set.is_ok(), "the host's background shader work is switched off (VICTORY_D3D12_BACKGROUND=0)");
         }
+        // `VICTORY_GROUP_CU` (on; `=0`: off): a compute program with a group barrier and no
+        // LDS adds to a dword of LDS, and RADV then runs its group in one compute unit
+        // (`victory_shader::emit::group_cu`; the programs are named as they are first
+        // asked for, `shader_cache`).
+        if victory_shader::emit::group_cu() {
+            tracing::info!(
+                "compute programs with a group barrier and no LDS add to a dword of LDS, so that the host runs each of their groups in one compute unit (VICTORY_GROUP_CU: on; =0 leaves them as they are)"
+            );
+        } else {
+            tracing::info!(
+                "compute programs with a group barrier and no LDS are left without LDS (VICTORY_GROUP_CU=0): on RADV their typed loads behind the barrier may be stale"
+            );
+        }
         // the widest wave the GPU runs: 32 (NVIDIA) gets console wave64 compute programs whose
         // cross-lane code stays in 32-lane halves translated for waves of 32
         let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
