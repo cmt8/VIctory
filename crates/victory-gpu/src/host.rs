@@ -2910,6 +2910,9 @@ struct Deferred {
     filled: std::collections::HashMap<(usize, usize), u64, std::hash::BuildHasherDefault<AddressHash>>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// Title textures the list records copies on the card into
+    /// ([`HostList::copies_into`]).
+    copied: Vec<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -8085,6 +8088,16 @@ impl HostList {
         self.deferred().textures.contains(&key)
     }
 
+    /// The list records a copy on the card into title texture `resource`:
+    /// once the list is submitted no upload of title memory may follow into
+    /// that texture (`crate::texture::upload_after_copy`).
+    pub(crate) fn copies_into(&self, resource: usize) {
+        let mut deferred = self.deferred();
+        if deferred.copied.last() != Some(&resource) {
+            deferred.copied.push(resource);
+        }
+    }
+
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
@@ -8278,10 +8291,18 @@ impl HostList {
         batch.refresh_textures();
         let mut uploads = Vec::new();
         for upload in textures {
+            // Not over what a copy on the card wrote in a list submitted
+            // before this one: the upload was recorded before that copy was.
+            if upload.due() && crate::texture::upload_after_copy(upload.resource()) {
+                continue;
+            }
             if let Some(first_upload) = upload.finish_refresh() {
                 uploads.push((upload, first_upload));
             }
         }
+        // This list's own copies run after its prelude: from the next list
+        // on, the textures they write hold the card's.
+        crate::texture::copies_submitted(&self.deferred().copied);
         uploads
     }
 }
