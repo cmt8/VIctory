@@ -6448,11 +6448,7 @@ impl Host {
         // (`VICTORY_WC_NO_BACK`), as with `HostList::defer_gpu_write`.
         if crate::wc::no_back() {
             picked.written.retain(|(shadow, at, len)| {
-                let keep = !crate::wc::skip_back(*at, *len, shadow.carded(), shadow.watched_known());
-                if !keep {
-                    shadow.card_owns(*at, *len);
-                }
-                keep
+                !shadow.left_on_card(*at, *len)
             });
         }
         for (shadow, at, len) in &picked.written {
@@ -7751,8 +7747,7 @@ impl HostList {
     ) {
         // Into write-combined title memory: the card keeps it, nothing is
         // declared (`VICTORY_WC_NO_BACK`).
-        if crate::wc::skip_back(address, len, shadow.carded(), shadow.watched_known()) {
-            shadow.card_owns(address, len);
+        if shadow.left_on_card(address, len) {
             return;
         }
         let mut deferred = self.deferred();
@@ -8154,6 +8149,7 @@ impl HostList {
                     }
                     batch.title_written();
                     crate::port::copied(dst, src, len);
+                    crate::wc::cpu_reads("a title buffer copy", src, len);
                     // Renderer port #7: into a heap's records, the rounds
                     // asked earlier did not see it.
                     if crate::descriptor::in_shader_heap(dst, len) {
@@ -8175,6 +8171,7 @@ impl HostList {
                         copies += 1;
                     }
                     crate::port::filled(src, len);
+                    crate::wc::cpu_reads("a fill of upload memory", src, len);
                     if wide_fills() {
                         batch.fills.push((dst, src, len));
                         bytes += len as u64;
@@ -8191,6 +8188,11 @@ impl HostList {
                         crate::port_journal::prep_wrote();
                     }
                     let free = !touches(air, p.src, p.src + p.len) && !touches(air, p.dst, p.dst + p.len);
+                    // (Out of a host copy shaders write, the card copies: what
+                    // the CPU takes of the source is made good by the landing.)
+                    if p.from_upload() {
+                        crate::wc::cpu_reads("a copy at its place in a list", p.src, p.len);
+                    }
                     batch.fill();
                     if free {
                         if !batch.due.is_empty() {
@@ -8213,6 +8215,9 @@ impl HostList {
                     continue;
                 }
                 Step::Run(work) | Step::Host(work, _) => {
+                    if let Step::Host(_, (from, to)) = step {
+                        crate::wc::cpu_reads("a step on host memory", *from, to.saturating_sub(*from));
+                    }
                     batch.fill();
                     #[cfg(feature = "diagnostics")]
                     let started = std::time::Instant::now();
@@ -8256,6 +8261,10 @@ impl HostList {
                     continue;
                 }
                 Step::Texture(upload) => {
+                    if crate::wc::no_back() {
+                        let (at, len) = upload.staging.memory();
+                        crate::wc::cpu_reads("a texture upload", at, len);
+                    }
                     if batch.texture_due(&upload.staging) {
                         batch.due.push(upload.staging.clone());
                     }

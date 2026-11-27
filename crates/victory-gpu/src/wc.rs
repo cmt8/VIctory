@@ -79,15 +79,27 @@ fn no_back_min() -> usize {
 static SKIPPED: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 
 /// Whether copies the card keeps ranges of send up only the dwords the
-/// title changed (`VICTORY_WC_KEEP_STORES=1`; off: the parts written
+/// title changed (`VICTORY_WC_KEEP_STORES`; `0`: the parts written
 /// since, whole, as for any copy). Whole, a part the CPU wrote in part goes
 /// up with title memory's older bytes beside the CPU's, over what shaders
 /// wrote there; dword by dword, a value the title writes over the same
 /// value is not seen (a counter the CPU sets back to what title memory
 /// still holds stays as the shaders left it).
+///
+/// On with [`no_back`] unless `VICTORY_WC_KEEP_STORES=0` asks for whole
+/// parts: whole, 2.5 MB a frame of title memory's older bytes went up over
+/// ranges left on the card (run pb4, the opening: 31 parts a frame, 2.7 MB,
+/// of which the title had changed 0.15 MB, run pb5), which is what leaving
+/// them on the card must not do.
 pub(crate) fn keep_stores() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WC_KEEP_STORES").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| keep_stores_asked(no_back(), std::env::var("VICTORY_WC_KEEP_STORES").ok().as_deref()))
+}
+
+/// [`keep_stores`], of what was asked: with [`no_back`] unless `0`, and
+/// never without it.
+fn keep_stores_asked(no_back: bool, asked: Option<&str>) -> bool {
+    no_back && asked.map(str::trim) != Some("0")
 }
 
 /// A refresh left out `bytes` the card keeps, the memory not being watched.
@@ -114,7 +126,14 @@ pub(crate) fn skip_back(address: usize, len: usize, carded: bool, watched: bool)
     if !no_back() || len == 0 {
         return false;
     }
-    let wc = kind(address) == Kind::WriteCombined && kind(address + len - 1) == Kind::WriteCombined;
+    // (All of it, not only its ends: memory of another kind between two
+    // write-combined ranges is memory the title's CPU may read back.)
+    let wc = all_of(
+        &ranges().read().unwrap_or_else(|e| e.into_inner()),
+        address,
+        address.saturating_add(len),
+        Kind::WriteCombined,
+    );
     if !wc {
         return false;
     }
@@ -130,6 +149,164 @@ pub(crate) fn skip_back(address: usize, len: usize, carded: bool, watched: bool)
     SKIPPED[0].fetch_add(1, Ordering::Relaxed);
     SKIPPED[1].fetch_add(len as u64, Ordering::Relaxed);
     true
+}
+
+/// Title memory whose shaders' writes were left on the card, of all copies
+/// ([`crate::shadow::Shadow::card_owns`]): it may hold older bytes than the
+/// card does.
+fn owned() -> &'static RwLock<Ranges> {
+    static OWNED: OnceLock<RwLock<Ranges>> = OnceLock::new();
+    OWNED.get_or_init(Default::default)
+}
+
+/// Title memory of [`owned`] that the runtime itself took on the CPU
+/// ([`cpu_reads`], [`orphaned`]): what shaders write there is copied back as
+/// before from then on ([`read_on_cpu`]).
+fn read() -> &'static RwLock<Ranges> {
+    static READ: OnceLock<RwLock<Ranges>> = OnceLock::new();
+    READ.get_or_init(Default::default)
+}
+
+/// What became of memory left on the card, since the counters were last
+/// taken: declared bytes copied back as before because the runtime read
+/// there ([`read_on_cpu`]); refreshes that took parts of it the title
+/// wrote, the bytes of those parts that are the card's, and the bytes that
+/// went up ([`taken_over`]).
+static GUARD: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Since the start (the line shows one sample in five, and these are rare):
+/// places of memory left on the card that steps of ours read on the CPU,
+/// and their bytes ([`cpu_reads`]); copies let go that held some, and its
+/// bytes ([`orphaned`]).
+static EVER: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// The first places are named in the log, each with the step that read it.
+const NAMED: u64 = 16;
+
+/// Shaders' writes to `[from, to)` stay on the card from now on.
+pub(crate) fn owns(from: usize, to: usize) {
+    if from >= to || owned().read().unwrap_or_else(|e| e.into_inner()).covers(from, to) {
+        return;
+    }
+    owned().write().unwrap_or_else(|e| e.into_inner()).add(from, to);
+}
+
+/// `[from, to)` is copied back again, or its copy is gone.
+/// shortcut: where two copies hold the same title memory and both left
+/// writes on the card, the other's is taken out with it.
+pub(crate) fn disowns(from: usize, to: usize) {
+    if from >= to || owned().read().unwrap_or_else(|e| e.into_inner()).is_empty() {
+        return;
+    }
+    owned().write().unwrap_or_else(|e| e.into_inner()).remove(from, to);
+}
+
+/// What of `[at, end)` lies in `owned`, put into `read`. Returns its bytes,
+/// or 0 if all of it was noted before.
+fn note_read(owned: &Ranges, read: &mut Ranges, at: usize, end: usize) -> usize {
+    let found: Vec<(usize, usize)> =
+        owned.overlapping(at, end).map(|(a, e)| (a.max(at), e.min(end))).filter(|&(a, e)| !read.covers(a, e)).collect();
+    for &(a, e) in &found {
+        read.add(a, e);
+    }
+    found.iter().map(|&(a, e)| e - a).sum()
+}
+
+/// A step of the runtime (`what`) takes `[at, at + len)` of title memory on
+/// the CPU: a fill of upload memory, a title buffer copy's source, a
+/// texture's bytes, the refresh of another host copy of the same memory
+/// (what the title has the card do, we do on the CPU: no read of the
+/// title's own, so the kind of the memory says nothing of it). Where shaders'
+/// writes were left on the card ([`no_back`]) those bytes are older than the
+/// card's: the range is noted, and what shaders write there from the next
+/// declaration on is copied back as before ([`read_on_cpu`]).
+/// Counted since the start and the first ones named in the log, so that a
+/// session shows whether it ever happened (the opening: never in runs pb4
+/// and pb5, one place of 4 MB in run pb6).
+///
+/// The declared ranges are wider than what shaders write (a view with no
+/// size reaches to its copy's end), so a place noted here need not hold a
+/// byte of theirs: then the read was good, and the range goes back for
+/// nothing.
+///
+/// shortcut: this tells and stops it going on; it does not make the read
+/// good. What shaders wrote before and do not write again is not fetched
+/// (the compare on the card finds only what a flight changes), so title
+/// memory keeps the older bytes there.
+/// shortcut: reads away from a submission's steps (the pass over textures
+/// picked by index, descriptor records) are not seen here.
+pub(crate) fn cpu_reads(what: &'static str, at: usize, len: usize) {
+    if !no_back() || len == 0 {
+        return;
+    }
+    let end = at.saturating_add(len);
+    let owned = owned().read().unwrap_or_else(|e| e.into_inner());
+    if owned.is_empty() || owned.overlapping(at, end).next().is_none() {
+        return;
+    }
+    let bytes = note_read(&owned, &mut read().write().unwrap_or_else(|e| e.into_inner()), at, end);
+    if bytes == 0 {
+        return;
+    }
+    EVER[1].fetch_add(bytes as u64, Ordering::Relaxed);
+    if EVER[0].fetch_add(1, Ordering::Relaxed) < NAMED {
+        tracing::warn!(
+            "VICTORY_WC_NO_BACK: {what} read title memory {at:#x}+{len:#x} on the CPU, {bytes} bytes of it where shaders' \
+             writes were left on the card (older bytes, if shaders wrote there); what they write there is copied back as \
+             before from now on"
+        );
+    }
+}
+
+/// What of `[from, to)` is left on the card by any copy, cut to it.
+pub(crate) fn owned_in(from: usize, to: usize) -> Vec<(usize, usize)> {
+    if !no_back() {
+        return Vec::new();
+    }
+    let owned = owned().read().unwrap_or_else(|e| e.into_inner());
+    if owned.is_empty() {
+        return Vec::new();
+    }
+    owned.overlapping(from, to).map(|(a, e)| (a.max(from), e.min(to))).collect()
+}
+
+/// Whether the runtime took some of `[address, address + len)` on the CPU
+/// while shaders' writes there were left on the card ([`cpu_reads`]): such a
+/// range is declared, compared and copied back as before.
+pub(crate) fn read_on_cpu(address: usize, len: usize) -> bool {
+    if !no_back() || len == 0 {
+        return false;
+    }
+    let read = read().read().unwrap_or_else(|e| e.into_inner());
+    if read.is_empty() || !read.overlaps(address, address.saturating_add(len)) {
+        return false;
+    }
+    GUARD[0].fetch_add(len as u64, Ordering::Relaxed);
+    true
+}
+
+/// A refresh took a part of title memory the title wrote, `over` bytes of
+/// which lie where shaders' writes are left on the card, and `sent` bytes of
+/// the part go up: all of it, title memory's older bytes beside the title's
+/// new ones, or with [`keep_stores`] only the dwords that changed.
+pub(crate) fn taken_over(over: usize, sent: usize) {
+    GUARD[1].fetch_add(1, Ordering::Relaxed);
+    GUARD[2].fetch_add(over as u64, Ordering::Relaxed);
+    GUARD[3].fetch_add(sent as u64, Ordering::Relaxed);
+}
+
+/// A copy that held `[from, to)` left on the card is let go: what shaders
+/// wrote there is gone with it, and title memory holds older bytes. A copy
+/// made of that memory later starts from those; its shaders' writes are
+/// copied back as before ([`read_on_cpu`]). Counted since the start.
+pub(crate) fn orphaned(from: usize, to: usize) {
+    if !no_back() || from >= to {
+        return;
+    }
+    disowns(from, to);
+    read().write().unwrap_or_else(|e| e.into_inner()).add(from, to);
+    EVER[2].fetch_add(1, Ordering::Relaxed);
+    EVER[3].fetch_add((to - from) as u64, Ordering::Relaxed);
 }
 
 /// A set of disjoint `[start, end)` ranges, joined where they touch.
@@ -168,6 +345,11 @@ impl Ranges {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// Whether any of `[from, to)` is in the set.
+    pub(crate) fn overlaps(&self, from: usize, to: usize) -> bool {
+        from < to && self.overlapping(from, to).next().is_some()
     }
 
     /// Takes `[from, to)` out, cutting the ranges it overlaps.
@@ -250,6 +432,26 @@ fn insert(map: &mut BTreeMap<usize, (usize, Kind)>, from: usize, to: usize, kind
     map.insert(from, (to, kind));
 }
 
+/// Whether all of `[from, to)` is noted as `kind`: no byte of another
+/// kind, and none that was never noted.
+fn all_of(map: &BTreeMap<usize, (usize, Kind)>, from: usize, to: usize, kind: Kind) -> bool {
+    if from >= to {
+        return false;
+    }
+    let first = map.range(..=from).next_back().filter(|&(_, &(end, _))| end > from);
+    let mut at = from;
+    for (&start, &(end, k)) in first.into_iter().chain(map.range(from + 1..to)) {
+        if start > at || k != kind {
+            return false;
+        }
+        at = end;
+        if at >= to {
+            return true;
+        }
+    }
+    false
+}
+
 pub(crate) fn kind(address: usize) -> Kind {
     let map = ranges().read().unwrap_or_else(|e| e.into_inner());
     match map.range(..=address).next_back() {
@@ -279,7 +481,7 @@ pub(crate) fn back(address: usize, bytes: u64) {
 }
 
 /// MB per frame, by kind, copied up and copied back.
-pub(crate) type Sample = Option<([f64; KINDS], [f64; KINDS], [f64; 9])>;
+pub(crate) type Sample = Option<([f64; KINDS], [f64; KINDS], [f64; 9], [f64; 4])>;
 
 /// Takes the counters as the frame-rate line takes its own (every second,
 /// over the same frames), so that the line printed beside it matches it.
@@ -292,13 +494,14 @@ pub(crate) fn take(frames: f64) -> Sample {
     };
     let per_frame = |v: u64| v as f64 / frames.max(1.0);
     let skipped = std::array::from_fn(|i| per_frame(SKIPPED[i].swap(0, Ordering::Relaxed)));
-    Some((take(&UP), take(&BACK), skipped))
+    let guard = std::array::from_fn(|i| per_frame(GUARD[i].swap(0, Ordering::Relaxed)));
+    Some((take(&UP), take(&BACK), skipped, guard))
 }
 
 /// With the frame-rate line: what [`take`] took, and the title memory
 /// noted of each kind.
 pub(crate) fn log(sample: Sample) {
-    let Some((up, back, skipped)) = sample else {
+    let Some((up, back, skipped, g)) = sample else {
         return;
     };
     let mut noted = [0u64; KINDS];
@@ -332,6 +535,29 @@ pub(crate) fn log(sample: Sample) {
             kept_unwatched / 1e6,
             kept_uncarded / 1e6
         );
+        let left = |set: &RwLock<Ranges>| {
+            set.read().unwrap_or_else(|e| e.into_inner()).iter().map(|(s, e)| e - s).sum::<usize>() >> 20
+        };
+        let ever: [u64; 4] = std::array::from_fn(|i| EVER[i].load(Ordering::Relaxed));
+        tracing::info!(
+            "the runtime's own use of memory left on the card (VICTORY_WC_NO_BACK): since the start {} places of it read on the \
+             CPU by steps of ours, {:.1} KB (older bytes than the card's where shaders wrote; shaders' writes there copied back \
+             as before from then on, {:.1} MB declared a frame kept for it), {} copies let go that held some, {:.1} KB; per \
+             frame, refreshes that took parts of it the title wrote: {:.1}, {:.1} KB of them left on the card, {:.1} KB sent up \
+             (VICTORY_WC_KEEP_STORES={}: {}); left on the card now {} MB, copied back again {} MB",
+            ever[0],
+            ever[1] as f64 / 1e3,
+            g[0] / 1e6,
+            ever[2],
+            ever[3] as f64 / 1e3,
+            g[1],
+            g[2] / 1e3,
+            g[3] / 1e3,
+            u8::from(keep_stores()),
+            if keep_stores() { "only the dwords the title changed" } else { "whole, title memory's older bytes with them" },
+            left(owned()),
+            left(read()),
+        );
     }
 }
 
@@ -352,6 +578,75 @@ mod tests {
         insert(&mut map, 0x2000, 0x6000, Kind::Uncached);
         let got: Vec<_> = map.iter().map(|(&s, &(e, k))| (s, e, k)).collect();
         assert_eq!(got, [(0x1000, 0x2000, Kind::Cached), (0x2000, 0x6000, Kind::Uncached), (0x6000, 0x9000, Kind::Cached)]);
+    }
+
+    /// A step that reads memory left on the card on the CPU is noted where
+    /// it read such memory and nowhere else, and from then on a declared
+    /// write that holds any of it goes back as before; others do not.
+    #[test]
+    fn a_read_on_the_cpu_of_memory_left_on_the_card_brings_its_range_back() {
+        let mut owned = Ranges::default();
+        owned.add(0x10000, 0x50000);
+        owned.add(0x80000, 0x90000);
+        let mut read = Ranges::default();
+        // Beside what is left on the card: nothing noted.
+        assert_eq!(note_read(&owned, &mut read, 0x50000, 0x80000), 0);
+        assert!(read.is_empty());
+        // A fill of 480 bytes inside, and a copy that reaches over the end.
+        assert_eq!(note_read(&owned, &mut read, 0x20100, 0x202e0), 480);
+        assert_eq!(note_read(&owned, &mut read, 0x8f000, 0xa0000), 0x1000);
+        assert_eq!(read.iter().collect::<Vec<_>>(), vec![(0x20100, 0x202e0), (0x8f000, 0x90000)]);
+        // The same place again is no new place; one that reaches past it is.
+        assert_eq!(note_read(&owned, &mut read, 0x20100, 0x202e0), 0);
+        assert_eq!(note_read(&owned, &mut read, 0x8e000, 0x90000), 0x2000);
+        assert_eq!(read.iter().collect::<Vec<_>>(), vec![(0x20100, 0x202e0), (0x8e000, 0x90000)]);
+        // The declared write of the whole buffer holds the fill: kept. One
+        // of another part of it does not, nor one that ends where it begins.
+        assert!(read.overlaps(0x10000, 0x50000));
+        assert!(!read.overlaps(0x30000, 0x50000));
+        assert!(!read.overlaps(0x10000, 0x20100));
+        assert!(read.overlaps(0x202df, 0x30000));
+        assert!(!read.overlaps(0x20100, 0x20100));
+    }
+
+    /// What is left on the card must be write-combined from end to end:
+    /// ranges that touch count as one, a range of another kind or a gap
+    /// between them does not pass, though both ends are write-combined.
+    #[test]
+    fn only_memory_that_is_write_combined_throughout_passes() {
+        let mut map = BTreeMap::new();
+        insert(&mut map, 0x10000, 0x30000, Kind::WriteCombined);
+        insert(&mut map, 0x30000, 0x50000, Kind::WriteCombined);
+        insert(&mut map, 0x50000, 0x60000, Kind::Cached);
+        insert(&mut map, 0x60000, 0x80000, Kind::WriteCombined);
+        insert(&mut map, 0x90000, 0xa0000, Kind::WriteCombined);
+        let wc = |from, to| all_of(&map, from, to, Kind::WriteCombined);
+        assert!(wc(0x10000, 0x30000));
+        assert!(wc(0x18000, 0x28000));
+        assert!(wc(0x10000, 0x50000));
+        assert!(wc(0x2ffff, 0x30001));
+        // Cached memory between: both ends are write-combined, the middle is not.
+        assert!(!wc(0x40000, 0x70000));
+        assert!(!wc(0x4ffff, 0x50001));
+        // A gap never noted between.
+        assert!(!wc(0x70000, 0x98000));
+        // Before the first range, past the last, and nothing at all.
+        assert!(!wc(0x8000, 0x20000));
+        assert!(!wc(0x98000, 0xa0001));
+        assert!(!wc(0x20000, 0x20000));
+        assert!(!all_of(&BTreeMap::new(), 0x10000, 0x20000, Kind::WriteCombined));
+    }
+
+    /// Leaving shaders' writes on the card sends up only what the title
+    /// changed unless whole parts are asked for; without it nothing changes.
+    #[test]
+    fn what_is_left_on_the_card_keeps_stores_unless_asked_not_to() {
+        assert!(keep_stores_asked(true, None));
+        assert!(keep_stores_asked(true, Some("1")));
+        assert!(!keep_stores_asked(true, Some("0")));
+        assert!(!keep_stores_asked(true, Some(" 0 ")));
+        assert!(!keep_stores_asked(false, None));
+        assert!(!keep_stores_asked(false, Some("1")));
     }
 
     #[test]

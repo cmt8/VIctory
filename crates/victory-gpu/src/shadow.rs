@@ -2653,6 +2653,10 @@ impl Drop for Shadow {
                 crate::census::forget(from, to);
             }
         }
+        // What shaders wrote and was left on the card goes with the copy.
+        for (from, to) in self.card_owned.get_mut().unwrap_or_else(|e| e.into_inner()).iter() {
+            crate::wc::orphaned(from, to);
+        }
         if self.kept.get_mut().unwrap_or_else(|e| e.into_inner()).1 {
             KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
@@ -3981,6 +3985,73 @@ impl Shadow {
         })
     }
 
+    /// Whether what shaders write to `[address, address + len)` stays on the
+    /// card and is not declared (`VICTORY_WC_NO_BACK`,
+    /// [`crate::wc::skip_back`]); noted then ([`Shadow::card_owns`]). Not
+    /// where the runtime itself took that memory on the CPU while it was
+    /// left on the card ([`crate::wc::read_on_cpu`]): that range is the
+    /// card's no more, and goes back as before.
+    pub(crate) fn left_on_card(&self, address: usize, len: usize) -> bool {
+        if !crate::wc::no_back() {
+            return false;
+        }
+        if crate::wc::read_on_cpu(address, len) {
+            self.card_disowns(address, len);
+            return false;
+        }
+        if !crate::wc::skip_back(address, len, self.carded(), self.watched_known()) {
+            return false;
+        }
+        self.card_owns(address, len);
+        true
+    }
+
+    /// `[address, address + len)` is copied back again: title memory holds
+    /// what shaders write there, as for any declared range.
+    pub(crate) fn card_disowns(&self, address: usize, len: usize) {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), (address + len).min(end));
+        if from >= to {
+            return;
+        }
+        {
+            let mut owned = self.card_owned.lock().unwrap_or_else(|e| e.into_inner());
+            if !owned.overlaps(from, to) {
+                return;
+            }
+            owned.remove(from, to);
+        }
+        crate::wc::disowns(from, to);
+        crate::census::forget(from, to);
+    }
+
+    /// A refresh of `[from, to)` reads title memory where another copy of
+    /// the same memory left shaders' writes on the card: told
+    /// ([`crate::wc::cpu_reads`]).
+    fn reads_left_by_others(&self, from: usize, to: usize) {
+        let left = crate::wc::owned_in(from, to);
+        if left.is_empty() {
+            return;
+        }
+        let others: Vec<(usize, usize)> = {
+            let mine = self.card_owned.lock().unwrap_or_else(|e| e.into_inner());
+            left.into_iter().filter(|&(a, e)| !mine.covers(a, e)).collect()
+        };
+        for (a, e) in others {
+            crate::wc::cpu_reads("the refresh of another host copy", a, e - a);
+        }
+    }
+
+    /// The bytes of title memory `[from, to)` where shaders' writes are left
+    /// on the card.
+    pub(crate) fn left_in(&self, from: usize, to: usize) -> usize {
+        let owned = self.card_owned.lock().unwrap_or_else(|e| e.into_inner());
+        if owned.is_empty() {
+            return 0;
+        }
+        owned.overlapping(from, to).map(|(a, e)| e.min(to) - a.max(from)).sum()
+    }
+
     /// Shaders write `[address, address + len)` and it is not copied back
     /// (`VICTORY_WC_NO_BACK`, [`crate::wc::skip_back`]): the copy holds the
     /// newest bytes there from now on (see [`Shadow::update`]).
@@ -3991,6 +4062,7 @@ impl Shadow {
             return;
         }
         self.card_owned.lock().unwrap_or_else(|e| e.into_inner()).add(from, to);
+        crate::wc::owns(from, to);
         crate::census::note(from, to);
         // Title memory there holds older bytes than the card: a refresh of a
         // part the CPU wrote sends up only the dwords it changed, not the
@@ -4018,6 +4090,9 @@ impl Shadow {
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
             return 0;
+        }
+        if crate::wc::no_back() {
+            self.reads_left_by_others(from, to);
         }
         let mut busy: Vec<(usize, usize)> = self
             .pending
@@ -4370,12 +4445,18 @@ impl Shadow {
             /// A page of title memory, as read.
             static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
+        // (Counted: title memory's older bytes may go over the card's there.)
+        let over = if crate::wc::no_back() { self.left_in(from, to) } else { 0 };
         let Some(card) = self.card.as_ref().filter(|_| self.changes_only.load(Ordering::Relaxed) || send_changed()) else {
+            if over != 0 {
+                crate::wc::taken_over(over, to - from);
+            }
             if known && self.card.is_some() && self.landing.load(Ordering::Acquire) && land_echo() && !crate::host::upcheck::on() {
                 return self.take_landed(from, to);
             }
             return self.copy(from, to);
         };
+        let sent = std::cell::Cell::new(0usize);
         let whole = !known && card.before.lock().unwrap_or_else(|e| e.into_inner()).is_none();
         let start = self.start as usize;
         TITLE.with_borrow_mut(|title| {
@@ -4398,6 +4479,7 @@ impl Shadow {
                     self.changed(at - start + a, at - start + a + len);
                 }
                 self.card_changed_runs(runs.iter().map(|&(a, len)| (at - start + a, at - start + a + len)));
+                sent.set(sent.get() + runs.iter().map(|r| r.1).sum::<usize>());
                 if let Some(was) = was {
                     crate::host::upcheck::note(self.id, at - start, &was, held);
                 }
@@ -4410,6 +4492,9 @@ impl Shadow {
                 at += n;
             }
         });
+        if over != 0 {
+            crate::wc::taken_over(over, sent.get());
+        }
         to - from
     }
 
