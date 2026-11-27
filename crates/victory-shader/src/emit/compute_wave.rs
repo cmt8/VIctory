@@ -184,7 +184,7 @@ pub(super) fn takes(wave64: bool) -> bool {
 /// switch unset or `=console`), so that the host runs it in the console's
 /// waves for certain and not by the driver's default. Part of the
 /// translation: whoever caches translations keys such a program apart
-/// ([`wave64_keyed_apart`]).
+/// ([`keyed_apart`]).
 pub fn wave64_as_console() -> bool {
     if !compute_wave_32() {
         return false;
@@ -217,30 +217,81 @@ pub(super) fn declares_64() -> bool {
     DECLARES_64.get()
 }
 
-/// Whether `container`'s program is a compute program compiled for the
+/// `container`'s program where it is a compute program compiled for the
 /// console's waves of 64 (the program [`super::translate`] takes).
-fn console_wave64_compute(container: &[u8]) -> bool {
+fn console_wave64_compute(container: &[u8]) -> Option<crate::native::NativeProgram> {
     use crate::native::HwStage;
-    let Ok(c) = crate::dxbc::Container::parse(container) else {
-        return false;
-    };
-    let Some(part) = c.part(crate::dxbc::FourCC::DXIL).or(c.part(crate::dxbc::FourCC::ACCC)) else {
-        return false;
-    };
+    let c = crate::dxbc::Container::parse(container).ok()?;
+    let part = c.part(crate::dxbc::FourCC::DXIL).or(c.part(crate::dxbc::FourCC::ACCC))?;
     crate::native_programs(part.data)
-        .ok()
-        .and_then(|all| all.into_iter().find(|p| matches!(p.stage, HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms)))
-        .is_some_and(|p| p.stage == HwStage::Cs && p.wave64)
+        .ok()?
+        .into_iter()
+        .find(|p| matches!(p.stage, HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms))
+        .filter(|p| p.stage == HwStage::Cs && p.wave64)
 }
 
-/// Whether the translation of `container` is one [`wave64_as_console`]
-/// changes: a console wave64 compute program, on a host and with a switch
-/// where that holds. Whoever caches translations keys such a program apart
-/// from the translation made of it while the switch unset meant the forms
-/// for host waves of 32 (the switch's value is the same for both); every
-/// other program keeps its key.
-pub fn wave64_keyed_apart(container: &[u8]) -> bool {
-    wave64_as_console() && console_wave64_compute(container)
+/// Whether some dword of `code` is a `ds_bpermute_b32` (the DS encoding,
+/// opcode 0xb3) if it is an instruction's first: every program with the
+/// instruction, and perhaps one whose literal looks like it.
+fn has_bpermute(code: &[u8]) -> bool {
+    code.chunks_exact(4).any(|w| {
+        let w = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+        w >> 26 == 0x36 && w >> 18 & 0xFF == 0xB3
+    })
+}
+
+/// [`keyed_apart`]'s mark of a console wave64 compute program translated
+/// for host waves of 64 that it declares ([`wave64_as_console`]).
+const WAVE64_AS_CONSOLE: &str = "VICTORY_COMPUTE_WAVE=console: wave64 compute programs declare 64";
+/// [`keyed_apart`]'s mark of a console wave64 compute program whose
+/// backward permutes read within halves of 32 lanes
+/// ([`super::bpermute_halves`]).
+const BPERMUTE_HALVES: &str = "VICTORY_BPERMUTE_HALVES: ds_bpermute within halves of 32 lanes";
+
+/// What of the translation of `container` whoever caches translations keys
+/// apart, beside what it keys every program by: a mark for each change of
+/// the translator's that reaches this program alone and has no value of a
+/// switch to tell it by. The other programs keep their keys, and their
+/// cached translations.
+/// * A console wave64 compute program where [`wave64_as_console`] holds: the
+///   switch unset used to mean a form for host waves of 32 for it. Not one
+///   `VICTORY_WAVE_KEEP` lists (`kept`), which is translated as before the
+///   switch in both cases.
+/// * A console wave64 compute program with a `ds_bpermute_b32` where
+///   [`super::bpermute_halves`] holds: the permute used to read within the
+///   whole wave (as it does with `VICTORY_BPERMUTE_HALVES=0`, whose
+///   translations so keep the key they had).
+pub fn keyed_apart(container: &[u8], kept: bool) -> Vec<&'static str> {
+    let console = !kept && wave64_as_console();
+    let halves = super::bpermute_halves();
+    let mut marks = Vec::new();
+    if !console && !halves {
+        return marks;
+    }
+    let Some(p) = console_wave64_compute(container) else {
+        return marks;
+    };
+    if console {
+        marks.push(WAVE64_AS_CONSOLE);
+    }
+    if halves && has_bpermute(&p.code) {
+        marks.push(BPERMUTE_HALVES);
+    }
+    marks
+}
+
+/// The marks of [`keyed_apart`] some program has with the switches and the
+/// host as they are: part of what tells one set of translations from
+/// another.
+pub fn keyed_apart_any() -> Vec<&'static str> {
+    let mut marks = Vec::new();
+    if wave64_as_console() {
+        marks.push(WAVE64_AS_CONSOLE);
+    }
+    if super::bpermute_halves() {
+        marks.push(BPERMUTE_HALVES);
+    }
+    marks
 }
 
 /// The widest host wave a compute program's lane forms are chosen for: 32
@@ -322,6 +373,18 @@ mod tests {
         assert_eq!(parse(Some("0")), Asked::Off);
         assert_eq!(parse(Some("host")), Asked::Off);
         assert_eq!(parse(Some("64")), Asked::Off);
+    }
+
+    #[test]
+    fn a_backward_permute_is_found_in_a_programs_code() {
+        let code = |words: &[u32]| -> Vec<u8> { words.iter().flat_map(|w| w.to_le_bytes()).collect() };
+        // v_mov_b32 v2, 11; ds_bpermute_b32 v1, v0, v2; s_endpgm
+        assert!(has_bpermute(&code(&[0x7E04_028B, 0xDACC_0000, 0x0100_0200, 0xBF81_0000])));
+        // ... with an offset
+        assert!(has_bpermute(&code(&[0xDACC_000C, 0x0300_0201])));
+        // ds_write_b32, ds_read_b32, ds_swizzle_b32
+        assert!(!has_bpermute(&code(&[0xD834_0000, 0x0000_0204, 0xD8D8_0000, 0x0300_0005, 0xD8D4_8000, 0x0100_0000])));
+        assert!(!has_bpermute(&[]));
     }
 
     #[test]

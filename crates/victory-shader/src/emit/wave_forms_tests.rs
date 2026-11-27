@@ -366,7 +366,9 @@ const LDS32: &[u32] = &[
     0xE070_1000, 0x8002_030A, // buffer_store_dword v3, v10, s[8:11], 0 offen
     0xBF81_0000, // s_endpgm
 ];
-/// `ds_bpermute_b32`: thread t reads t + 1 from the lane a quarter wave on.
+/// `ds_bpermute_b32`: thread t reads t + 1 from the lane its address names, a quarter
+/// wave on: in a wave of 32 that lane, in a wave of 64 the lane of its own half of 32
+/// lanes that the address names modulo 32 (16 on, within the half).
 const BPERM64: &[u32] = &[
     0xBE85_0380, // s_mov_b32 s5, 0
     0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
@@ -504,7 +506,16 @@ fn console(name: &str, wave: u32, threads: u32) -> Vec<u32> {
                 }
             }
             "lds" => o[0] = base + (lane + wave / 2) % wave + 1,
-            "bperm" => o[0] = base + (lane + wave / 4) % wave + 1,
+            // The console's hardware (GFX10) permutes the two halves of a wave of 64 each
+            // on its own: lane l reads lane (l & 32) | (address / 4 & 31)
+            // (`super::bpermute_halves`). Until that was known this said
+            // `(lane + wave / 4) % wave` for both waves, a read within the whole wave of
+            // 64, which is what `permutes_within_the_whole_wave` still gives with
+            // `VICTORY_BPERMUTE_HALVES=0`.
+            "bperm" => {
+                let from = if wave == 64 { lane & 32 | (lane + 16) & 31 } else { (lane + 8) % 32 };
+                o[0] = base + from + 1;
+            }
             "hsum" => {
                 let terms: Vec<u16> =
                     (base..base + wave).map(|u| if u < threads { (0x3C00 + 37 * u) as u16 } else { 0 }).collect();
@@ -985,4 +996,138 @@ fn unset_the_switch_declares_the_consoles_wave_and_uses_no_form_for_waves_of_32(
     }
     // `=forms` is what it was (a test's choice of the switch unset is made with the form)
     assert_eq!(made(BALLOT64, true, 128, Form::Waves32, Some(true)).1, Some(32));
+}
+
+/// `ds_bpermute_b32` at an address with bits above the lane's and below the dword, plus an
+/// offset: lane l of a wave of 64 reads 0x4000 + the thread of lane (l & 32) | (l + 3 & 31),
+/// so lanes 29..31 wrap to 0..2 and lanes 61..63 to 32..34, and lane 32 reads lane 35, not 3.
+/// (After `wave64_permutes_stay_within_each_32_lane_half` of upstream VIctory 0665a0e85, QB,
+/// pull request #573.)
+const BPERM_WRAP64: &[u32] = &[
+    0xBE85_0380, // s_mov_b32 s5, 0
+    0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+    0x3414_0084, // v_lshlrev_b32 v10, 4, v0
+    0x4A04_00FF, 0x0000_4000, // v_add_nc_u32 v2, 0x4000, v0
+    0x3602_009F, // v_and_b32 v1, 31, v0
+    0x3402_0282, // v_lshlrev_b32 v1, 2, v1
+    0x4A02_02FF, 0x0000_0103, // v_add_nc_u32 v1, 0x103, v1
+    0xDACC_000C, 0x0300_0201, // ds_bpermute_b32 v3, v1, v2 offset:12
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xE070_1000, 0x8002_030A, // buffer_store_dword v3, v10, s[8:11], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
+/// `ds_bpermute_b32` under an EXEC of threads 0..39, each lane reading the lane 8 on in its
+/// half: lanes 0..31 read 0x5000 + that thread; lanes 32..39 read lanes 40..47, which EXEC
+/// leaves out, and get 0 (not what lanes 8..15 of the other half hold); threads 40..63 keep
+/// 0xcafe0000 + their index. (After `wave64_permutes_check_exec_within_each_half` of the
+/// same upstream commit.)
+const BPERM_EXEC64: &[u32] = &[
+    0xBE85_0380, // s_mov_b32 s5, 0
+    0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+    0x3414_0084, // v_lshlrev_b32 v10, 4, v0
+    0x4A04_00FF, 0x0000_5000, // v_add_nc_u32 v2, 0x5000, v0
+    0x4A06_00FF, 0xCAFE_0000, // v_add_nc_u32 v3, 0xcafe0000, v0
+    0x4A02_0088, // v_add_nc_u32 v1, 8, v0
+    0x3602_029F, // v_and_b32 v1, 31, v1
+    0x3402_0282, // v_lshlrev_b32 v1, 2, v1
+    0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+    0xBE94_246A, // s_and_saveexec_b64 s[20:21], vcc
+    0xDACC_0000, 0x0300_0201, // ds_bpermute_b32 v3, v1, v2
+    0xBEFE_0414, // s_mov_b64 exec, s[20:21]
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xE070_1000, 0x8002_030A, // buffer_store_dword v3, v10, s[8:11], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
+/// `words` translated in `form` with `VICTORY_BPERMUTE_HALVES` as `halves` says.
+fn permuting(words: &[u32], wave64: bool, threads: u32, form: Form, halves: bool) -> Result<(HostShader, Option<u32>), ShaderError> {
+    let was = super::BPERMUTE_HALVES_TEST.replace(Some(halves));
+    let r = translated(words, wave64, threads, false, form);
+    super::BPERMUTE_HALVES_TEST.set(was);
+    r
+}
+
+/// A backward permute in a console wave of 64 reads within the lane's own half of 32
+/// lanes (no device needed): so it crosses no half, and a program whose only cross-lane
+/// code it is takes a form for host waves of 32 that exchanges nothing, where it was
+/// refused ("a lane permute across two host waves") on a host of 32-lane waves and kept
+/// 64 lanes on one that has them. `VICTORY_BPERMUTE_HALVES=0` is the lowering of before in
+/// every form; a console wave32 program is the same either way.
+#[test]
+fn a_wave64_permute_stays_in_its_half_and_needs_no_wave_of_64() {
+    let code = |words: &[u32], wave64: bool, form: Form, halves: bool| {
+        permuting(words, wave64, 64, form, halves).unwrap_or_else(|e| panic!("{form:?} {halves}: {e}")).0.dxil
+    };
+    let declared = |form: Form, halves: bool| permuting(BPERM64, true, 64, form, halves).map(|t| t.1);
+    // for host waves of 64 the size stays and the code changes
+    for form in [Form::Host64, Form::Console] {
+        assert_eq!(declared(form, true), Ok(Some(64)), "{form:?}");
+        assert_eq!(declared(form, false), Ok(Some(64)), "{form:?}");
+        assert!(code(BPERM64, true, form, true) != code(BPERM64, true, form, false), "{form:?}");
+    }
+    // `=32`: a form for host waves of 32, where it kept its 64 lanes
+    assert_eq!(declared(Form::Waves32, true), Ok(Some(32)));
+    assert_eq!(declared(Form::Waves32, false), Ok(Some(64)));
+    // a host of 32-lane waves: translated, where it was refused
+    assert_eq!(declared(Form::Host32, true), Ok(Some(32)));
+    let refused = declared(Form::Host32, false).expect_err("refused as before");
+    assert!(refused.to_string().contains("a lane permute across two host waves"), "{refused}");
+    // a console wave32 program: the same code
+    for form in [Form::Host64, Form::Waves32, Form::Console, Form::Host32] {
+        assert!(code(BPERM32, false, form, true) == code(BPERM32, false, form, false), "{form:?}");
+    }
+}
+
+/// The permutes on the card: what each lane of a console wave of 64 reads with the
+/// permute within halves (the console's result, [`console`]'s "bperm" and the two
+/// programs after upstream's tests) in the forms for host waves of 64 and for two host
+/// waves of 32, and within the whole wave with `VICTORY_BPERMUTE_HALVES=0`, as before.
+#[test]
+fn permutes_within_halves_on_the_card_and_within_the_whole_wave_with_the_switch_off() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let first = |got: Vec<u32>| -> Vec<u32> { got.chunks(4).map(|t| t[0]).collect() };
+    let mut ran = 0;
+    for form in [Form::Host64, Form::Console, Form::Waves32] {
+        let cases: [(&str, &[u32], Vec<u32>); 3] = [
+            ("a quarter wave on", BPERM64, (0..64).map(|l| (l & 32 | (l + 16) & 31) + 1).collect()),
+            ("high and low address bits", BPERM_WRAP64, (0..64).map(|l| 0x4000 + (l & 32 | (l + 3) & 31)).collect()),
+            (
+                "EXEC within each half",
+                BPERM_EXEC64,
+                (0..64u32)
+                    .map(|l| match l {
+                        0..32 => 0x5000 + ((l + 8) & 31),
+                        32..40 => 0,
+                        _ => 0xCAFE_0000 + l,
+                    })
+                    .collect(),
+            ),
+        ];
+        for (name, words, want) in cases {
+            let (shader, declared) = permuting(words, true, 64, form, true).unwrap_or_else(|e| panic!("{form:?} {name}: {e}"));
+            let Some(got) = run(&host, &shader, 4 * 64) else {
+                eprintln!("{form:?} {name}: declared {declared:?}: the device takes no such pipeline");
+                continue;
+            };
+            ran += 1;
+            assert_eq!(first(got), want, "{form:?} {name}: declared {declared:?}");
+        }
+    }
+    // the switch off: within the whole wave of 64 (a host of 64-lane waves)
+    for form in [Form::Host64, Form::Console] {
+        let (shader, declared) = permuting(BPERM64, true, 64, form, false).unwrap_or_else(|e| panic!("{form:?}: {e}"));
+        let Some(got) = run(&host, &shader, 4 * 64) else {
+            eprintln!("{form:?} off: declared {declared:?}: the device takes no such pipeline");
+            continue;
+        };
+        ran += 1;
+        let whole: Vec<u32> = (0..64).map(|l| (l + 16) % 64 + 1).collect();
+        assert_eq!(first(got), whole, "{form:?} with the switch off: declared {declared:?}");
+    }
+    eprintln!("{ran} dispatches on the hardware device");
 }

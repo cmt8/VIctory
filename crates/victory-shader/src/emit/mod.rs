@@ -124,7 +124,8 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use bitcode::census;
 pub use sampler::StaticSampler;
 pub use compute_wave::{
-    compute_wave_32, host_min_wave_set, named, set_host_min_wave, wave64_as_console, wave64_keyed_apart, wave_kept,
+    compute_wave_32, host_min_wave_set, keyed_apart, keyed_apart_any, named, set_host_min_wave, wave64_as_console,
+    wave_kept,
 };
 pub use lower::{host_settings, set_host_max_wave, set_host_rdna, set_thread_max_wave};
 pub use rect::rect_list_gs;
@@ -269,6 +270,36 @@ pub fn missing_upper_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_MISSING_UPPER").is_none_or(|v| v != "0"))
 }
 
+/// Whether `ds_bpermute_b32` in a console wave64 program reads within the
+/// lane's own half of 32 lanes: lane l takes the data of lane
+/// (l & 32) | ((address + offset) / 4 & 31). That is what the console's
+/// hardware does: from GFX10 to GFX11.7 the instruction permutes the two
+/// halves of a wave of 64 each on its own (Mesa ACO, `emit_bpermute` in
+/// aco_select_nir_intrinsics.cpp, "GFX10-11.5 wave64 mode: emulate
+/// full-wave bpermute", and `emit_bpermute_shared_vgpr` in
+/// aco_lower_to_hw_instr.cpp, "on GFX10 the bpermute instruction only works
+/// on half waves"; LLVM's `supportsWaveWideBPermute`, GCNSubtarget.h).
+/// After upstream VIctory 0665a0e85 (pull request #573, QB) and fxceless
+/// b1d777a80 (after Belobug #363). Such a permute then crosses no half: a
+/// program in host waves of 32 needs no exchange for it and is not refused
+/// one. `VICTORY_BPERMUTE_HALVES`: on, `=0` reads within the whole wave of
+/// 64 as before, for A/B runs. Part of the translation: the shader cache
+/// keys the programs it changes apart ([`keyed_apart`]).
+pub fn bpermute_halves() -> bool {
+    #[cfg(test)]
+    if let Some(on) = BPERMUTE_HALVES_TEST.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BPERMUTE_HALVES").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`bpermute_halves`] on its thread (`None`: the switch's).
+    pub(crate) static BPERMUTE_HALVES_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// Whether a 16-bit result written by SDWA with `dst_unused` 1 (sext) into
 /// WORD_0 copies its bit 15 into the high word, and the reserved
 /// `dst_unused` 3 is refused (upstream VIctory #3124). `VICTORY_SDWA_SEXT`:
@@ -374,7 +405,9 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
     out.extend_from_slice(&host_min_wave_set().to_le_bytes());
     out.push(u8::from(compute_wave_32()));
-    out.push(u8::from(wave64_as_console()));
+    for mark in keyed_apart_any() {
+        out.extend_from_slice(mark.as_bytes());
+    }
     out.extend_from_slice(&lower::host_rdna().to_le_bytes());
     out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());
     out.extend_from_slice(&shader::raw_views().to_le_bytes());
@@ -591,12 +624,15 @@ pub(crate) fn emit_sized(
                 Ok((_, wave)) => format!("declares {wave:?}"),
                 Err(e) => format!("not translated: {e}"),
             };
+            // (which programs permute lanes backward: `bpermute_halves`)
+            let permutes = p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name() == "ds_bpermute_b32");
             eprintln!(
-                "WAVE-FORM {} console wave{} group={:?} lds={}: {what}, {declares}",
+                "WAVE-FORM {} console wave{} group={:?} lds={}{}: {what}, {declares}",
                 compute_wave::name(),
                 if native.wave64 { 64 } else { 32 },
                 cs.threads,
                 cs.lds_bytes(),
+                if permutes { " ds_bpermute" } else { "" },
             );
         }
     };
