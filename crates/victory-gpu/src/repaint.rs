@@ -68,6 +68,44 @@
 //! look finds it equal. A line "audit" every [`AUDIT_LINE`] frames has the
 //! counts. A run in which a face is wrong and no texture of its sizes is
 //! stale has the fault in title memory, not in what is uploaded from it.
+//!
+//! The bakes (fourth form). Runs fr2 and fr3 showed that the textures
+//! followed above are the planes of a video the title decodes (two sets of
+//! 2048x1088 and twice 1024x544 bytes), written by its own threads and
+//! uploaded while drawn: not a head's. What the faulty faces look like (the
+//! detail of the skin kept, its colour gone: one flat green, or coarse
+//! blocks of every colour, for one character and a whole shot, another
+//! character in another run) fits a small colour texture of zeros or of
+//! other bytes, and the title makes such textures itself: its decoration
+//! bake draws a character's skin and decorations from sources picked by
+//! index and copies the result into a texture of its own
+//! (`crate::draw::BAKE_PIXEL_SHADERS`, `crate::list` `copy_texture_region`).
+//! A bake that reads a host copy that is not what title memory holds bakes
+//! that, once; and the audit found 13 to 24 such host copies at any time in
+//! the frames the bakes were drawn in. So the bakes are told too:
+//! - "bake pass": every run of the texture pass made for a bake draw: its
+//!   frame, the bake draws so far (and those that got no pass: nothing was
+//!   new, or the frame's milliseconds were spent), whether it served all
+//!   that was due, what it uploaded and how long it took, the queue's
+//!   counts, and how many host copies the audit holds stale at that moment;
+//! - "host copy stale" also says how many bake passes ran between the
+//!   detiling and the line;
+//! - "first copy on the card into a title texture" and, a frame at a time,
+//!   "copies on the card into a title texture": which texture (its title
+//!   memory, size and format), how many copies, into which levels, the
+//!   bounds of those into the first level, from what (a texture, a buffer
+//!   with shaders' writes at their place in the list, a buffer filled from
+//!   title memory), and what the texture held before the first one (zeros,
+//!   the title's bytes). Two runs' lists of these can be laid side by side:
+//!   the scene is the same, the faulty character is not;
+//! - "a slot shows a texture copies on the card wrote": which slots.
+//!
+//! `VICTORY_REPAINT_WATCH=2` adds the exact form of the question, at the
+//! cost of a pause in every frame with a bake: before the frame's first
+//! bake pass every audited texture of up to 4 MiB is read whole, and two
+//! frames later a line "bake audit" says how many were other than their
+//! host copy at that moment, how many of those the pass and the frame's
+//! lists detiled again in that frame, and names up to twelve of the rest.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
@@ -79,7 +117,14 @@ use crate::object::This;
 /// Whether the lines are written.
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_REPAINT_WATCH").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| std::env::var("VICTORY_REPAINT_WATCH").is_ok_and(|v| matches!(v.trim(), "1" | "2")))
+}
+
+/// Whether every audited texture is read before a frame's first bake pass
+/// (`VICTORY_REPAINT_WATCH=2`).
+fn exact() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_REPAINT_WATCH").is_ok_and(|v| v.trim() == "2"))
 }
 
 /// Textures followed at a time; the frames after its last change one is
@@ -254,6 +299,8 @@ pub(crate) fn frame(heap: &crate::descriptor::Heap, frame: u64) {
     if !on() {
         return;
     }
+    copies_frame(frame);
+    bake_audit_done(frame);
     audit_frame(heap, frame);
     let mut w = WATCH.lock().unwrap_or_else(|e| e.into_inner());
     if w.frame == frame || w.now.is_empty() {
@@ -504,6 +551,9 @@ fn audit_one(heap: &crate::descriptor::Heap, a: &mut Audit, i: usize, frame: u64
     let (view_of, texture, tabled, card_copied) = shown(heap, slot);
     if card_copied {
         counts[5] += 1;
+        if let Some(texture) = texture {
+            slot_of_copied(slot, texture, at, len, frame);
+        }
         return 0;
     }
     let held = {
@@ -569,6 +619,7 @@ fn audit_one(heap: &crate::descriptor::Heap, a: &mut Audit, i: usize, frame: u64
                 shaders_writes_landed_there_since =
                     crate::watch::landed_lately(at as usize, len as usize, frame.saturating_sub(detiled_at)),
                 all_mapped = crate::texture::committed(at as usize as *const u8, len as usize),
+                bake_passes_since_detiled = bake_passes_between(detiled_at, frame),
                 stale_now = *stale,
                 "repaint watch: host copy stale"
             );
@@ -638,4 +689,380 @@ fn audit_frame(heap: &crate::descriptor::Heap, frame: u64) {
             "repaint watch: audit"
         );
     }
+}
+
+/// Lines "bake pass" written at most; lines of copies on the card, in all
+/// and for one texture; the textures a "bake audit" line names; and the
+/// largest texture a bake audit reads.
+const BAKE_LINES: u32 = 800;
+const COPY_LINES: u32 = 1500;
+const COPY_LINES_EACH: u32 = 48;
+const BAKE_NAMED: usize = 12;
+const BAKE_LARGEST: u64 = 4 << 20;
+
+/// What a bake audit found other than its host copy: slot, address, bytes,
+/// the frame it was last detiled in, and whether draws read it through a
+/// table.
+type Other = (u32, u64, u64, u64, bool);
+
+/// A bake audit waiting for its line: the frame, the textures and megabytes
+/// read, the milliseconds, and those found other.
+struct BakeAudit {
+    frame: u64,
+    looked: u64,
+    megabytes: u64,
+    ms: u64,
+    other: Vec<Other>,
+}
+
+#[derive(Default)]
+struct Bakes {
+    /// The frames of the passes made for bake draws, in order.
+    passes: Vec<u64>,
+    /// Bake draws: those a pass was made for, those that needed none
+    /// (nothing new since one served all), and those whose frame had spent
+    /// its milliseconds.
+    draws: [u64; 3],
+    lines: u32,
+    audit: Option<BakeAudit>,
+    /// The frame the last bake audit was made in, plus one.
+    audited_in: u64,
+}
+
+static BAKES: Mutex<Option<Bakes>> = Mutex::new(None);
+
+/// A draw of the title's bake is recorded (`State::early_textures`): a pass
+/// follows (0), none is needed (1), or the frame's time for them is spent
+/// (2).
+pub(crate) fn bake_draw(what: usize) {
+    if !on() {
+        return;
+    }
+    let mut b = BAKES.lock().unwrap_or_else(|e| e.into_inner());
+    b.get_or_insert_with(Bakes::default).draws[what.min(2)] += 1;
+}
+
+/// How many bake passes ran in frames `(after, until]`.
+fn bake_passes_between(after: u64, until: u64) -> usize {
+    let b = BAKES.lock().unwrap_or_else(|e| e.into_inner());
+    b.as_ref().map_or(0, |b| b.passes.iter().filter(|&&f| f > after && f <= until).count())
+}
+
+/// Before a pass made for a bake draw (`VICTORY_REPAINT_WATCH=2`, the
+/// frame's first one): every audited texture is read whole and compared
+/// with what its staging buffer was last filled from. The line follows two
+/// frames later ([`bake_audit_done`]).
+pub(crate) fn before_bake(heap: &crate::descriptor::Heap, frame: u64) {
+    if !on() || !exact() {
+        return;
+    }
+    {
+        let mut b = BAKES.lock().unwrap_or_else(|e| e.into_inner());
+        let b = b.get_or_insert_with(Bakes::default);
+        if b.audited_in == frame + 1 || b.audit.is_some() {
+            return;
+        }
+        b.audited_in = frame + 1;
+    }
+    let began = std::time::Instant::now();
+    let (mut looked, mut bytes, mut other) = (0u64, 0u64, Vec::new());
+    {
+        let a = AUDIT.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(a) = a.as_ref() else {
+            return;
+        };
+        let mut seen = std::collections::HashSet::new();
+        for s in &a.slots {
+            if s.len == 0 || s.len > BAKE_LARGEST || !seen.insert(s.at) || key(heap, s.slot) != Some(s.key) {
+                continue;
+            }
+            let (_, _, tabled, card_copied) = shown(heap, s.slot);
+            if card_copied {
+                continue;
+            }
+            let held = {
+                let map = DETILED.lock().unwrap_or_else(|e| e.into_inner());
+                map.as_ref().and_then(|map| map.get(&s.at)).filter(|d| d.bytes == s.len).map(|d| (d.digest, d.frame))
+            };
+            let Some((digest, detiled_at)) = held else {
+                continue;
+            };
+            looked += 1;
+            bytes += s.len;
+            if whole(s.at, s.len) != digest {
+                other.push((s.slot, s.at, s.len, detiled_at, tabled));
+            }
+        }
+    }
+    let ms = began.elapsed().as_millis() as u64;
+    let mut b = BAKES.lock().unwrap_or_else(|e| e.into_inner());
+    b.get_or_insert_with(Bakes::default).audit = Some(BakeAudit { frame, looked, megabytes: bytes >> 20, ms, other });
+}
+
+/// Once a frame: the line of a bake audit made two frames ago or more.
+fn bake_audit_done(frame: u64) {
+    let audit = {
+        let mut b = BAKES.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(b) = b.as_mut() else {
+            return;
+        };
+        if b.audit.as_ref().is_none_or(|a| frame < a.frame + 2) {
+            return;
+        }
+        b.audit.take()
+    };
+    let Some(audit) = audit else {
+        return;
+    };
+    // Detiled again in the bake's frame (the pass before it, or a list of
+    // that frame), in the next one, or left as they were.
+    let (mut same_frame, mut next_frame) = (0u64, 0u64);
+    let mut left: Vec<Other> = Vec::new();
+    {
+        let map = DETILED.lock().unwrap_or_else(|e| e.into_inner());
+        for &(slot, at, len, detiled_at, tabled) in &audit.other {
+            match map.as_ref().and_then(|map| map.get(&at)).map(|d| d.frame) {
+                Some(f) if f != detiled_at && f == audit.frame => same_frame += 1,
+                Some(f) if f != detiled_at && f == audit.frame + 1 => next_frame += 1,
+                _ => left.push((slot, at, len, detiled_at, tabled)),
+            }
+        }
+    }
+    let named: Vec<String> = left
+        .iter()
+        .take(BAKE_NAMED)
+        .map(|&(slot, at, len, detiled_at, tabled)| {
+            format!("slot {slot} at {at:#x} of {len} bytes, detiled in frame {detiled_at}, tabled {tabled}")
+        })
+        .collect();
+    tracing::info!(
+        frame = audit.frame,
+        looked_at = audit.looked,
+        megabytes = audit.megabytes,
+        ms = audit.ms,
+        other_than_the_host_copy = audit.other.len(),
+        detiled_again_in_that_frame = same_frame,
+        detiled_again_in_the_next = next_frame,
+        left_as_they_were = left.len(),
+        kilobytes_left = left.iter().map(|o| o.2).sum::<u64>() >> 10,
+        the_first = ?named,
+        "repaint watch: bake audit"
+    );
+}
+
+/// A pass made for a bake draw has run: its number, whether it served all
+/// that was due, the textures and bytes it uploaded, its milliseconds, and
+/// the queue's counts as it found them
+/// (`crate::descriptor::host::TextureQueue::census`).
+pub(crate) fn bake_pass(frame: u64, pass: u64, served: bool, uploaded: u64, bytes: u64, ms: u64, queue: [u64; 5]) {
+    if !on() {
+        return;
+    }
+    let stale = AUDIT.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |a| a.stale);
+    let mut b = BAKES.lock().unwrap_or_else(|e| e.into_inner());
+    let b = b.get_or_insert_with(Bakes::default);
+    b.passes.push(frame);
+    b.lines += 1;
+    if b.lines > BAKE_LINES {
+        return;
+    }
+    tracing::info!(
+        frame,
+        pass,
+        bake_draws_with_a_pass = b.draws[0],
+        with_nothing_new = b.draws[1],
+        with_the_frames_time_spent = b.draws[2],
+        served_all_that_was_due = served,
+        uploaded,
+        kilobytes = bytes >> 10,
+        ms,
+        queued = queue[0],
+        due = queue[1],
+        waiting_for_memory = queue[2],
+        uploaded_in_part = queue[3],
+        oldest_due_waited_frames = queue[4],
+        host_copies_stale_now = stale,
+        "repaint watch: bake pass"
+    );
+}
+
+/// A title texture copies on the card write into.
+struct Copied {
+    first_frame: u64,
+    copies: u64,
+    /// The frame of the copies not yet told, and of them: how many, a bit
+    /// for each level written, the bounds of those into the first level
+    /// (left, top, right, bottom), how many had no box, and how many came
+    /// from a texture, from a buffer with shaders' writes at their place in
+    /// the list, and from a buffer filled from title memory.
+    frame: u64,
+    in_frame: u32,
+    levels: u64,
+    bounds: [u32; 4],
+    whole: u32,
+    sources: [u32; 3],
+    lines: u32,
+    address: u64,
+}
+
+#[derive(Default)]
+struct Copies {
+    by_texture: HashMap<usize, Copied>,
+    lines: u32,
+    /// Textures a slot was found to show, with a line written.
+    shown: std::collections::HashSet<usize>,
+}
+
+static COPIES: Mutex<Option<Copies>> = Mutex::new(None);
+
+/// The line of one texture's copies of a frame, if there are any.
+fn copies_line(texture: usize, c: &mut Copied, lines: &mut u32) {
+    if c.in_frame == 0 {
+        return;
+    }
+    *lines += 1;
+    c.lines += 1;
+    if *lines <= COPY_LINES && c.lines <= COPY_LINES_EACH {
+        tracing::info!(
+            texture = format_args!("{texture:#x}"),
+            address = format_args!("{:#x}", c.address),
+            frame = c.frame,
+            copies = c.in_frame,
+            levels = format_args!("{:#x}", c.levels),
+            first_level_bounds = ?c.bounds,
+            without_a_box = c.whole,
+            from_textures = c.sources[0],
+            from_buffers_with_shaders_writes_placed = c.sources[1],
+            from_buffers_filled_from_title_memory = c.sources[2],
+            copies_so_far = c.copies,
+            first_copy_in_frame = c.first_frame,
+            "repaint watch: copies on the card into a title texture"
+        );
+    }
+    c.in_frame = 0;
+    c.levels = 0;
+    c.bounds = [u32::MAX, u32::MAX, 0, 0];
+    c.whole = 0;
+    c.sources = [0; 3];
+}
+
+/// Once a frame: the lines of the copies of earlier frames.
+fn copies_frame(frame: u64) {
+    let mut c = COPIES.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(c) = c.as_mut() else {
+        return;
+    };
+    let Copies { by_texture, lines, .. } = c;
+    for (&texture, copied) in by_texture.iter_mut() {
+        if copied.frame < frame {
+            copies_line(texture, copied, lines);
+        }
+    }
+}
+
+/// A list records a copy on the card into title texture `dst` (host texture
+/// `to`), subresource `sub`, at `x`, `y`, of `boxed` of the source (left,
+/// top, front, right, bottom, back; none: all of it). `source`: a texture
+/// (0), a buffer with shaders' writes at their place in the list (1), a
+/// buffer filled from title memory (2). `first`: what was done before it:
+/// nothing, the host wrote the texture before (0); zeros (1); the title's
+/// bytes uploaded (2); nothing, and it is the first (3).
+#[allow(clippy::too_many_arguments)] // what a copy is
+pub(crate) fn card_copy(
+    dst: This,
+    to: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    sub: u32,
+    x: u32,
+    y: u32,
+    boxed: Option<[u32; 6]>,
+    source: usize,
+    first: u8,
+) {
+    if !on() {
+        return;
+    }
+    let frame = crate::frame::current();
+    // SAFETY: a live resource.
+    let d = unsafe { to.GetDesc() };
+    let level = sub % u32::from(d.MipLevels.max(1));
+    let mut c = COPIES.lock().unwrap_or_else(|e| e.into_inner());
+    let Copies { by_texture, lines, .. } = c.get_or_insert_with(Copies::default);
+    let new = !by_texture.contains_key(&(dst as usize));
+    let copied = by_texture.entry(dst as usize).or_insert_with(|| Copied {
+        first_frame: frame,
+        copies: 0,
+        frame,
+        in_frame: 0,
+        levels: 0,
+        bounds: [u32::MAX, u32::MAX, 0, 0],
+        whole: 0,
+        sources: [0; 3],
+        lines: 0,
+        address: crate::resource::texture_memory(dst).map_or(0, |(at, _)| at as u64),
+    });
+    if new || first != 0 {
+        *lines += 1;
+        if *lines <= COPY_LINES {
+            tracing::info!(
+                texture = format_args!("{:#x}", dst as usize),
+                address = format_args!("{:#x}", copied.address),
+                width = d.Width,
+                height = d.Height,
+                layers = d.DepthOrArraySize,
+                levels = d.MipLevels,
+                format = d.Format.0,
+                frame,
+                held_before = match first {
+                    0 => "what the card wrote before the watch saw it",
+                    1 => "zeros",
+                    2 => "the title's bytes, uploaded",
+                    _ => "what its host copy held",
+                },
+                draws_read_it_through_a_table = crate::texture::is_staged(dst),
+                "repaint watch: first copy on the card into a title texture"
+            );
+        }
+    }
+    if copied.frame != frame {
+        copies_line(dst as usize, copied, lines);
+        copied.frame = frame;
+    }
+    copied.copies += 1;
+    copied.in_frame += 1;
+    copied.levels |= 1 << level.min(63);
+    copied.sources[source.min(2)] += 1;
+    match boxed {
+        Some([left, top, _, right, bottom, _]) if level == 0 => {
+            let b = &mut copied.bounds;
+            *b = [
+                b[0].min(x),
+                b[1].min(y),
+                b[2].max(x + right.saturating_sub(left)),
+                b[3].max(y + bottom.saturating_sub(top)),
+            ];
+        }
+        Some(_) => {}
+        None => copied.whole += 1,
+    }
+}
+
+/// The audit met title slot `slot` showing `texture`, which copies on the
+/// card wrote (its memory at `[at, at + len)`): said once for a texture.
+fn slot_of_copied(slot: u32, texture: This, at: u64, len: u64, frame: u64) {
+    let mut c = COPIES.lock().unwrap_or_else(|e| e.into_inner());
+    let c = c.get_or_insert_with(Copies::default);
+    if c.shown.len() >= 300 || !c.shown.insert(texture as usize) {
+        return;
+    }
+    let copied = c.by_texture.get(&(texture as usize));
+    tracing::info!(
+        slot,
+        texture = format_args!("{:#x}", texture as usize),
+        address = format_args!("{at:#x}"),
+        bytes = len,
+        frame,
+        copies_so_far = copied.map_or(0, |c| c.copies),
+        first_copy_in_frame = copied.map_or(0, |c| c.first_frame),
+        "repaint watch: a slot shows a texture copies on the card wrote"
+    );
 }

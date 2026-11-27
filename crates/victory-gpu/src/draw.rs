@@ -2294,6 +2294,11 @@ impl State {
             BAKED_MS.store(0, Ordering::Relaxed);
         }
         let left = bake_ms.saturating_sub(BAKED_MS.load(Ordering::Relaxed));
+        // (`VICTORY_REPAINT_WATCH=1`: a bake draw that gets no pass.)
+        #[cfg(feature = "diagnostics")]
+        if bake && left == 0 {
+            crate::repaint::bake_draw(2);
+        }
         let budget = if bake && left > 0 {
             // What a bake may read must be there now: up to 2 GiB.
             (left, 2 << 30)
@@ -2318,8 +2323,19 @@ impl State {
         if bake && !first && bake_exact() {
             let (writes, noted) = host.texture_news();
             if !noted && BAKE_SERVED.load(Ordering::Relaxed) == writes + 1 {
+                #[cfg(feature = "diagnostics")]
+                crate::repaint::bake_draw(1);
                 return;
             }
+        }
+        // (`VICTORY_REPAINT_WATCH`: the bake draws and their passes; =2
+        // reads every audited texture before a frame's first one.)
+        #[cfg(feature = "diagnostics")]
+        let before = [&HEAP_TEXTURES, &HEAP_TEXTURE_BYTES].map(|c| c.load(Ordering::Relaxed));
+        #[cfg(feature = "diagnostics")]
+        if bake {
+            crate::repaint::bake_draw(0);
+            crate::repaint::before_bake(heap, frame);
         }
         let n = EARLY_TEXTURE_PASSES[usize::from(bake)].fetch_add(1, Ordering::Relaxed) + 1;
         if bake && n.is_power_of_two() {
@@ -2339,6 +2355,18 @@ impl State {
         self.heap_textures(list, heap, host);
         crate::texture::BAKING.set(false);
         PASS_BUDGET.set(None);
+        #[cfg(feature = "diagnostics")]
+        if bake {
+            crate::repaint::bake_pass(
+                frame,
+                n,
+                BAKE_SERVED.load(Ordering::Relaxed) != 0,
+                HEAP_TEXTURES.load(Ordering::Relaxed) - before[0],
+                HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) - before[1],
+                began.elapsed().as_millis() as u64,
+                HEAP_TEXTURES_QUEUE.each_ref().map(|c| c.load(Ordering::Relaxed)),
+            );
+        }
         if bake {
             BAKED_MS.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
         }

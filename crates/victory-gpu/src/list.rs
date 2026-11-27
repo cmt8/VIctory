@@ -1056,6 +1056,11 @@ extern "system" fn copy_texture_region(
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
         let mut read = None;
+        // (`VICTORY_REPAINT_WATCH=1`: what the copy is from, and what its
+        // destination held before the first one: `crate::repaint::card_copy`.)
+        #[cfg(feature = "diagnostics")]
+        let (mut watch_source, mut watch_first) =
+            (0usize, if crate::texture::host_wrote(dst.resource as usize) { 0u8 } else { 3 });
         if src.kind == FOOTPRINT {
             let (Some(host), Some(bytes)) = (crate::host::host(), src.footprint.bytes()) else {
                 return;
@@ -1063,9 +1068,19 @@ extern "system" fn copy_texture_region(
             let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
                 return;
             };
+            #[cfg(feature = "diagnostics")]
+            {
+                watch_source = 2;
+            }
             let buffer = match list.place_source(data as usize, bytes as usize) {
                 // What shaders wrote to it, at this place of the list.
-                Some(buffer) => buffer,
+                Some(buffer) => {
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        watch_source = 1;
+                    }
+                    buffer
+                }
                 None => {
                     let Some((buffer, staging)) = list.upload(host, bytes) else {
                         return;
@@ -1133,9 +1148,17 @@ extern "system" fn copy_texture_region(
                     ensure_state(list, dst.resource, COPY_DEST);
                     let _ = list.first_use(dst.resource as usize);
                     crate::texture::zeros(list, host, to);
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        watch_first = 1;
+                    }
                 }
             } else {
                 crate::texture::upload(list, dst.resource, to);
+                #[cfg(feature = "diagnostics")]
+                {
+                    watch_first = 2;
+                }
             }
             // (Done before the title's copy writes over it.)
             if list.used(dst.resource as usize) {
@@ -1148,6 +1171,21 @@ extern "system" fn copy_texture_region(
         // a copy into a level without memory is dropped.
         crate::texture::card_writes(list, dst.resource, to, Some(dst.footprint.offset as u32));
         crate::texture::host_written(dst.resource);
+        #[cfg(feature = "diagnostics")]
+        if !same && crate::texture::title_written(to) {
+            // SAFETY: the title's box, or null.
+            let boxed = unsafe { source_box.as_ref() }.copied();
+            crate::repaint::card_copy(
+                dst.resource,
+                to,
+                dst.footprint.offset as u32,
+                x,
+                y,
+                boxed,
+                watch_source,
+                watch_first,
+            );
+        }
         if same {
             SELF_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return;
