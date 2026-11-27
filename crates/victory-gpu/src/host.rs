@@ -1029,7 +1029,11 @@ pub(crate) fn made_host() -> Option<&'static Host> {
 /// behaves as before: nothing executes).
 pub(crate) fn host() -> Option<&'static Host> {
     HOST.get_or_init(|| match create() {
-        Ok(host) => Some(host),
+        Ok(host) => {
+            #[cfg(feature = "diagnostics")]
+            crate::crumbs::watch(&host.queue, &host.fence, &host.device);
+            Some(host)
+        }
         Err(e) => {
             tracing::warn!(error = %e, "no host D3D12 device; command lists will not run");
             None
@@ -2968,6 +2972,10 @@ impl Deferred {
 
 impl Drop for Deferred {
     fn drop(&mut self) {
+        #[cfg(feature = "diagnostics")]
+        if crate::crumbs::on() {
+            self.uploads.iter().for_each(crate::crumbs::upload_gone);
+        }
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
     }
@@ -5114,6 +5122,8 @@ impl Host {
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                    #[cfg(feature = "diagnostics")]
+                    crate::crumbs::view(list, crate::crumbs::views::HASH_DIFFERS, true, &work.differs.0);
                     for (shadow, ranges) in &dirty {
                         let (Some((_, Some(before), _)), size) = (shadow.card_sides(), shadow.card_hash_size()) else {
                             continue;
@@ -5126,6 +5136,11 @@ impl Host {
                         // pieces and flags those whose hash is another.
                         list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+                        #[cfg(feature = "diagnostics")]
+                        if crate::crumbs::on() {
+                            crate::crumbs::view(list, crate::crumbs::views::HASH_NOW, false, &shadow.buffer);
+                            crate::crumbs::view(list, crate::crumbs::views::HASH_BEFORE, true, &before);
+                        }
                         let joins = rehash_runs() || own.is_some();
                         let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
                             vec![shadow.card_run(0, usize::MAX)]
@@ -5150,7 +5165,10 @@ impl Host {
                         }
                     }
                     list.Close()?;
-                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                    let lists = [Some(list.cast::<ID3D12CommandList>()?)];
+                    #[cfg(feature = "diagnostics")]
+                    crate::crumbs::exec(&self.queue, crate::crumbs::sent::CARD_SYNC, 0, &lists);
+                    self.queue.ExecuteCommandLists(&lists);
                     Ok(())
                 })()
             };
@@ -5245,12 +5263,19 @@ impl Host {
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                    #[cfg(feature = "diagnostics")]
+                    crate::crumbs::view(list, crate::crumbs::views::HASH_DIFFERS, true, &work.differs.0);
                     for r in plan.ranges.iter().filter(|r| r.compared) {
                         let (Some((_, Some(before), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) else {
                             continue;
                         };
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+                        #[cfg(feature = "diagnostics")]
+                        if crate::crumbs::on() {
+                            crate::crumbs::view(list, crate::crumbs::views::HASH_NOW, false, &r.shadow.buffer);
+                            crate::crumbs::view(list, crate::crumbs::views::HASH_BEFORE, true, &before);
+                        }
                         // (What is only looked at keeps its hashes: what
                         // changed there is the next declared range's to land.)
                         card_pass(list, &r.span, size as u32, r.at, if flown && !r.picked { 2 } else { 1 });
@@ -5508,28 +5533,40 @@ impl Host {
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
                 let _fetching = crate::timeline::span("landing: fetching pieces");
                 if let Some(queue) = &copy_queue {
+                    #[cfg(feature = "diagnostics")]
+                    crate::crumbs::exec(queue, crate::crumbs::sent::FETCH, 0, &lists);
                     queue.ExecuteCommandLists(&lists);
                     queue.Signal(&fence, sent)?;
+                    #[cfg(feature = "diagnostics")]
+                    crate::crumbs::signal(queue, &fence, sent);
                     meanwhile();
                     fence.SetEventOnCompletion(sent, event)?;
                     #[cfg(feature = "diagnostics")]
                     let _card = crate::timeline::card_wait(None);
                     WaitForSingleObject(event, INFINITE);
+                    #[cfg(feature = "diagnostics")]
+                    crate::crumbs::waited(&fence, sent);
                     return Ok(behind);
                 }
                 // In the order of the queue: the sends of title bytes so
                 // far are ahead of this fetch, every later one behind it.
                 let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+                #[cfg(feature = "diagnostics")]
+                crate::crumbs::exec(&self.queue, crate::crumbs::sent::FETCH, 0, &lists);
                 self.queue.ExecuteCommandLists(&lists);
                 let after = *order;
                 drop(order);
                 self.card_sent();
                 self.queue.Signal(&fence, sent)?;
+                #[cfg(feature = "diagnostics")]
+                crate::crumbs::signal(&self.queue, &fence, sent);
                 meanwhile();
                 fence.SetEventOnCompletion(sent, event)?;
                 #[cfg(feature = "diagnostics")]
                 let _card = crate::timeline::card_wait(None);
                 WaitForSingleObject(event, INFINITE);
+                #[cfg(feature = "diagnostics")]
+                crate::crumbs::waited(&fence, sent);
                 Ok(after)
             })()
         };
@@ -5815,13 +5852,20 @@ impl Host {
                         list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
                     }
                     list.Close()?;
-                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                    let lists = [Some(list.cast::<ID3D12CommandList>()?)];
+                    #[cfg(feature = "diagnostics")]
+                    crate::crumbs::exec(&self.queue, crate::crumbs::sent::FETCH, 0, &lists);
+                    self.queue.ExecuteCommandLists(&lists);
                     self.card_sent();
                     *submitted += 1;
                     self.queue.Signal(&self.fence, *submitted)?;
+                    #[cfg(feature = "diagnostics")]
+                    crate::crumbs::signal(&self.queue, &self.fence, *submitted);
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
                     WaitForSingleObject(self.event, INFINITE);
+                    #[cfg(feature = "diagnostics")]
+                    crate::crumbs::waited(&self.fence, *submitted);
                     stood(waiting);
                     working(was_working);
                     Ok(())
@@ -6528,9 +6572,13 @@ impl Host {
             let signalled = unsafe {
                 let mut from = 0;
                 for to in cuts.into_iter().chain([lists.len()]) {
+                    #[cfg(feature = "diagnostics")]
+                    crate::crumbs::exec(&self.queue, crate::crumbs::sent::LATE, this_submission, &lists[from..to]);
                     self.queue.ExecuteCommandLists(&lists[from..to]);
                     from = to;
                 }
+                #[cfg(feature = "diagnostics")]
+                crate::crumbs::signal(&self.queue, &self.fence, *submitted);
                 self.queue.Signal(&self.fence, *submitted)
             };
             awake::sent(&self.device);
@@ -6586,8 +6634,12 @@ impl Host {
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
+                #[cfg(feature = "diagnostics")]
+                crate::crumbs::exec(&self.queue, crate::crumbs::sent::SYNC, this_submission, group);
                 self.queue.ExecuteCommandLists(group);
                 self.card_sent();
+                #[cfg(feature = "diagnostics")]
+                crate::crumbs::signal(&self.queue, &self.fence, *submitted);
                 let signalled = self.queue.Signal(&self.fence, *submitted);
                 #[cfg(feature = "diagnostics")]
                 crate::timeline::sent(sending, *submitted, stamp);
@@ -7795,6 +7847,8 @@ impl HostList {
         // With [`card_steps`] the card may be the one that fills it.
         let (buffer, data) = if card_steps::stage() > 1 { host.shared_buffer(size)? } else { host.upload_buffer(size)? };
         name(&buffer, || format!("list upload {size:#x}"));
+        #[cfg(feature = "diagnostics")]
+        crate::crumbs::upload_made(&self.list, &buffer, size, u64::from(card_steps::stage()));
         self.deferred().hold_upload(buffer.clone(), size);
         Some((buffer, data))
     }

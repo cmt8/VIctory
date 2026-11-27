@@ -34,6 +34,8 @@ mod copystat;
 mod faultbook;
 #[cfg(windows)]
 mod cores;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod crumbs;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]

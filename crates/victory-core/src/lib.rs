@@ -4,8 +4,11 @@
 //! * [`policy`]: the runtime half of rule #1, refusing to write
 //!   game-derived data into the source tree.
 //! * [`logging`]: one tracing setup for all binaries.
+//! * [`crumbs`]: the record of what was sent to the card last, and its
+//!   reader.
 
 pub mod config;
+pub mod crumbs;
 pub mod logging;
 pub mod policy;
 

@@ -1865,6 +1865,10 @@ impl State {
                             return false;
                         };
                         debug_assert_ne!(m.directory, 0, "our directory at GPU address 0");
+                        #[cfg(feature = "diagnostics")]
+                        if crate::crumbs::on() {
+                            crate::crumbs::steady_view(crate::crumbs::views::MEMORY_DIRECTORY, false, m.directory);
+                        }
                         // SAFETY: an open list; the directory lives as
                         // long as the process and the list holds it.
                         unsafe {
@@ -1961,6 +1965,10 @@ impl State {
                         unbound_root("the empty-page notes without title memory's directory");
                         return false;
                     };
+                    #[cfg(feature = "diagnostics")]
+                    if crate::crumbs::on() {
+                        crate::crumbs::steady_view(crate::crumbs::views::MEMORY_FAULTS, true, m.faults);
+                    }
                     // SAFETY: an open list; the buffer lives as long as
                     // the process and the list holds it.
                     unsafe {

@@ -581,6 +581,8 @@ fn record_clamp_as(
         // Earlier shader writes (the title's argument and count passes) first.
         l.ResourceBarrier(&first[skip..]);
         if records > 0 {
+            #[cfg(feature = "diagnostics")]
+            crate::crumbs::clamp(l, dst, u64::from(records) * u64::from(stride), src_gpu + u64::from(args_offset), budget);
             l.SetComputeRootSignature(&c.root);
             l.SetPipelineState(&c.pso);
             l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
@@ -647,6 +649,8 @@ pub(crate) fn open_batch(
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
     batch::record(c, &list.list, (&dst, before), budget, sources, jobs);
+    #[cfg(feature = "diagnostics")]
+    crate::crumbs::batch(&list.list, jobs, &dst, u64::from(base), budget);
     // SAFETY: the list's own upload memory of that many bytes, 256-byte
     // aligned, until it is reset.
     Some((unsafe { batch::Table::new(at, base, ids) }, dst))

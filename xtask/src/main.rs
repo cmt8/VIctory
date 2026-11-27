@@ -1,5 +1,6 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
+mod crumbs;
 mod policy;
 #[cfg(test)]
 mod switches;
@@ -43,6 +44,20 @@ enum Cmd {
         #[arg(last = true)]
         args: Vec<std::ffi::OsString>,
     },
+    /// Read a breadcrumb file (a diagnostics build run with
+    /// `VICTORY_CRUMBS=1` writes `victory-crumbs.bin`): the submissions the
+    /// card had not finished when the records end, and every record that
+    /// names bytes outside their buffer.
+    Crumbs {
+        /// The file.
+        file: PathBuf,
+        /// Every record of the lists not finished, not only their counts.
+        #[arg(long)]
+        records: bool,
+        /// The last records of the file, whatever they are of.
+        #[arg(long, value_name = "N")]
+        tail: Option<usize>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -74,6 +89,11 @@ fn main() -> Result<()> {
                 args,
             },
         ),
+        Cmd::Crumbs { file, records, tail } => {
+            let bytes = std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?;
+            print!("{}", crumbs::read(&bytes, records, tail.unwrap_or(0))?);
+            Ok(())
+        }
     }
 }
 

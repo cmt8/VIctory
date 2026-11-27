@@ -364,11 +364,18 @@ impl Own {
                 list.SetPipelineState(&pass.pso);
                 list.SetComputeRootShaderResourceView(1, source.GetGPUVirtualAddress());
                 list.SetComputeRootUnorderedAccessView(3, pass.notes.GetGPUVirtualAddress());
-                for ((shadow, _), copy) in dirty.iter().zip(&self.copies).filter(|(_, c)| c.pairs.1 > 0) {
+                for ((shadow, _ranges), copy) in dirty.iter().zip(&self.copies).filter(|(_, c)| c.pairs.1 > 0) {
                     list.SetComputeRootUnorderedAccessView(2, shadow.buffer.GetGPUVirtualAddress());
                     const MOST: u32 = 64 * D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION;
                     let (at, words) = copy.pairs;
                     let bytes = bound(shadow.width());
+                    #[cfg(feature = "diagnostics")]
+                    if crate::crumbs::on() {
+                        // (Where the last of the copy's changed words ends.)
+                        let end = _ranges.iter().filter(|r| short(r.0, r.1 - r.0)).map(|r| r.1 as u64).max().unwrap_or(0);
+                        let pairs = source.GetGPUVirtualAddress() + at;
+                        crate::crumbs::scatter(list, pairs, u64::from(words), shadow.buffer.GetGPUVirtualAddress(), shadow.width(), end);
+                    }
                     let mut done = 0;
                     while done < words {
                         let n = (words - done).min(MOST);

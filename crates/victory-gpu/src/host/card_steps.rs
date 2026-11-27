@@ -577,7 +577,8 @@ fn record(
     // here is counted and said. (After SlaktarnVI's check at this place.)
     let mut widths: Vec<(usize, u64)> = Vec::new();
     let mut left_out = 0;
-    let mut inside = |all: &[(&ID3D12Resource, u64, u64, u64)]| -> Vec<(ID3D12Resource, u64, u64, u64)> {
+    let mut inside = |all: &[(&ID3D12Resource, u64, u64, u64)], write: bool| -> Vec<(ID3D12Resource, u64, u64, u64)> {
+        let _ = write;
         let mut kept = Vec::with_capacity(all.len());
         for &(buffer, offset, at, len) in all {
             let key = buffer.as_raw() as usize;
@@ -590,6 +591,8 @@ fn record(
                     width
                 }
             };
+            #[cfg(feature = "diagnostics")]
+            crate::crumbs::step_copy(list, (write, fits(width, offset, at, len)), buffer, width, [offset, at, len]);
             if fits(width, offset, at, len) {
                 kept.push((buffer.clone(), offset, at, len));
             } else {
@@ -602,7 +605,7 @@ fn record(
         }
         kept
     };
-    let (reads, writes) = (inside(reads), inside(writes));
+    let (reads, writes) = (inside(reads, false), inside(writes, true));
     let reads: Vec<(&ID3D12Resource, u64, u64, u64)> = reads.iter().map(|r| (&r.0, r.1, r.2, r.3)).collect();
     let writes: Vec<(&ID3D12Resource, u64, u64, u64)> = writes.iter().map(|w| (&w.0, w.1, w.2, w.3)).collect();
     let (reads, writes) = (&reads[..], &writes[..]);
@@ -929,6 +932,8 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         own.list.note_op(|| format!("{} copies of title memory done on the card, {end} bytes (VICTORY_CARD_STEPS)", ops.len()));
         let levels = ops.iter().map(|op| op.level).max().unwrap_or(0);
+        #[cfg(feature = "diagnostics")]
+        crate::crumbs::step_list(&own.list.list, &own.between, [ops.len() as u64, u64::from(levels) + 1, end]);
         for level in 0..=levels {
             let mut reads = Vec::new();
             let mut writes = Vec::new();
@@ -962,6 +967,8 @@ impl Host {
                 {
                     // (A heap that is gone, or another one made where it
                     // was: nothing of this submission can read the slot.)
+                    #[cfg(feature = "diagnostics")]
+                    crate::crumbs::step_slot(&own.list.list, *heap as u64, *id, u64::from(*index), gpu + op.at, op.len as u64);
                     crate::descriptor::constant_slot(*heap, *id, *index, &own.between, gpu + op.at, op.len as u32);
                 }
             }

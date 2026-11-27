@@ -739,10 +739,18 @@ fn neutral() -> Option<&'static ID3D12Resource> {
                 list.CopyTextureRegion(&to, 0, 0, 0, &source, None);
                 list.Close().ok()?;
                 let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
-                queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).ok()?)]);
+                let lists = [Some(windows::core::Interface::cast::<ID3D12CommandList>(&list).ok()?)];
+                #[cfg(feature = "diagnostics")]
+                {
+                    crate::crumbs::exec(&queue, crate::crumbs::sent::OTHER, 0, &lists);
+                    crate::crumbs::signal(&queue, &fence, 1);
+                }
+                queue.ExecuteCommandLists(&lists);
                 queue.Signal(&fence, 1).ok()?;
                 // (Without an event: this waits.)
                 fence.SetEventOnCompletion(1, windows::Win32::Foundation::HANDLE::default()).ok()?;
+                #[cfg(feature = "diagnostics")]
+                crate::crumbs::waited(&fence, 1);
                 Some(made)
             }
         })
