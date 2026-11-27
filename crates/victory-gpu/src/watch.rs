@@ -4657,6 +4657,10 @@ mod tests {
         PORT_GUARD_IN_TEST.set(port);
         assert!(!port || port_guard());
         let p = placeholder(4);
+        // Nothing is known of what was at the address before: another test's
+        // memory may have been here and gone with no word of it, as no
+        // memory of the title's does (told as the runtime tells it).
+        title_memory_unmapping(p, 4 * BLOCK);
         // SAFETY: a section's block in place of the first placeholder.
         let view = unsafe {
             let section =
