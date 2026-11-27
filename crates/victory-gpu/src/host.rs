@@ -3445,8 +3445,26 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
 /// What can go wrong: a constant a flight's shader really writes, in a
 /// block that the title (or an earlier flight's copy-back) also wrote, or
 /// for the first time, is read as it was before that flight.
+///
+/// How often that is so is counted: a read taken as the title's is noted
+/// ([`crate::watch::taken_as_titles`]), and a shader's write that lands in
+/// one of its pages within a frame is warned of and told by the frame-rate
+/// line. What the waits are for with the switch off, and how many of them it
+/// would take away, is told there too ([`quiet`]).
 fn fill_is_titles(src: usize, len: usize) -> bool {
-    const SMALL: usize = 64 << 10;
+    let mode = fill_title();
+    if mode == 0 || len > quiet::SMALL {
+        return false;
+    }
+    let titles = !crate::watch::landed_lately(src, len, 600) || mode == 1 && crate::watch::written_since_taken(src, len);
+    if titles {
+        crate::watch::taken_as_titles(src, len);
+    }
+    titles
+}
+
+/// `VICTORY_FILL_TITLE` ([`fill_is_titles`]): 0, 1 or 2.
+fn fill_title() -> u32 {
     static MODE: OnceLock<u32> = OnceLock::new();
     let mode = *MODE.get_or_init(|| match std::env::var("VICTORY_FILL_TITLE").ok().as_deref() {
         Some("1") => 1,
@@ -3455,10 +3473,7 @@ fn fill_is_titles(src: usize, len: usize) -> bool {
     });
     #[cfg(feature = "diagnostics")]
     let mode = crate::ab::pick("VICTORY_FILL_TITLE").map_or(mode, |on| if on { 2 } else { 0 });
-    if mode == 0 || len > SMALL {
-        return false;
-    }
-    !crate::watch::landed_lately(src, len, 600) || mode == 1 && crate::watch::written_since_taken(src, len)
+    mode
 }
 
 /// Diagnostics: the waits for flights, by what waited, why it was not done
@@ -4321,6 +4336,7 @@ fn late_line(frames: f64) {
         );
     }
     card_steps::log(frames);
+    quiet::log(frames);
     crate::port::log(frames);
     crate::port_cbv::log(frames);
     crate::watch::port_guard_line(frames);
@@ -4361,6 +4377,7 @@ mod card_steps;
 pub(crate) mod indirects;
 mod panel;
 mod place;
+mod quiet;
 pub(crate) mod rec;
 mod send;
 mod upq;
@@ -6239,6 +6256,10 @@ impl Host {
         } else if own.is_none()
             && let Some(why) = late_blocked(runs)
         {
+            if why == WHY_READ {
+                // (A report of what the wait is for: nothing is changed.)
+                quiet::look(runs);
+            }
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
