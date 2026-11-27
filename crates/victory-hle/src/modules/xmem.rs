@@ -180,6 +180,13 @@ pub extern "system" fn XMemVirtualAlloc(
     if !at.is_null() && !placeholder {
         victory_gpu::title_memory_allocated(at as usize, size);
     }
+    // A placeholder made just now, ours or one the title asked for by its
+    // own flag: only our mapping calls put pages into it, so the GPU side
+    // knows its holes without asking the host (`VICTORY_HOLE_RECORDS`). Told
+    // before the title has the address.
+    if !at.is_null() && kind & MEM_RESERVE_PLACEHOLDER != 0 && kind & (MEM_COMMIT | MEM_REPLACE_PLACEHOLDER) == 0 {
+        victory_gpu::title_memory_reserved(at as usize, size);
+    }
     // (Grand Theft Auto VI asks for its 32-bit heap with kind 0x42000,
     // without the 64 KiB page bits: not `placeholder` above, though the host
     // makes a placeholder of it all the same.)
@@ -2237,6 +2244,52 @@ mod tests {
         assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64));
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
         assert_eq!(XMemIsToolsMemAvailable(), 0);
+    }
+
+    /// What the GPU side is told of a reservation of 64 KiB pages, as it is
+    /// made, mapped into in every way there is and unmapped from, is what the
+    /// host says of it: its records answer for every block, hole or view
+    /// (`VICTORY_HOLE_RECORDS`), until the title frees the reservation.
+    #[test]
+    fn the_gpu_side_knows_the_holes_of_a_reservation_from_what_it_is_told() {
+        const N: usize = 12;
+        let pages = allocate(N);
+        let a = XMemVirtualAlloc(std::ptr::null_mut(), N * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        assert!(!a.is_null());
+        let at = |page: usize| a.wrapping_byte_add(page * PAGE);
+        // Every block is the records' to answer for, and none differs.
+        let same = |what: &str| assert_eq!(victory_gpu::title_memory_holes_compared(a as usize, N * PAGE), (N, None), "{what}");
+        same("reserved");
+        assert_eq!(XMemMapPhysicalPages(at(1), 4, pages.as_ptr()), at(1));
+        same("a view of four pages");
+        // (The whole view goes, and what stays of it is mapped again.)
+        assert_eq!(XMemMapPhysicalPages(at(2), 1, std::ptr::null()), at(2));
+        same("a page taken out of it");
+        assert_eq!(XMemMapPhysicalPages(at(2), 1, pages[9..].as_ptr()), at(2));
+        same("another put in its place");
+        let to = [at(7), at(9), at(11)];
+        assert_eq!(XMemMapPhysicalPagesScatter(to.as_ptr(), 3, pages[4..].as_ptr()), 1);
+        same("pages scattered");
+        assert!(map_alias(at(6) as u64, at(1) as u64, PAGE as u64));
+        assert!(map_aliases(&[(at(8) as u64, at(3) as u64, PAGE as u64), (at(10) as u64, at(7) as u64, PAGE as u64)]));
+        same("the GPU's page-mapping copies");
+        assert_eq!(XMemMapPhysicalPagesScatter(to.as_ptr(), 3, [0usize; 3].as_ptr()), 1);
+        assert!(map_alias(at(6) as u64, 0, PAGE as u64));
+        same("some unmapped");
+        assert_eq!(XMemMapPhysicalPages(a, N, std::ptr::null()), a);
+        same("all unmapped");
+        // The title joins the pieces its mappings cut the placeholder into
+        // (of which the GPU side is not told: nothing shows anything else).
+        assert_ne!(title_virtual_free(a, N * PAGE, MEM_RELEASE | 1 /* MEM_COALESCE_PLACEHOLDERS */), 0);
+        same("the placeholders joined");
+        assert_eq!(XMemMapPhysicalPages(a, N, pages.as_ptr()), a);
+        same("all of it one view");
+        assert_eq!(XMemMapPhysicalPages(a, N, std::ptr::null()), a);
+        same("and unmapped");
+        assert_eq!(XMemFreePhysicalPages(N, pages.as_ptr()), 1);
+        // Given up by the title: the host is asked about it from then on.
+        assert_ne!(title_virtual_free(a, 0, MEM_RELEASE), 0);
+        assert_eq!(victory_gpu::title_memory_holes_compared(a as usize, N * PAGE).0, 0);
     }
 
     /// A thread that reads a mapped page in place, as the GPU side reads a

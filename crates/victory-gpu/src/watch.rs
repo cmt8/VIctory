@@ -30,6 +30,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Bound, RangeBounds};
 use std::sync::{Condvar, Mutex, RwLock};
 
+pub(crate) mod reserved;
+
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
 /// big buffers cost more than the copies they saved.
@@ -1748,6 +1750,48 @@ impl Bits {
         })
     }
 
+    /// Sets all of `[first, last)` (not what lies past the address space).
+    fn set_all(&self, first: usize, last: usize) {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire, SeqCst};
+        let last = last.min(Bits::PIECES * Bits::WORDS * 64);
+        if first >= last {
+            return;
+        }
+        for word in first / 64..last.div_ceil(64) {
+            let Some(place) = self.0.get(word / Bits::WORDS) else {
+                return;
+            };
+            if place.load(Acquire).is_null() {
+                let piece: Box<BitsPiece> = Box::new([const { std::sync::atomic::AtomicU64::new(0) }; Bits::WORDS]);
+                let piece = Box::into_raw(piece);
+                if place.compare_exchange(std::ptr::null_mut(), piece, AcqRel, Acquire).is_err() {
+                    // SAFETY: made just now, and another thread's is there.
+                    drop(unsafe { Box::from_raw(piece) });
+                }
+            }
+            if let Some(piece) = self.piece(word) {
+                piece[word % Bits::WORDS].fetch_or(in_word(word * 64, first, last), SeqCst);
+            }
+        }
+    }
+
+    /// Clears all of `[first, last)`.
+    fn clear_all(&self, first: usize, last: usize) {
+        let last = last.min(Bits::PIECES * Bits::WORDS * 64);
+        let mut word = first / 64;
+        while first < last && word * 64 < last {
+            match self.piece(word) {
+                Some(piece) => {
+                    let mask = in_word(word * 64, first, last);
+                    piece[word % Bits::WORDS].fetch_and(!mask, std::sync::atomic::Ordering::SeqCst);
+                    word += 1;
+                }
+                // None of the piece's is set.
+                None => word = (word / Bits::WORDS + 1) * Bits::WORDS,
+            }
+        }
+    }
+
     /// How many are set.
     fn count(&self) -> usize {
         self.0
@@ -2076,8 +2120,11 @@ fn placeholder(block: usize) -> bool {
 }
 
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
-/// committed: what was known of holes there is asked again.
+/// committed: what was known of holes there is asked again. (And asked of
+/// Windows: what is there now is no hole of a reservation that only the
+/// runtime's mapping fills, [`reserved`].)
 pub fn title_memory_allocated(at: usize, len: usize) {
+    reserved::RECORDS.forget(at, len);
     if len == 0 || !known_holes() {
         return;
     }
@@ -2089,9 +2136,20 @@ pub fn title_memory_allocated(at: usize, len: usize) {
     }
 }
 
+/// The runtime reserved `[at, at + len)` for the title as a placeholder:
+/// address space in which pages come to be only by the runtime's mapping
+/// views of the title's physical pages there, of which it tells
+/// ([`title_memory_remapped`], [`title_memory_unmapping`]). Called when the
+/// reservation is made, before the title has its address. From then on the
+/// holes among its blocks are known without asking Windows ([`reserved`]).
+pub fn title_memory_reserved(at: usize, len: usize) {
+    reserved::RECORDS.reserve(at, len);
+}
+
 /// Once a frame: a hundredth of the known holes are looked at, in case one
 /// was filled with nobody telling ([`title_memory_allocated`],
-/// [`title_memory_remapped`]), which no title we know does.
+/// [`title_memory_remapped`]), which no title we know does. (Windows is
+/// asked: the runtime's own records, [`reserved`], are what is doubted.)
 pub(crate) fn look_at_holes() {
     const PARTS: usize = 100;
     if !known_holes() {
@@ -2108,7 +2166,7 @@ pub(crate) fn look_at_holes() {
     let mut until = 0;
     for block in blocks {
         if block >= until {
-            until = uncommitted_end(block);
+            until = uncommitted_end_asked(block);
         }
         if block >= until {
             // (Or unmapped memory was mapped since the part was taken: told
@@ -2737,7 +2795,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     for block in unsure {
         // One question for the blocks of a region.
         if block >= uncommitted_until {
-            uncommitted_until = uncommitted_end(block);
+            uncommitted_until = uncommitted_end(block, last);
             #[cfg(feature = "diagnostics")]
             tally(9, 1);
         }
@@ -3115,7 +3173,9 @@ fn protect_here(g: &Guards, from: usize, to: usize) {
         }
         PROTECTED.clear(block);
         if block >= uncommitted_until {
-            uncommitted_until = uncommitted_end(block);
+            // (Windows' word, whatever the runtime's records say: what is
+            // noted a hole here was one.)
+            uncommitted_until = uncommitted_end_found(block, to);
             #[cfg(feature = "diagnostics")]
             tally(9, 1);
         }
@@ -3128,8 +3188,39 @@ fn protect_here(g: &Guards, from: usize, to: usize) {
     }
 }
 
-/// The end (exclusive) of the whole uncommitted blocks starting at `block`.
-fn uncommitted_end(block: usize) -> usize {
+/// The end (exclusive) of the whole uncommitted blocks starting at `block`
+/// (`block` itself: it is not one), or `limit` if they go on past it: the
+/// caller asks about blocks before `limit` only. Asked by [`guard`] of blocks
+/// noted absent before: whether they are holes still.
+///
+/// What rests on it: a block before that end is a hole. [`guard`] leaves it
+/// noted absent, tells nothing of it and guards nothing there, and the copies
+/// of title memory keep the zeros they have for it, until the runtime tells
+/// of something there. So an end too far leaves memory that is there unread,
+/// and the card with zeros for it; an end too near has a hole told as written
+/// and read at every asking, which fails, and costs, and no more.
+///
+/// From the runtime's own records where they know ([`reserved`]), from
+/// Windows where they do not (`VICTORY_HOLE_RECORDS=0`: from Windows always,
+/// as before).
+fn uncommitted_end(block: usize, limit: usize) -> usize {
+    reserved::end(reserved::mode(), block, limit)
+}
+
+/// [`uncommitted_end`] for a block that could not be guarded and was not
+/// noted absent before ([`protect_here`]): Windows is asked, as ever, so
+/// nothing is first taken for a hole on the records' word alone (and the
+/// records are compared with what it says, [`reserved::found`]). These are
+/// few: one for each hole that comes to be, not one at every asking.
+fn uncommitted_end_found(block: usize, limit: usize) -> usize {
+    reserved::found(reserved::mode(), block, limit)
+}
+
+/// [`uncommitted_end`], Windows asked: the end of the region `block` begins
+/// in, if that is reserved or free. One question is a walk through the
+/// process's views (under Wine behind its one address-space lock, with the
+/// signals held off around it).
+fn uncommitted_end_asked(block: usize) -> usize {
     use windows_sys::Win32::System::Memory::{
         MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
@@ -3631,6 +3722,10 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// neither guarded nor writable) and a kernel read into it fail, so the
 /// write access is given back.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    // A view is there, committed: no hole from now on ([`reserved`]). Ahead
+    // of the guards' forgetting what they noted of its blocks: whoever finds
+    // one of them unguardable after that, and asks, is told of the view.
+    reserved::RECORDS.show(at, len);
     crate::texback::remapped(at, len);
     open(&mut title_memory_changed(at, len), at, at.saturating_add(len));
 }
@@ -3641,6 +3736,9 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 /// before the unmapping would leave the address guarded, clean and known by
 /// its bits ([`PUBLISHED`]) with no view behind it.
 pub fn title_memory_unmapping(at: usize, len: usize) {
+    // No view from now on, as far as the runtime's records go ([`reserved`]):
+    // ahead of the unmapping, so that what they call a view is one.
+    reserved::RECORDS.hide(at, len);
     crate::texback::remapped(at, len);
     forget_views(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     let mut g = title_memory_changed(at, len);
@@ -3666,6 +3764,15 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
+    // What the runtime reserved there is its own no more ([`reserved`]): the
+    // range, or the allocation that begins at `at` as Windows has it now,
+    // before it goes (a placeholder the title cut out of a reservation is
+    // one).
+    if len != 0 {
+        reserved::RECORDS.forget(at, len);
+    } else if reserved::RECORDS.any(at, 1) {
+        reserved::RECORDS.forget(at, allocation_end(at, at).saturating_sub(at).max(1));
+    }
     if len != 0 {
         forget_views(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     } else if VIEWS.any(at / BLOCK, at / BLOCK + 1) {
