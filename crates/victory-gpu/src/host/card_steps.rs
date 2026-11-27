@@ -520,6 +520,13 @@ fn fill_to(runs: &[&HostList], step: (usize, usize)) -> Option<FillTo> {
     }
 }
 
+/// Why a submission waits whose steps would copy outside a buffer
+/// ([`fits`]).
+const OUTSIDE_A_BUFFER: &str = "a copy would not lie in its buffer";
+
+/// Submissions refused for it, since the start.
+static OUTSIDE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// A step done on the card.
 struct Op {
     from: (Arc<Shadow>, usize),
@@ -551,7 +558,45 @@ fn record(
     between: &ID3D12Resource,
     reads: &[(&ID3D12Resource, u64, u64, u64)],
     writes: &[(&ID3D12Resource, u64, u64, u64)],
-) {
+) -> usize {
+    // Every range is looked at once more before it is recorded: nothing
+    // between here and the card checks a buffer copy (vkd3d-proton passes
+    // the offsets on, and RADV adds them to the buffer's address), and a
+    // range past a buffer's end is a write by the card to an address of no
+    // allocation, a page fault and with it a reset. `Host::take_steps` has
+    // refused the submission by now if one does not fit; what is left out
+    // here is counted and said. (After SlaktarnVI's check at this place.)
+    let mut widths: Vec<(usize, u64)> = Vec::new();
+    let mut left_out = 0;
+    let mut inside = |all: &[(&ID3D12Resource, u64, u64, u64)]| -> Vec<(ID3D12Resource, u64, u64, u64)> {
+        let mut kept = Vec::with_capacity(all.len());
+        for &(buffer, offset, at, len) in all {
+            let key = buffer.as_raw() as usize;
+            let width = match widths.iter().find(|w| w.0 == key) {
+                Some(w) => w.1,
+                None => {
+                    // SAFETY: a plain query of a live buffer.
+                    let width = unsafe { buffer.GetDesc() }.Width;
+                    widths.push((key, width));
+                    width
+                }
+            };
+            if fits(width, offset, at, len) {
+                kept.push((buffer.clone(), offset, at, len));
+            } else {
+                left_out += 1;
+                let n = LEFT_OUT.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 16 || n.is_power_of_two() {
+                    tracing::warn!(offset, at, len, width, n, "a card step's copy does not lie in its buffer: left out");
+                }
+            }
+        }
+        kept
+    };
+    let (reads, writes) = (inside(reads), inside(writes));
+    let reads: Vec<(&ID3D12Resource, u64, u64, u64)> = reads.iter().map(|r| (&r.0, r.1, r.2, r.3)).collect();
+    let writes: Vec<(&ID3D12Resource, u64, u64, u64)> = writes.iter().map(|w| (&w.0, w.1, w.2, w.3)).collect();
+    let (reads, writes) = (&reads[..], &writes[..]);
     let common = D3D12_RESOURCE_STATE_COMMON;
     let (source, dest) = (D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     let mut sources: Vec<&ID3D12Resource> = Vec::new();
@@ -597,6 +642,19 @@ fn record(
             list.ResourceBarrier(&done);
         }
     }
+    left_out
+}
+
+/// Copies [`record`] left out because they did not lie in their buffers,
+/// since the start.
+static LEFT_OUT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether a copy of `len` bytes between `offset` of a buffer `width` bytes
+/// wide and `at` of the buffer between ([`BETWEEN`] bytes) lies in both.
+fn fits(width: u64, offset: u64, at: u64, len: u64) -> bool {
+    len != 0
+        && offset.checked_add(len).is_some_and(|end| end <= width)
+        && at.checked_add(len).is_some_and(|end| end <= BETWEEN)
 }
 
 /// The list in front of a submission's, and its buffer ([`BETWEEN`] bytes).
@@ -795,6 +853,40 @@ impl Host {
                 level,
                 to,
             });
+        }
+        // Every range inside its buffers, before a list is taken, a copy
+        // brought up to date or a write declared: a submission with one that
+        // is not waits, as without card steps (see `record`).
+        {
+            let mut widths: HashMap<usize, u64> = HashMap::default();
+            let mut width = |buffer: &ID3D12Resource| {
+                // SAFETY: a plain query of a live buffer.
+                *widths.entry(buffer.as_raw() as usize).or_insert_with(|| unsafe { buffer.GetDesc() }.Width)
+            };
+            for op in &ops {
+                let len = op.len as u64;
+                let read = fits(width(&op.from.0.buffer), op.from.0.offset(op.from.1 as u64), op.at, len);
+                let write = match &op.to {
+                    To::Copy(to, dst) => fits(width(&to.buffer), to.offset(*dst as u64), op.at, len),
+                    To::Buffer(buffer) => fits(width(buffer), 0, op.at, len),
+                    To::Slot(..) => true,
+                };
+                if !(read && write) {
+                    let n = OUTSIDE.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n <= 16 || n.is_power_of_two() {
+                        tracing::warn!(
+                            src = op.from.1,
+                            len = op.len,
+                            at = op.at,
+                            read,
+                            write,
+                            n,
+                            "a card step would copy outside a buffer: the submission waits instead"
+                        );
+                    }
+                    return Err(OUTSIDE_A_BUFFER);
+                }
+            }
         }
         spent.next("steps on the card: the list");
         let Some(own) = self.own_list() else {
@@ -1195,6 +1287,45 @@ mod tests {
     fn what_no_host_copy_holds_is_refused() {
         let writers = [Writer { shadow: None, from: 100, to: 108, copy: false }];
         assert!(holder(&writers, 104, 120).is_err());
+    }
+
+    #[test]
+    fn a_copy_lies_in_its_buffer_and_the_one_between() {
+        let width = 1 << 16;
+        assert!(fits(width, 0, 0, 1));
+        assert!(fits(width, width - 100, BETWEEN - 100, 100));
+        // Nothing, past the buffer's end, past the end of the one between.
+        assert!(!fits(width, 0, 0, 0));
+        assert!(!fits(width, width - 99, 0, 100));
+        assert!(!fits(width, width, 0, 1));
+        assert!(!fits(width, 0, BETWEEN - 99, 100));
+        // An offset that came out of a subtraction below zero, and sums that
+        // wrap.
+        assert!(!fits(width, 0u64.wrapping_sub(4096), 0, 4096));
+        assert!(!fits(u64::MAX, u64::MAX - 1, 0, 2));
+        assert!(!fits(width, 0, u64::MAX - 1, 2));
+    }
+
+    /// A range that does not lie in its buffer never reaches the list (the
+    /// list is closed and not run: nothing here is sent to the card).
+    #[test]
+    fn a_copy_outside_its_buffer_is_not_recorded() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let (a, _) = host.shared_buffer(1 << 16).unwrap();
+        let own = host.own_list().unwrap();
+        let left_out = record(
+            true,
+            &own.list.list,
+            &own.between,
+            // In it; past its end; past the end of the buffer between.
+            &[(&a, 0, 0, 256), (&a, (1 << 16) - 100, 256, 256), (&a, 0, BETWEEN - 100, 256)],
+            // In it; an offset from below zero.
+            &[(&a, 4096, 0, 256), (&a, 0u64.wrapping_sub(256), 0, 256)],
+        );
+        own.list.close();
+        assert_eq!(left_out, 3);
     }
 
     /// Reads are all before writes, between two buffers and within one, and
