@@ -76,6 +76,8 @@ mod framewatch;
 mod dropwhy;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod popwatch;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod repaint;
 #[cfg(windows)]
 mod primitive;
 pub mod query;

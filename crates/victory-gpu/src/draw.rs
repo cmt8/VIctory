@@ -2464,6 +2464,9 @@ impl State {
         if FRAME.swap(frame, Ordering::Relaxed) != frame {
             SPENT.store(0, Ordering::Relaxed);
         }
+        // (`VICTORY_REPAINT_WATCH=1`: the textures followed, once a frame.)
+        #[cfg(feature = "diagnostics")]
+        crate::repaint::frame(heap, frame);
         // No more of them are made while the card has no room
         // (`resource::room`): by what is alive now, not by what was ever
         // staged (4 GB in all, after which later textures stayed empty for
@@ -2633,6 +2636,8 @@ impl State {
                 if recheck_soon() {
                     again_in = 1;
                 }
+                #[cfg(feature = "diagnostics")]
+                crate::repaint::found(index, at, len, frame, true);
                 let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
                 if n < 200 || n.is_multiple_of(1000) {
                     // Whether its pages are the title's at other addresses
@@ -2805,6 +2810,8 @@ impl State {
                 match memory {
                     Some((at, len)) => {
                         let print = crate::texture::fingerprint(at, len);
+                        #[cfg(feature = "diagnostics")]
+                        crate::repaint::found(index, at, len, frame, false);
                         host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
                     }
                     None => host.texture_slot_done(index, write, again),
@@ -2935,6 +2942,8 @@ impl State {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
                     let print = crate::texture::fingerprint(at, len);
+                    #[cfg(feature = "diagnostics")]
+                    crate::repaint::found(index, at, len, frame, false);
                     host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
                 }
                 None => host.texture_slot_done(index, write, again),
