@@ -366,7 +366,9 @@ const LDS32: &[u32] = &[
     0xE070_1000, 0x8002_030A, // buffer_store_dword v3, v10, s[8:11], 0 offen
     0xBF81_0000, // s_endpgm
 ];
-/// `ds_bpermute_b32`: thread t reads t + 1 from the lane a quarter wave on.
+/// `ds_bpermute_b32`: thread t reads t + 1 from the lane its address names, a quarter
+/// wave on: in a wave of 32 that lane, in a wave of 64 the lane of its own half of 32
+/// lanes that the address names modulo 32 (16 on, within the half).
 const BPERM64: &[u32] = &[
     0xBE85_0380, // s_mov_b32 s5, 0
     0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
@@ -391,6 +393,16 @@ const BPERM32: &[u32] = &[
     0xDACC_0000, 0x0300_0204, // ds_bpermute_b32 v3, v4, v2
     0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
     0xE070_1000, 0x8002_030A, // buffer_store_dword v3, v10, s[8:11], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
+/// Every thread stores its index: no wave operation, no lane read, no LDS (the
+/// same words for both console waves).
+const PLAIN: &[u32] = &[
+    0xBE85_0380, // s_mov_b32 s5, 0
+    0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+    0x3414_0084, // v_lshlrev_b32 v10, 4, v0
+    0xE070_1000, 0x8002_000A, // buffer_store_dword v0, v10, s[8:11], 0 offen
     0xBF81_0000, // s_endpgm
 ];
 
@@ -494,7 +506,16 @@ fn console(name: &str, wave: u32, threads: u32) -> Vec<u32> {
                 }
             }
             "lds" => o[0] = base + (lane + wave / 2) % wave + 1,
-            "bperm" => o[0] = base + (lane + wave / 4) % wave + 1,
+            // The console's hardware (GFX10) permutes the two halves of a wave of 64 each
+            // on its own: lane l reads lane (l & 32) | (address / 4 & 31)
+            // (`super::bpermute_halves`). Until that was known this said
+            // `(lane + wave / 4) % wave` for both waves, a read within the whole wave of
+            // 64, which is what `permutes_within_the_whole_wave` still gives with
+            // `VICTORY_BPERMUTE_HALVES=0`.
+            "bperm" => {
+                let from = if wave == 64 { lane & 32 | (lane + 16) & 31 } else { (lane + 8) % 32 };
+                o[0] = base + from + 1;
+            }
             "hsum" => {
                 let terms: Vec<u16> =
                     (base..base + wave).map(|u| if u < threads { (0x3C00 + 37 * u) as u16 } else { 0 }).collect();
@@ -504,6 +525,7 @@ fn console(name: &str, wave: u32, threads: u32) -> Vec<u32> {
                 o[0] = lane;
                 o[1] = (picked(base) & ((1u64 << lane) - 1)).count_ones();
             }
+            "plain" => o[0] = t,
             _ => unreachable!(),
         }
     }
@@ -515,8 +537,11 @@ fn console(name: &str, wave: u32, threads: u32) -> Vec<u32> {
 enum Form {
     /// For a host of 64-lane waves, as before (`VICTORY_COMPUTE_WAVE=0` on RADV).
     Host64,
-    /// For host waves of 32 on a host that also runs 64 (`VICTORY_COMPUTE_WAVE`).
+    /// For host waves of 32 on a host that also runs 64 (`VICTORY_COMPUTE_WAVE=32`).
     Waves32,
+    /// On such a host with `VICTORY_COMPUTE_WAVE` unset: a console wave64 program for
+    /// host waves of 64, which it declares; a console wave32 program as `Waves32`.
+    Console,
     /// For a host of at most 32 lanes (`VICTORY_HOST_WAVE=32`, NVIDIA's forms), which
     /// on RADV runs what declares no size in the driver's waves.
     Host32,
@@ -592,16 +617,19 @@ fn translated(
         version: (1, 0),
         parts: Vec::new(),
     };
-    let (host, mode) = match form {
-        Form::Host64 => (64, false),
-        Form::Waves32 => (64, true),
-        Form::Host32 => (32, false),
+    let (host, mode, console) = match form {
+        Form::Host64 => (64, false, false),
+        Form::Waves32 => (64, true, false),
+        Form::Console => (64, true, true),
+        Form::Host32 => (32, false, false),
     };
     let host_was = lower::TEST_HOST_WAVE.replace(Some(host));
     let mode_was = compute_wave::TEST.replace(Some(mode));
+    let console_was = compute_wave::TEST_CONSOLE.replace(console);
     let r = super::emit_sized(&c, &native, &p, &st, &io, &res);
     lower::TEST_HOST_WAVE.set(host_was);
     compute_wave::TEST.set(mode_was);
+    compute_wave::TEST_CONSOLE.set(console_was);
     let r = r?;
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut dxil = r.0.dxil.clone();
@@ -676,6 +704,8 @@ fn cases() -> Vec<(&'static str, &'static [u32], bool, &'static [u32], bool)> {
         ("ballot", BALLOT64, true, &[64, 96], true),
         ("mbcnt", MBCNT64, true, &[64, 96], true),
         ("sum", SUM64, true, &[64, 96], true),
+        // (a group of half a console wave too)
+        ("plain", PLAIN, true, &[32, 64, 96], false),
         ("first", FIRST32, false, G32, false),
         ("ballot", BALLOT32, false, G32, false),
         ("branch", BRANCH32, false, G32, false),
@@ -689,13 +719,14 @@ fn cases() -> Vec<(&'static str, &'static [u32], bool, &'static [u32], bool)> {
         ("ballot", BALLOT32, false, &[48, 64], true),
         ("mbcnt", MBCNT32, false, &[48, 64], true),
         ("sum", SUM32, false, &[48, 64], true),
+        ("plain", PLAIN, false, G32, false),
     ]
 }
 
 /// Every case through every form on the hardware device: one line each,
 /// with the declared wave and where the result differs from the console's.
 /// Asserted: the forms for a host of 64-lane waves and those of
-/// [`super::compute_wave_32`] give the console's results in every case but
+/// [`super::compute_wave_32`] (`=32`, and unset) give the console's results in every case but
 /// `branch`, which is lowered per lane in every form (`structure`: a branch
 /// on VCC is taken to test a value the same in every lane, which is what
 /// the console's compiler branches on that way); its lines show what a
@@ -715,7 +746,7 @@ fn the_wave_forms_on_the_card_give_the_consoles_results() {
         let wave = if wave64 { 64 } else { 32 };
         for &threads in groups {
             let want = console(name, wave, threads);
-            for form in [Form::Host64, Form::Waves32, Form::Host32] {
+            for form in [Form::Host64, Form::Waves32, Form::Console, Form::Host32] {
                 let shape = if flat { format!("8x{}", threads / 8) } else { format!("x{threads}") };
                 let label = format!("wave{wave} {name} {shape} {form:?}");
                 let asserted = form != Form::Host32 && name != "branch";
@@ -780,7 +811,7 @@ fn the_wave_forms_give_the_consoles_results_in_every_group_of_a_dispatch() {
         let words = adding(words);
         for &threads in groups {
             let want: Vec<u32> = console(name, wave, threads).iter().map(|v| v.wrapping_mul(GROUPS)).collect();
-            for form in [Form::Host64, Form::Waves32] {
+            for form in [Form::Host64, Form::Waves32, Form::Console] {
                 let shape = if flat { format!("8x{}", threads / 8) } else { format!("x{threads}") };
                 let label = format!("wave{wave} {name} {shape} {form:?} in {GROUPS} groups");
                 let (shader, declared) = match translated(&words, wave64, threads, flat, form) {
@@ -899,4 +930,331 @@ fn the_switch_can_leave_one_kind_of_program_as_before() {
     assert!(code(Form::Waves32, pin) == code(Form::Host64, None));
     assert!(code(Form::Waves32, forms) == code(Form::Waves32, None));
     assert!(code(Form::Waves32, forms) != code(Form::Host64, None));
+}
+
+/// A wave64 barrier only some threads reach, as [`BARRIER32`].
+const BARRIER64: &[u32] = &[
+    0xBE85_0380, // s_mov_b32 s5, 0
+    0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+    0x3414_0084, // v_lshlrev_b32 v10, 4, v0
+    0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+    0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+    0xBF88_0001, // s_cbranch_execz end
+    0xBF8A_0000, // s_barrier
+    0xBEFE_040C, // end: s_mov_b64 exec, s[12:13]
+    0xE070_1000, 0x8002_000A, // buffer_store_dword v0, v10, s[8:11], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
+/// `VICTORY_COMPUTE_WAVE` unset on a host of waves of 32 and 64 (no device needed): a
+/// console wave32 program declares 32 as with `=32` and `=pin`; a console wave64 program
+/// declares 64 whether or not it uses wave operations, whatever its group and whether or
+/// not the host leaves out a barrier of its, and its code is the one for a host of
+/// 64-lane waves: none of the forms for host waves of 32. The wave is the whole
+/// difference from `=pin`, which declares 64 only where the program did before.
+#[test]
+fn unset_the_switch_declares_the_consoles_wave_and_uses_no_form_for_waves_of_32() {
+    let made = |words: &[u32], wave64: bool, threads: u32, form: Form, only: Option<bool>| {
+        let was = compute_wave::TEST_ONLY.replace(only);
+        let r = translated(words, wave64, threads, false, form);
+        compute_wave::TEST_ONLY.set(was);
+        r.unwrap_or_else(|e| panic!("{form:?}: {e}"))
+    };
+    let declared = |words: &[u32], wave64: bool, threads: u32, form: Form| made(words, wave64, threads, form, None).1;
+    let pin = Some(false);
+    // console wave32 programs
+    assert_eq!(declared(BRANCH32, false, 64, Form::Console), Some(32));
+    assert_eq!(declared(PLAIN, false, 64, Form::Console), Some(32));
+    assert_eq!(declared(FIRST32, false, 64, Form::Console), Some(32));
+    assert_eq!(declared(BARRIER32, false, 64, Form::Console), None);
+    for words in [BRANCH32, PLAIN, FIRST32, BARRIER32, BALLOT32] {
+        assert!(
+            made(words, false, 64, Form::Console, None).0.dxil == made(words, false, 64, Form::Waves32, None).0.dxil,
+            "a console wave32 program is what it is with =32"
+        );
+    }
+    // console wave64 programs with wave operations: 64, and the code of a host of 64-lane waves
+    for words in [BALLOT64, FIRST64, SUM64, MBCNT64, LDS64] {
+        let threads = if words == LDS64 { 64 } else { 128 };
+        let (console, wave) = made(words, true, threads, Form::Console, None);
+        assert_eq!(wave, Some(64));
+        assert_eq!(declared(words, true, threads, Form::Host64), Some(64));
+        assert!(console.dxil == made(words, true, threads, Form::Host64, None).0.dxil, "the code for a host of 64-lane waves");
+        assert!(console.dxil == made(words, true, threads, Form::Waves32, pin).0.dxil, "and of =pin");
+        assert!(console.dxil != made(words, true, threads, Form::Waves32, None).0.dxil, "not a form for waves of 32");
+    }
+    // ... without any: 64 too, where `=pin` and a host of 64-lane waves leave the size to
+    // the driver (in a group of several console waves; these programs have LDS, and with
+    // LDS a group of one console wave declared it before)
+    for (words, threads) in [(BRANCH64, 128), (PLAIN, 128), (PLAIN, 96), (BARRIER64, 128)] {
+        assert_eq!(declared(words, true, threads, Form::Console), Some(64), "{threads}");
+        assert_eq!(declared(words, true, threads, Form::Host64), None, "{threads}");
+        assert_eq!(made(words, true, threads, Form::Waves32, pin).1, None, "{threads}");
+    }
+    for threads in [64, 32, 8] {
+        assert_eq!(declared(PLAIN, true, threads, Form::Console), Some(64), "{threads}");
+    }
+    // `=forms` is what it was (a test's choice of the switch unset is made with the form)
+    assert_eq!(made(BALLOT64, true, 128, Form::Waves32, Some(true)).1, Some(32));
+}
+
+/// `ds_bpermute_b32` at an address with bits above the lane's and below the dword, plus an
+/// offset: lane l of a wave of 64 reads 0x4000 + the thread of lane (l & 32) | (l + 3 & 31),
+/// so lanes 29..31 wrap to 0..2 and lanes 61..63 to 32..34, and lane 32 reads lane 35, not 3.
+/// (After `wave64_permutes_stay_within_each_32_lane_half` of upstream VIctory 0665a0e85, QB,
+/// pull request #573.)
+const BPERM_WRAP64: &[u32] = &[
+    0xBE85_0380, // s_mov_b32 s5, 0
+    0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+    0x3414_0084, // v_lshlrev_b32 v10, 4, v0
+    0x4A04_00FF, 0x0000_4000, // v_add_nc_u32 v2, 0x4000, v0
+    0x3602_009F, // v_and_b32 v1, 31, v0
+    0x3402_0282, // v_lshlrev_b32 v1, 2, v1
+    0x4A02_02FF, 0x0000_0103, // v_add_nc_u32 v1, 0x103, v1
+    0xDACC_000C, 0x0300_0201, // ds_bpermute_b32 v3, v1, v2 offset:12
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xE070_1000, 0x8002_030A, // buffer_store_dword v3, v10, s[8:11], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
+/// `ds_bpermute_b32` under an EXEC of threads 0..39, each lane reading the lane 8 on in its
+/// half: lanes 0..31 read 0x5000 + that thread; lanes 32..39 read lanes 40..47, which EXEC
+/// leaves out, and get 0 (not what lanes 8..15 of the other half hold); threads 40..63 keep
+/// 0xcafe0000 + their index. (After `wave64_permutes_check_exec_within_each_half` of the
+/// same upstream commit.)
+const BPERM_EXEC64: &[u32] = &[
+    0xBE85_0380, // s_mov_b32 s5, 0
+    0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+    0x3414_0084, // v_lshlrev_b32 v10, 4, v0
+    0x4A04_00FF, 0x0000_5000, // v_add_nc_u32 v2, 0x5000, v0
+    0x4A06_00FF, 0xCAFE_0000, // v_add_nc_u32 v3, 0xcafe0000, v0
+    0x4A02_0088, // v_add_nc_u32 v1, 8, v0
+    0x3602_029F, // v_and_b32 v1, 31, v1
+    0x3402_0282, // v_lshlrev_b32 v1, 2, v1
+    0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+    0xBE94_246A, // s_and_saveexec_b64 s[20:21], vcc
+    0xDACC_0000, 0x0300_0201, // ds_bpermute_b32 v3, v1, v2
+    0xBEFE_0414, // s_mov_b64 exec, s[20:21]
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xE070_1000, 0x8002_030A, // buffer_store_dword v3, v10, s[8:11], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
+/// `words` translated in `form` with `VICTORY_BPERMUTE_HALVES` as `halves` says.
+fn permuting(words: &[u32], wave64: bool, threads: u32, form: Form, halves: bool) -> Result<(HostShader, Option<u32>), ShaderError> {
+    let was = super::BPERMUTE_HALVES_TEST.replace(Some(halves));
+    let r = translated(words, wave64, threads, false, form);
+    super::BPERMUTE_HALVES_TEST.set(was);
+    r
+}
+
+/// A backward permute in a console wave of 64 reads within the lane's own half of 32
+/// lanes (no device needed): so it crosses no half, and a program whose only cross-lane
+/// code it is takes a form for host waves of 32 that exchanges nothing, where it was
+/// refused ("a lane permute across two host waves") on a host of 32-lane waves and kept
+/// 64 lanes on one that has them. `VICTORY_BPERMUTE_HALVES=0` is the lowering of before in
+/// every form; a console wave32 program is the same either way.
+#[test]
+fn a_wave64_permute_stays_in_its_half_and_needs_no_wave_of_64() {
+    let code = |words: &[u32], wave64: bool, form: Form, halves: bool| {
+        permuting(words, wave64, 64, form, halves).unwrap_or_else(|e| panic!("{form:?} {halves}: {e}")).0.dxil
+    };
+    let declared = |form: Form, halves: bool| permuting(BPERM64, true, 64, form, halves).map(|t| t.1);
+    // for host waves of 64 the size stays and the code changes
+    for form in [Form::Host64, Form::Console] {
+        assert_eq!(declared(form, true), Ok(Some(64)), "{form:?}");
+        assert_eq!(declared(form, false), Ok(Some(64)), "{form:?}");
+        assert!(code(BPERM64, true, form, true) != code(BPERM64, true, form, false), "{form:?}");
+    }
+    // `=32`: a form for host waves of 32, where it kept its 64 lanes
+    assert_eq!(declared(Form::Waves32, true), Ok(Some(32)));
+    assert_eq!(declared(Form::Waves32, false), Ok(Some(64)));
+    // a host of 32-lane waves: translated, where it was refused
+    assert_eq!(declared(Form::Host32, true), Ok(Some(32)));
+    let refused = declared(Form::Host32, false).expect_err("refused as before");
+    assert!(refused.to_string().contains("a lane permute across two host waves"), "{refused}");
+    // a console wave32 program: the same code
+    for form in [Form::Host64, Form::Waves32, Form::Console, Form::Host32] {
+        assert!(code(BPERM32, false, form, true) == code(BPERM32, false, form, false), "{form:?}");
+    }
+}
+
+/// The permutes on the card: what each lane of a console wave of 64 reads with the
+/// permute within halves (the console's result, [`console`]'s "bperm" and the two
+/// programs after upstream's tests) in the forms for host waves of 64 and for two host
+/// waves of 32, and within the whole wave with `VICTORY_BPERMUTE_HALVES=0`, as before.
+#[test]
+fn permutes_within_halves_on_the_card_and_within_the_whole_wave_with_the_switch_off() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let first = |got: Vec<u32>| -> Vec<u32> { got.chunks(4).map(|t| t[0]).collect() };
+    let mut ran = 0;
+    for form in [Form::Host64, Form::Console, Form::Waves32] {
+        let cases: [(&str, &[u32], Vec<u32>); 3] = [
+            ("a quarter wave on", BPERM64, (0..64).map(|l| (l & 32 | (l + 16) & 31) + 1).collect()),
+            ("high and low address bits", BPERM_WRAP64, (0..64).map(|l| 0x4000 + (l & 32 | (l + 3) & 31)).collect()),
+            (
+                "EXEC within each half",
+                BPERM_EXEC64,
+                (0..64u32)
+                    .map(|l| match l {
+                        0..32 => 0x5000 + ((l + 8) & 31),
+                        32..40 => 0,
+                        _ => 0xCAFE_0000 + l,
+                    })
+                    .collect(),
+            ),
+        ];
+        for (name, words, want) in cases {
+            let (shader, declared) = permuting(words, true, 64, form, true).unwrap_or_else(|e| panic!("{form:?} {name}: {e}"));
+            let Some(got) = run(&host, &shader, 4 * 64) else {
+                eprintln!("{form:?} {name}: declared {declared:?}: the device takes no such pipeline");
+                continue;
+            };
+            ran += 1;
+            assert_eq!(first(got), want, "{form:?} {name}: declared {declared:?}");
+        }
+    }
+    // the switch off: within the whole wave of 64 (a host of 64-lane waves)
+    for form in [Form::Host64, Form::Console] {
+        let (shader, declared) = permuting(BPERM64, true, 64, form, false).unwrap_or_else(|e| panic!("{form:?}: {e}"));
+        let Some(got) = run(&host, &shader, 4 * 64) else {
+            eprintln!("{form:?} off: declared {declared:?}: the device takes no such pipeline");
+            continue;
+        };
+        ran += 1;
+        let whole: Vec<u32> = (0..64).map(|l| (l + 16) % 64 + 1).collect();
+        assert_eq!(first(got), whole, "{form:?} with the switch off: declared {declared:?}");
+    }
+    eprintln!("{ran} dispatches on the hardware device");
+}
+
+/// A group of two console waves that share LDS across the program's own barrier, with LDS
+/// accesses that only one of the two console waves runs (a branch on a scalar the wave's
+/// first lane gives, which the waves of a group answer differently): every thread zeroes
+/// three dwords, the group meets, the console wave of thread 0 writes 0x77 to the three,
+/// the group meets again, and every thread reads the third: 0x77 on the console.
+const UNEVEN64: &[u32] = &[
+    0xBE85_0380, // s_mov_b32 s5, 0
+    0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+    0x3414_0084, // v_lshlrev_b32 v10, 4, v0
+    0x7E04_0280, // v_mov_b32 v2, 0
+    0x7E02_0280, // v_mov_b32 v1, 0
+    0xD834_0000, 0x0000_0102, // ds_write_b32 v2, v1
+    0xD834_0004, 0x0000_0102, // ds_write_b32 v2, v1 offset:4
+    0xD834_0008, 0x0000_0102, // ds_write_b32 v2, v1 offset:8
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xBF8A_0000, // s_barrier
+    0x7E1C_0500, // v_readfirstlane_b32 s14, v0
+    0xBF07_800E, // s_cmp_lg_u32 s14, 0
+    0xBF85_0009, // s_cbranch_scc1 skip
+    0x7E02_02FF, 0x0000_0077, // v_mov_b32 v1, 0x77
+    0xD834_0000, 0x0000_0102, // ds_write_b32 v2, v1
+    0xD834_0004, 0x0000_0102, // ds_write_b32 v2, v1 offset:4
+    0xD834_0008, 0x0000_0102, // ds_write_b32 v2, v1 offset:8
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xBF8A_0000, // skip: s_barrier
+    0xD8D8_0008, 0x0300_0002, // ds_read_b32 v3, v2 offset:8
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xE070_1000, 0x8002_030A, // buffer_store_dword v3, v10, s[8:11], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
+/// [`UNEVEN64`] without its branch (an `s_nop` in its place): every console wave writes, and
+/// every LDS access stands where each thread of the group passes once.
+fn even64() -> Vec<u32> {
+    UNEVEN64.iter().map(|&w| if w == 0xBF85_0009 { 0xBF80_0000 } else { w }).collect()
+}
+
+/// `words` (console wave64) translated in `form` with `VICTORY_WAVE_EVEN_BARRIERS` as `even`
+/// says.
+fn evenly(words: &[u32], threads: u32, form: Form, even: bool) -> Result<(HostShader, Option<u32>), ShaderError> {
+    let was = super::EVEN_BARRIERS_TEST.replace(Some(even));
+    let r = translated(words, true, threads, false, form);
+    super::EVEN_BARRIERS_TEST.set(was);
+    r
+}
+
+/// Where a form for host waves of 32 may put its group barriers (no device needed). The
+/// host's barrier lets the waves of a group go on once each waits at one, so in a group of
+/// several console waves with a barrier of the program's own, the form's barriers must be
+/// passed alike by all of them: [`UNEVEN64`]'s LDS writes stand behind a branch that one of
+/// two console waves takes, and the program keeps its waves of 64 (`=32` on a host that has
+/// them); with `VICTORY_WAVE_EVEN_BARRIERS=0` it takes the form as before. A group of one
+/// console wave (its two host waves take the branch alike, having exchanged what it tests)
+/// and a program whose accesses every thread passes once keep the form. The forms for a
+/// host of 64-lane waves, and NVIDIA's, are the same either way.
+#[test]
+fn a_forms_barriers_stand_where_every_thread_of_the_group_passes_once() {
+    let declared = |words: &[u32], threads: u32, even: bool| evenly(words, threads, Form::Waves32, even).map(|t| t.1);
+    assert_eq!(declared(UNEVEN64, 128, true), Ok(Some(64)));
+    assert_eq!(declared(UNEVEN64, 128, false), Ok(Some(32)));
+    for even in [true, false] {
+        assert_eq!(declared(UNEVEN64, 64, even), Ok(Some(32)), "{even}");
+        assert_eq!(declared(&even64(), 128, even), Ok(Some(32)), "{even}");
+        assert_eq!(declared(&even64(), 64, even), Ok(Some(32)), "{even}");
+    }
+    for form in [Form::Host64, Form::Console, Form::Host32] {
+        for threads in [64, 128] {
+            let code = |even: bool| {
+                evenly(UNEVEN64, threads, form, even).unwrap_or_else(|e| panic!("{form:?} {threads} {even}: {e}")).0.dxil
+            };
+            assert!(code(true) == code(false), "{form:?} {threads}");
+        }
+    }
+}
+
+/// [`UNEVEN64`] and [`even64`] on the card, in groups of one and of two console waves: every
+/// thread reads 0x77 after the program's second barrier, as on the console, in the forms for
+/// a host of 64-lane waves and with `VICTORY_COMPUTE_WAVE=32` and unset. (Before
+/// [`super::even_barriers`], `=32` gave 0 in threads 64..127 of the group of 128: the console
+/// wave that takes the branch around the writes passed three barriers fewer, went through
+/// the program's barrier while the other still waited before its second write, and read
+/// before the third. That is shown, not asserted, with `VICTORY_WAVE_EVEN_BARRIERS=0`.)
+#[test]
+fn a_group_of_two_console_waves_meets_at_its_own_barriers_on_the_card() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let wrong = |got: &[u32]| -> Vec<usize> { (0..got.len() / 4).filter(|&t| got[4 * t] != 0x77).collect() };
+    let mut ran = 0;
+    for (name, words) in [("uneven", UNEVEN64.to_vec()), ("even", even64())] {
+        for threads in [64u32, 128] {
+            for form in [Form::Host64, Form::Waves32, Form::Console] {
+                let (shader, declared) =
+                    evenly(&words, threads, form, true).unwrap_or_else(|e| panic!("{name} {threads} {form:?}: {e}"));
+                for round in 0..3 {
+                    let Some(got) = run(&host, &shader, 4 * threads) else {
+                        eprintln!("{name} {threads} {form:?}: declared {declared:?}: the device takes no such pipeline");
+                        break;
+                    };
+                    ran += 1;
+                    let wrong = wrong(&got);
+                    assert!(
+                        wrong.is_empty(),
+                        "{name} x{threads} {form:?} declared {declared:?} round {round}: {} threads read no 0x77, from thread {}",
+                        wrong.len(),
+                        wrong[0],
+                    );
+                }
+            }
+        }
+    }
+    // as before the switch (shown only: what a barrier out of step gives is the card's)
+    if let Ok((shader, declared)) = evenly(UNEVEN64, 128, Form::Waves32, false)
+        && let Some(got) = run(&host, &shader, 4 * 128)
+    {
+        let wrong = wrong(&got);
+        eprintln!(
+            "uneven x128 Waves32 with VICTORY_WAVE_EVEN_BARRIERS=0: declared {declared:?}: {} threads read no 0x77{}",
+            wrong.len(),
+            wrong.first().map(|t| format!(", from thread {t}")).unwrap_or_default(),
+        );
+    }
+    eprintln!("{ran} dispatches on the hardware device");
 }

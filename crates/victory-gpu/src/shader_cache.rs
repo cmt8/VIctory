@@ -162,16 +162,24 @@ fn build() -> [u8; 32] {
     for value in victory_shader::emit::host_settings() {
         hash.update(&value.to_le_bytes());
     }
-    // Whether compute programs take waves of 32 (`VICTORY_COMPUTE_WAVE`,
+    // Whether compute programs declare their waves (`VICTORY_COMPUTE_WAVE`,
     // keyed above too), which depends on the host's narrowest wave as well.
+    // (What the switch means unset for console wave64 programs is keyed per
+    // program: `named`.)
     hash.update(&victory_shader::emit::host_min_wave_set().to_le_bytes());
     hash.update(&[u8::from(victory_shader::emit::compute_wave_32())]);
     *hash.finalize().as_bytes()
 }
 
-/// What tells one set of translations from another ([`build`]).
+/// What tells one set of translations from another: [`build`], and what
+/// some programs are keyed apart by (`victory_shader::emit::keyed_apart_any`:
+/// console wave64 compute programs translated for host waves of 64 that
+/// they declare, their backward permutes within halves of 32 lanes, their
+/// forms' barriers where every thread of a group passes once). That
+/// is not in [`build`], which every other program's translation stays keyed
+/// by ([`named`]).
 pub(crate) fn translation() -> [u8; 32] {
-    build()
+    victory_shader::emit::keyed_apart_any().into_iter().fold(build(), apart_key)
 }
 
 /// Puts the translation of `container` into the cache before any title asks
@@ -208,10 +216,35 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
 /// (`victory_shader::emit::named`) and so kept apart from the translation a
 /// run without the variable makes of it. Every other program keeps its key,
 /// and its cached translation.
+///
+/// A console wave64 compute program is keyed apart too by each change of
+/// the translator's that reaches it alone and that no switch's value tells
+/// (`victory_shader::emit::keyed_apart`): where it is translated for host
+/// waves of 64 that it declares (`VICTORY_COMPUTE_WAVE` unset on a host of
+/// waves of 32 and 64: the switch unset used to mean a form for host waves
+/// of 32 for it), where its `ds_bpermute_b32` reads within halves of 32
+/// lanes (`VICTORY_BPERMUTE_HALVES`, on unless `=0`), and, with
+/// `VICTORY_COMPUTE_WAVE=32` or `=forms`, where it has a barrier in a group
+/// over 64 threads and so takes a form for host waves of 32 only with the
+/// form's barriers where every thread passes once
+/// (`VICTORY_WAVE_EVEN_BARRIERS`, on unless `=0`). The translations made
+/// before those changes sit in the cache under [`build`]; the other
+/// programs' are the same as then, and keep that key.
 fn named(container: &[u8]) -> (String, [u8; 32]) {
     let name = blake3::hash(container).to_hex()[..16].to_owned();
-    let build = kept_key(build(), victory_shader::emit::wave_kept(&name));
+    let kept = victory_shader::emit::wave_kept(&name);
+    let build = kept_key(build(), kept);
+    let build = victory_shader::emit::keyed_apart(container, kept).into_iter().fold(build, apart_key);
     (name, build)
+}
+
+/// The key beside `build` for a program whose translation `mark` tells from
+/// the one `build` keys (`victory_shader::emit::keyed_apart`).
+fn apart_key(build: [u8; 32], mark: &str) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new();
+    hash.update(&build);
+    hash.update(mark.as_bytes());
+    *hash.finalize().as_bytes()
 }
 
 /// `build`, or the key beside it for a program translated as before.
@@ -558,6 +591,23 @@ mod tests {
         assert_ne!(kept_key(build, true), build);
         assert_eq!(kept_key(build, true), kept_key(build, true));
         assert_ne!(kept_key(build, true), kept_key([8u8; 32], true));
+    }
+
+    #[test]
+    fn a_program_a_change_reaches_alone_is_keyed_apart_by_its_mark() {
+        let build = [7u8; 32];
+        let (console, halves) = ("wave64 as the console", "permutes within halves");
+        assert_ne!(apart_key(build, console), build);
+        assert_eq!(apart_key(build, console), apart_key(build, console));
+        assert_ne!(apart_key(build, console), apart_key([8u8; 32], console));
+        assert_ne!(apart_key(build, console), apart_key(build, halves));
+        // a program both reach: neither's key, nor the build's
+        let both = [console, halves].into_iter().fold(build, apart_key);
+        assert!(![build, apart_key(build, console), apart_key(build, halves)].contains(&both));
+        // (nor is it the key of a program `VICTORY_WAVE_KEEP` lists)
+        assert_ne!(apart_key(build, console), kept_key(build, true));
+        // a program no change reaches keeps its key
+        assert_eq!(Vec::<&str>::new().into_iter().fold(build, apart_key), build);
     }
 
     #[test]

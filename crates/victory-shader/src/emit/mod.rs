@@ -123,7 +123,10 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use compute_wave::{compute_wave_32, host_min_wave_set, named, set_host_min_wave, wave_kept};
+pub use compute_wave::{
+    compute_wave_32, host_min_wave_set, keyed_apart, keyed_apart_any, named, set_host_min_wave, wave64_as_console,
+    wave_kept,
+};
 pub use lower::{host_settings, set_host_max_wave, set_host_rdna, set_thread_max_wave};
 pub use rect::rect_list_gs;
 pub use shader::{
@@ -267,6 +270,64 @@ pub fn missing_upper_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_MISSING_UPPER").is_none_or(|v| v != "0"))
 }
 
+/// Whether a form for host waves of 32 puts its group barriers only where
+/// every thread of the group passes exactly once, in a console wave64
+/// compute program whose group holds several console waves (over 64
+/// threads) and that has a barrier of its own, on a host that also runs
+/// waves of 64 ([`compute_wave_32`]). The host's barrier lets a group's
+/// waves go on once each waits at one, whichever: a barrier the form adds
+/// behind a branch that one console wave of the group takes and another
+/// does not (a branch on a scalar of the wave's own) sets them out of step,
+/// and the program's own barrier no longer holds one back until the other
+/// has written what it reads after it. On the RX 7900 XTX half of a group
+/// of 128 threads read LDS before the other half wrote it (the test
+/// `a_group_of_two_console_waves_meets_at_its_own_barriers_on_the_card`).
+/// A program whose LDS accesses or exchanges stand elsewhere takes no form
+/// for host waves of 32 and keeps its waves of 64.
+/// `VICTORY_WAVE_EVEN_BARRIERS`: on, `=0` places the barriers as before, for
+/// A/B runs. Part of the translation: the shader cache keys the programs it
+/// can change apart ([`keyed_apart`]).
+pub fn even_barriers() -> bool {
+    #[cfg(test)]
+    if let Some(on) = EVEN_BARRIERS_TEST.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_EVEN_BARRIERS").is_none_or(|v| v != "0"))
+}
+
+/// Whether `ds_bpermute_b32` in a console wave64 program reads within the
+/// lane's own half of 32 lanes: lane l takes the data of lane
+/// (l & 32) | ((address + offset) / 4 & 31). That is what the console's
+/// hardware does: from GFX10 to GFX11.7 the instruction permutes the two
+/// halves of a wave of 64 each on its own (Mesa ACO, `emit_bpermute` in
+/// aco_select_nir_intrinsics.cpp, "GFX10-11.5 wave64 mode: emulate
+/// full-wave bpermute", and `emit_bpermute_shared_vgpr` in
+/// aco_lower_to_hw_instr.cpp, "on GFX10 the bpermute instruction only works
+/// on half waves"; LLVM's `supportsWaveWideBPermute`, GCNSubtarget.h).
+/// After upstream VIctory 0665a0e85 (pull request #573, QB) and fxceless
+/// b1d777a80 (after Belobug #363). Such a permute then crosses no half: a
+/// program in host waves of 32 needs no exchange for it and is not refused
+/// one. `VICTORY_BPERMUTE_HALVES`: on, `=0` reads within the whole wave of
+/// 64 as before, for A/B runs. Part of the translation: the shader cache
+/// keys the programs it changes apart ([`keyed_apart`]).
+pub fn bpermute_halves() -> bool {
+    #[cfg(test)]
+    if let Some(on) = BPERMUTE_HALVES_TEST.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BPERMUTE_HALVES").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`bpermute_halves`] on its thread (`None`: the switch's).
+    pub(crate) static BPERMUTE_HALVES_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// A test's choice for [`even_barriers`] on its thread (`None`: the switch's).
+    pub(crate) static EVEN_BARRIERS_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// Whether a 16-bit result written by SDWA with `dst_unused` 1 (sext) into
 /// WORD_0 copies its bit 15 into the high word, and the reserved
 /// `dst_unused` 3 is refused (upstream VIctory #3124). `VICTORY_SDWA_SEXT`:
@@ -372,6 +433,9 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
     out.extend_from_slice(&host_min_wave_set().to_le_bytes());
     out.push(u8::from(compute_wave_32()));
+    for mark in keyed_apart_any() {
+        out.extend_from_slice(mark.as_bytes());
+    }
     out.extend_from_slice(&lower::host_rdna().to_le_bytes());
     out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());
     out.extend_from_slice(&shader::raw_views().to_le_bytes());
@@ -566,9 +630,12 @@ pub fn emit(
 }
 
 /// [`emit`], with the wave size the program declares. With
-/// [`compute_wave_32`] a console wave64 compute program that the 32-lane
-/// forms take only approximately, or not at all, is translated as before
-/// (in waves of 64 where it declares a size).
+/// [`compute_wave_32`] a console wave64 compute program is translated for
+/// host waves of 64 and declares them ([`wave64_as_console`], the switch
+/// unset); with `VICTORY_COMPUTE_WAVE=32` or `=forms` it takes a form for
+/// host waves of 32, and one that those forms take only approximately, or
+/// not at all, is translated as before (in waves of 64 where it declares a
+/// size).
 pub(crate) fn emit_sized(
     c: &Container,
     native: &NativeProgram,
@@ -585,15 +652,24 @@ pub(crate) fn emit_sized(
                 Ok((_, wave)) => format!("declares {wave:?}"),
                 Err(e) => format!("not translated: {e}"),
             };
+            // (which programs permute lanes backward: `bpermute_halves`)
+            let permutes = p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name() == "ds_bpermute_b32");
             eprintln!(
-                "WAVE-FORM {} console wave{} group={:?} lds={}: {what}, {declares}",
+                "WAVE-FORM {} console wave{} group={:?} lds={}{}: {what}, {declares}",
                 compute_wave::name(),
                 if native.wave64 { 64 } else { 32 },
                 cs.threads,
                 cs.lds_bytes(),
+                if permutes { " ds_bpermute" } else { "" },
             );
         }
     };
+    if waves && native.wave64 && compute_wave::wave64_as_console() {
+        // (the switch unset: a host wave is a console wave, declared)
+        let own = compute_wave::in_console_waves(|| emit_forms(c, native, p, st, io, res));
+        say("for host waves of 64, its console wave declared", &own);
+        return own;
+    }
     if waves && !compute_wave::takes(native.wave64) {
         // (`VICTORY_COMPUTE_WAVE=pin` or `=forms`: this kind is left as it was)
         let before = compute_wave::without(|| emit_forms(c, native, p, st, io, res));

@@ -538,6 +538,64 @@ fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
     Some(regions)
 }
 
+/// Per IR block: every thread of the group runs it exactly once whatever the data – it is on
+/// every path from the entry to an end of the program, and on no cycle. Stricter than
+/// [`all_lane_blocks`], which also has the blocks behind a branch on a scalar and those of a
+/// loop the wave leaves together: one wave takes such a branch as one, but the waves of a
+/// group need not take it alike (the scalar may be a wave's own: its first lane's value, a
+/// count of its lanes). An indirect exit counts as an end (the callers have none).
+///
+/// What it is for: the host's group barrier lets the waves of a group go on once each of
+/// them waits at a barrier, whichever barrier that is. A barrier the translation adds where
+/// one console wave of a group passes and another does not (or passes more often) sets the
+/// two out of step: the second one's next barrier, the program's own, is then met by the
+/// first one's added barrier, and it reads LDS the first has not written yet
+/// ([`super::even_barriers`]).
+fn once_blocks(st: &Structured) -> Vec<bool> {
+    let n = st.exits.len();
+    let succ: Vec<Vec<usize>> = st
+        .exits
+        .iter()
+        .map(|e| match *e {
+            LaneExit::Jump(t) => vec![t],
+            LaneExit::Branch { taken, not_taken, .. } => vec![taken, not_taken],
+            LaneExit::End | LaneExit::Indirect => Vec::new(),
+        })
+        .collect();
+    // whether an end is reached from the entry without passing `skip`
+    let ends_without = |skip: usize| {
+        let mut seen = vec![false; n];
+        let mut stack = vec![0usize];
+        while let Some(b) = stack.pop() {
+            if b == skip || b >= n || seen[b] {
+                continue;
+            }
+            seen[b] = true;
+            if succ[b].is_empty() {
+                return true;
+            }
+            stack.extend(succ[b].iter().copied());
+        }
+        false
+    };
+    let on_cycle = |b: usize| {
+        let mut seen = vec![false; n];
+        let mut stack = succ[b].clone();
+        while let Some(t) = stack.pop() {
+            if t == b {
+                return true;
+            }
+            if t >= n || seen[t] {
+                continue;
+            }
+            seen[t] = true;
+            stack.extend(succ[t].iter().copied());
+        }
+        false
+    };
+    (0..n).map(|b| !ends_without(b) && !on_cycle(b)).collect()
+}
+
 /// The per-lane branches (by block) whose regions hold a block of `needs` (blocks where two
 /// host waves must meet, [`take_needs`]): the ones to take wave-wide
 /// ([`crate::structure::structure_wide`]) so that every lane runs those blocks. None if one
@@ -1868,6 +1926,8 @@ impl<'a> Lower<'a> {
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
+        // such a program kept from those waves by `once_blocks` alone (for `VICTORY_WAVE_WHY`)
+        let mut uneven = false;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -1892,10 +1952,11 @@ impl<'a> Lower<'a> {
             let one_wave = group <= wave;
             // A host whose waves are at most 32 lanes (NVIDIA) refuses `WaveSize(64)`. A console
             // wave64 program whose cross-lane code stays inside 32-lane halves – DPP rows,
-            // `ds_swizzle`, `v_permlane16` / `v_permlanex16`, which the ISA confines there – runs
+            // `ds_swizzle`, `v_permlane16` / `v_permlanex16`, `ds_bpermute`
+            // ([`super::bpermute_halves`]), which the hardware confines there – runs
             // exactly in waves of 32: the thread relabelling makes each host wave one half of a
             // console wave (lanes 32k..32k+31). Not when it crosses halves (`v_mbcnt`,
-            // `v_readlane`, `v_writelane`, `ds_(b)permute`, masks as numbers or lane-constant
+            // `v_readlane`, `v_writelane`, `ds_permute`, masks as numbers or lane-constant
             // masks), nor when LDS may be shared within the console wave without barriers (a
             // group over 32 threads with LDS): those still need 64-lane waves.
             if wave == 64 && lanes_wave() == 32 && (console_lanes || one_wave && s.lds_dwords > 0) {
@@ -1904,7 +1965,8 @@ impl<'a> Lower<'a> {
                     n.starts_with("v_mbcnt")
                         || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                         || n.starts_with("ds_permute")
-                        || n.starts_with("ds_bpermute")
+                        // (a backward permute reads within its own half of 32 lanes)
+                        || n.starts_with("ds_bpermute") && !super::bpermute_halves()
                         || reads_mask_as_data(x.st, i)
                 }) || lane_constant_masks(x.st)
                     || !x.st.wide.is_empty()
@@ -1923,15 +1985,50 @@ impl<'a> Lower<'a> {
                             && !(i.name().starts_with("ds_swizzle") || i.name().contains("permute"))
                     };
                     if let Some(all) = all_lane_blocks(x.st) {
-                        let ok = p.blocks.iter().enumerate().all(|(b, blk)| {
-                            blk.insts.iter().all(|inst| {
-                                !lds(inst) || all.get(b).copied().unwrap_or(false)
-                            })
-                        });
+                        // A group of several console waves that meets at the program's own
+                        // barriers: a barrier of the form (before an LDS access, where the host
+                        // waves meet around a lane branch, in an exchange) only where every
+                        // thread of the group passes exactly once (`once_blocks`), so that the
+                        // console waves stay in step up to each of the program's barriers. On a
+                        // host that runs waves of 64, where a program refused here keeps them.
+                        // (NVIDIA's forms are left as they were: there no form in waves of 64
+                        // is left to fall back on.)
+                        let once = (group > 64
+                            && super::even_barriers()
+                            && super::compute_wave_32()
+                            && insts().any(|i| i.name() == "s_barrier"))
+                        .then(|| once_blocks(x.st));
+                        let in_all = |b: usize| all.get(b).copied().unwrap_or(false);
+                        let met = |b: usize| {
+                            in_all(b) && once.as_ref().is_none_or(|o| o.get(b).copied().unwrap_or(false))
+                        };
+                        if once.is_some() && super::compute_wave::why() {
+                            let apart = (0..p.blocks.len()).filter(|&b| in_all(b) && !met(b)).count();
+                            eprintln!(
+                                "WAVE64-EVEN {} group={group}: no barrier of a form in {apart} of {} blocks every lane runs (not passed once by every thread)",
+                                super::compute_wave::name(),
+                                (0..p.blocks.len()).filter(|&b| in_all(b)).count(),
+                            );
+                        }
+                        // every block with an LDS access is one of `f`
+                        let accesses_in = |f: &dyn Fn(usize) -> bool| {
+                            p.blocks.iter().enumerate().all(|(b, blk)| !blk.insts.iter().any(lds) || f(b))
+                        };
+                        let ok = accesses_in(&met);
                         let mut lds_ok = !(s.lds_dwords > 0 && group > 32) || ok;
                         if !lds_ok && let Some(meet) = lds_meetings(p, x.st, &all) {
-                            lds_meet = Some((all.clone(), meet));
-                            lds_ok = true;
+                            // (the meetings, and the barriers of the accesses every lane runs)
+                            let alike = p.blocks.iter().enumerate().all(|(b, blk)| {
+                                let barrier = meet.get(b).is_some_and(|m| m.0 || m.1)
+                                    || in_all(b) && blk.insts.iter().any(lds);
+                                !barrier || met(b)
+                            });
+                            if alike {
+                                lds_meet = Some((all.clone(), meet));
+                                lds_ok = true;
+                            } else {
+                                uneven = true;
+                            }
                         }
                         if !lds_ok {
                             // (the blocks whose LDS accesses not every lane runs: with the
@@ -1948,7 +2045,9 @@ impl<'a> Lower<'a> {
                             if crosses {
                                 // lanes 32..63 are the other host wave: masks, lane reads and lane
                                 // numbers go through two exchange dwords past the program's LDS
-                                exchange = Some((s.lds_dwords, group <= 32, all));
+                                // (where the halves may exchange: at two barriers each time)
+                                let places: Vec<bool> = (0..all.len()).map(met).collect();
+                                exchange = Some((s.lds_dwords, group <= 32, places));
                                 s.lds_dwords += 2 * group.div_ceil(64);
                             }
                         }
@@ -1965,7 +2064,7 @@ impl<'a> Lower<'a> {
                             "v_readlane"
                         } else if n == "v_writelane_b32" {
                             "v_writelane"
-                        } else if n.starts_with("ds_permute") || n.starts_with("ds_bpermute") {
+                        } else if n.starts_with("ds_permute") || n.starts_with("ds_bpermute") && !super::bpermute_halves() {
                             "ds_(b)permute"
                         } else if reads_mask_as_data(x.st, i) {
                             "mask as data"
@@ -1978,6 +2077,9 @@ impl<'a> Lower<'a> {
                     }
                     if lane_constant_masks(x.st) {
                         why.push("lane-constant mask");
+                    }
+                    if uneven {
+                        why.push("an LDS barrier the group's console waves would not pass alike");
                     }
                     if s.lds_dwords > 0 && group > 32 {
                         why.push("LDS in a group over 32");
@@ -5628,18 +5730,26 @@ impl<'a> Lower<'a> {
         }
         if name == "ds_bpermute_b32" {
             // Backward permute: no LDS is touched. Each lane takes the data
-            // register of the lane its address names, (address + offset) / 4
-            // within the wave; a source lane outside EXEC gives 0. (
-            // the title's checkerboard shadow-mask generators read their
+            // register of the lane its address names, (address + offset) / 4,
+            // within its own half of 32 lanes: the console's hardware
+            // permutes the two halves of a wave of 64 each on its own
+            // ([`super::bpermute_halves`], after upstream VIctory 0665a0e85
+            // by QB, pull request #573, in the shape of fxceless b1d777a80).
+            // So lane l reads lane (l & 32) | (that & 31), which is in the
+            // same host wave on a host of 32 lanes too, where each host wave
+            // is one half of the console's. A source lane outside EXEC gives
+            // 0. (The title's checkerboard shadow-mask generators read their
             // neighbours' samples with it; without them every shadowed light
             // was multiplied by an empty mask.)
             // shortcut: a source lane that is not at this instruction on the
             // host (it left through a branch, not a guard) is read as the
             // host gives it; the console reads 0.
             self.cross_lane(false)?;
-            if self.exchange.as_ref().is_some_and(|e| !e.1) {
-                // a console wave of 64 run as two host waves: the lane named
-                // may be in the other one
+            let halves = super::bpermute_halves();
+            if !halves && self.exchange.as_ref().is_some_and(|e| !e.1) {
+                // (`VICTORY_BPERMUTE_HALVES=0`, within the whole wave as
+                // before:) a console wave of 64 run as two host waves: the
+                // lane named may be in the other one
                 return Err("a lane permute across two host waves");
             }
             let at = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
@@ -5648,8 +5758,19 @@ impl<'a> Lower<'a> {
             let at = self.s.m.bin(c, Bin::Add, at, o);
             let two = self.s.m.i32(2);
             let src = self.s.m.bin(c, Bin::LShr, at, two);
-            let last = self.s.m.i32(self.wave() - 1);
-            let src = self.s.m.bin(c, Bin::And, src, last);
+            let src = if halves && self.wave() == 64 {
+                let k31 = self.s.m.i32(31);
+                let within = self.s.m.bin(c, Bin::And, src, k31);
+                // The lane's own half: bit 5 of its host lane, which is 0 in
+                // a host wave of 32 (one half of the console's wave).
+                let lane = self.lane_index();
+                let k32 = self.s.m.i32(32);
+                let half = self.s.m.bin(c, Bin::And, lane, k32);
+                self.s.m.bin(c, Bin::Or, within, half)
+            } else {
+                let last = self.s.m.i32(self.wave() - 1);
+                self.s.m.bin(c, Bin::And, src, last)
+            };
             let x = match guard {
                 Some(g) => {
                     let z = self.s.m.i32(0);

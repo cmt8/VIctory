@@ -40,12 +40,24 @@ impl<'a> Lower<'a> {
     /// host leaves out (`fence_only`): a host wave of 64 holds more of such
     /// a group together than one of 32. `VICTORY_WAVE_PIN` does not apply
     /// then.
+    ///
+    /// A console wave64 program translated for host waves of 64 with the
+    /// switch unset (`compute_wave::in_console_waves`) declares its 64 here
+    /// in every case, `fence_only` or not (64 is what such a group wants).
+    /// Without a declared size it has 64 lanes only by RADV's default for a
+    /// group of over 32 threads, and vkd3d-proton asks the driver for 32
+    /// where its own reading of the code suggests them (see
+    /// `compute_wave`'s notes).
     pub(super) fn pin_wave(&mut self) {
         if self.x.native.stage != HwStage::Cs || self.s.wave_size.is_some() {
             return;
         }
         let wave = if self.x.p.wave64 { 64 } else { 32 };
         let wave_ops = self.s.flags & flags::WAVE_OPS != 0;
+        if wave == 64 && super::super::compute_wave::declares_64() {
+            self.s.wave_size = Some(64);
+            return;
+        }
         if super::super::compute_wave_32() {
             if wave_ops || self.fence_only.is_empty() {
                 self.s.wave_size = Some(wave);
