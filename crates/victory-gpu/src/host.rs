@@ -2338,6 +2338,33 @@ static MESH_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atom
 /// largest cost of one (told from 2^22 on), likewise.
 static BUDGET_NOTES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Stores of ours that were left out because they did not lie inside the
+/// buffer they were for, since the start: clamped records of a batch
+/// (`crate::indirect::batch`, from the lists' budget buffers, a run late).
+/// The changed words sent to copies in the card's memory count their own
+/// ([`send::refused`]). None is expected: [`outside_line`] says so if one is.
+static STORES_OUTSIDE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Once a second: a warning if a pass of ours left a store out since the
+/// last one, because it would have landed outside its buffer (in memory
+/// that is another buffer's, or not mapped at all: then the card stops and
+/// the device is lost). The store is lost instead; what made its place is
+/// wrong and has to be found.
+fn outside_line() {
+    static WAS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+    let now = [send::refused(), STORES_OUTSIDE.load(Ordering::Relaxed)];
+    let [words, records] = [0, 1].map(|i| now[i].saturating_sub(WAS[i].swap(now[i], Ordering::Relaxed)));
+    if words + records > 0 {
+        tracing::warn!(
+            "stores of ours left out because they lay outside their buffer: {words} changed words sent to copies in the card's \
+             memory, {records} clamped records of indirect executions ({} and {} since the start); each would have been written \
+             where its offset pointed, mapped or not",
+            now[0],
+            now[1],
+        );
+    }
+}
+
 /// Whether a list's indirect-work budget lives in the card's own memory
 /// (`VICTORY_INDIRECT_CARD_BUDGET=0` keeps it in memory the CPU maps, as
 /// before). The clamp charges it with atomics, at least two in a row for
@@ -7860,7 +7887,9 @@ impl HostList {
                 BUDGET_NOTES[0].fetch_add(u64::from(refused), Ordering::Relaxed);
                 crate::framewatch::add(crate::framewatch::Count::Refused, u64::from(refused));
                 BUDGET_NOTES[1].fetch_max(u64::from(biggest), Ordering::Relaxed);
-                for k in 0..5 {
+                // (And the records whose place was outside their buffer.)
+                STORES_OUTSIDE.fetch_add(u64::from(words.add(5).read_volatile()), Ordering::Relaxed);
+                for k in 0..6 {
                     words.add(k).write_volatile(0);
                 }
             });
@@ -7895,7 +7924,7 @@ impl HostList {
         };
         // SAFETY: a live buffer.
         let at = unsafe { card.GetGPUVirtualAddress() };
-        let zeros = [0u64, 4, 8, 12, 16].map(|offset| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
+        let zeros = [0u64, 4, 8, 12, 16, 20].map(|offset| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
             Dest: at + offset,
             Value: 0,
         });
@@ -7936,7 +7965,7 @@ impl HostList {
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
-            self.list.CopyBufferRegion(mapped, 4, card, 4, 16);
+            self.list.CopyBufferRegion(mapped, 4, card, 4, 20);
             self.list.ResourceBarrier(&[transition(
                 card,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -9912,6 +9941,7 @@ impl Meter {
             tracing::info!(
                 "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame; {refused:.2} indirect records a frame ran empty for want of their list's budget (2^27), the largest cost of one {biggest} (0: under 2^22)"
             );
+            outside_line();
             crate::shadow::exact_line(frames);
             crate::descriptor::sync_line(frames);
             late_line(frames);

@@ -3263,6 +3263,81 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
         }
     }
 
+    /// A job whose record would not lie whole inside the bytes the pass is
+    /// told the clamped records' buffer has is not stored, and is counted
+    /// in the budget's word 5: bound by its address alone, the buffer would
+    /// take the store wherever the place points, in mapped memory or not.
+    /// (The test's buffer is wider than the bytes it says, so that a store
+    /// the pass let through would show, and harm nothing.)
+    #[test]
+    fn warp_batch_stores_nothing_outside_its_buffer() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let pass = make_batch_for(&warp.device).expect("the batched clamp must compile on WARP");
+        const SAID: u32 = 256;
+        const FILL: u32 = 0xaaaa_aaaa;
+        let record = [3u32, 2, 5, 6];
+        assert_eq!(batch::words(0), Some(4));
+        let (_src, src_ptr, src_gpu) = warp.shared_buffer(64 << 10);
+        let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (fill, fill_ptr, _) = warp.shared_buffer(1024);
+        let (back, back_ptr, _) = warp.shared_buffer(1024);
+        let (_table, table_ptr, table_gpu) = warp.shared_buffer(batch::TABLE);
+        let dst = warp.default_uav(64 << 10);
+        // SAFETY: an open list; live buffers (the destination is promoted
+        // from the common state); mapped buffers the list has not read yet.
+        let mut table = unsafe {
+            for w in 0..256 {
+                fill_ptr.cast::<u32>().add(w).write_volatile(FILL);
+            }
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            for r in 0..6 {
+                for (w, word) in record.into_iter().enumerate() {
+                    src_ptr.cast::<u32>().add(r * 4 + w).write_volatile(word);
+                }
+            }
+            warp.list.CopyBufferRegion(&dst, 0, &fill, 0, 1024);
+            batch::Table::new(table_ptr, SAID - 64, [1, 0, 0, 0])
+        };
+        batch::record_within(&pass, &warp.list, (&dst, D3D12_RESOURCE_STATE_COPY_DEST, SAID), budget_gpu, [src_gpu; 4], table_gpu);
+        // The last two places inside the bytes said, the first two past
+        // them.
+        for r in 0..4u64 {
+            assert_eq!(table.place(1, r * 16, 0), Some(u64::from(SAID) - 64 + r * 32));
+        }
+        // By hand: a place that begins inside them and ends past them, and
+        // one far past them. (None past the test's buffer: a pass that let
+        // one through must not write where nothing is mapped.)
+        // SAFETY: the table's own words, before the list runs.
+        unsafe {
+            let words = table_ptr.cast::<u32>();
+            for (i, place) in [(4usize, SAID - 12), (5, 512)] {
+                let job = [batch::job(0, 0, 1), i as u32 * 16, place, 0];
+                for (w, word) in job.into_iter().enumerate() {
+                    words.add(4 + 4 * i + w).write_volatile(word);
+                }
+            }
+            words.write_volatile(6);
+            warp.list.ResourceBarrier(&[transition(&dst, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            warp.list.CopyBufferRegion(&back, 0, &dst, 0, 1024);
+        }
+        warp.submit_and_wait();
+        // SAFETY: the list has run; mapped words.
+        let (held, outside): (Vec<u32>, u32) = unsafe {
+            (
+                (0..256).map(|w| back_ptr.cast::<u32>().add(w).read_volatile()).collect(),
+                budget_ptr.cast::<u32>().add(5).read_volatile(),
+            )
+        };
+        let mut wanted = vec![FILL; 256];
+        for place in [SAID as usize - 64, SAID as usize - 32] {
+            wanted[place / 4..place / 4 + 4].copy_from_slice(&record);
+        }
+        assert_eq!(held, wanted, "only the records inside the {SAID} bytes are stored");
+        assert_eq!(outside, 4, "the four records outside are counted");
+    }
+
     /// Two batches through a host list, twice (the second recording finds
     /// the scratch buffer as the first one's end left it): executions with
     /// nothing between them read what they asked for, of two source buffers,

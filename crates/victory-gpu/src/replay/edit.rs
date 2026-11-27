@@ -330,6 +330,12 @@ pub const BATCH: u32 = u32::MAX - 3;
 pub const BATCH_JOBS: u32 = u32::MAX - 4;
 pub const BATCH_SCRATCH: u32 = u32::MAX - 16;
 
+/// The bytes of the scratch buffer made for a list whose clamped records
+/// take `used` of them ([`Batched::scratch`]).
+pub fn scratch_bytes(used: u64) -> u64 {
+    used.next_multiple_of(64 << 10)
+}
+
 /// What [`batch_clamps`] did to a list.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Batched {
@@ -368,9 +374,12 @@ pub fn batch_clamps(
     careful: bool,
     jobs: &mut Vec<u8>,
 ) -> (Vec<Cmd>, Batched) {
-    use crate::indirect::batch::{JOBS, SLOT, SOURCES, TIMES, job};
+    use crate::indirect::batch::{BOUND, JOBS, SLOT, SOURCES, TIMES, job};
     const DISPATCH: u32 = 2;
     let mut done = Batched::default();
+    // Where the passes are told the bytes of the scratch buffer, which are
+    // known at the list's end.
+    let mut bounds: Vec<usize> = Vec::new();
     let scratches: HashSet<u32> = {
         let mut next = 0;
         let found = find_clamps(&cmds, psos, &mut next);
@@ -465,6 +474,13 @@ pub fn batch_clamps(
                     root: BATCH_ROOT,
                 });
                 out.push(Cmd::Pipeline { pso: BATCH });
+                bounds.push(out.len());
+                out.push(Cmd::Constants {
+                    graphics: false,
+                    param: BOUND,
+                    offset: 0,
+                    values: vec![0],
+                });
                 let at = out.len();
                 let mut view = |kind, param: usize, res, offset| {
                     out.push(Cmd::RootView {
@@ -587,6 +603,11 @@ pub fn batch_clamps(
         out.push(Cmd::Barriers {
             all: vec![moved(INDIRECT_ARGUMENT, 0)],
         });
+    }
+    for at in bounds {
+        if let Some(Cmd::Constants { values, .. }) = out.get_mut(at) {
+            *values = vec![crate::indirect::batch::bound(scratch_bytes(done.scratch))];
+        }
     }
     (out, done)
 }
@@ -847,7 +868,7 @@ mod tests {
 
     #[test]
     fn clamps_are_batched() {
-        use crate::indirect::batch::job;
+        use crate::indirect::batch::{BOUND, job};
         let clamp = |kind, offset, records, source| {
             let view = |param, res| Cmd::RootView {
                 graphics: false,
@@ -943,6 +964,17 @@ mod tests {
                 })
                 .collect();
             assert_eq!(sources.last(), Some(&71));
+            // Each pass is told the bytes of the scratch buffer, which hold
+            // every place.
+            let bounds: Vec<u32> = out
+                .iter()
+                .filter_map(|c| match c {
+                    Cmd::Constants { graphics: false, param: BOUND, values, .. } => values.first().copied(),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(bounds, vec![64 << 10; batches as usize]);
+            assert!(done.scratch <= 64 << 10 && places.iter().all(|p| p + 32 <= 64 << 10));
             // It ends common, as it began.
             assert_eq!(out.last(), Some(&barriers(&[moved(99, 0x200, 0)])));
         }

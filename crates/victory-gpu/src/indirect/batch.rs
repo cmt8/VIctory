@@ -11,6 +11,16 @@
 //!
 //! What the records charge the list's budget is as for records clamped
 //! alone, times the executions that read them.
+//!
+//! The clamped records' buffer is bound by its address alone (a root view),
+//! and a job's place in it is a word of the table: nothing but the pass
+//! itself keeps a store inside the buffer, and a store where no memory is
+//! mapped stops the card with a page fault (the device is lost). So the pass
+//! is told the buffer's bytes and stores a record only where it lies whole
+//! inside them; one that does not is left out and counted (the budget's
+//! word 5). The places are made by us ([`Table::place`]), so none should be:
+//! the bound costs each thread of a job a subtraction, a shift and two
+//! compares.
 
 use windows::Win32::Graphics::Direct3D12::*;
 
@@ -30,7 +40,9 @@ pub(crate) const SOURCES: usize = 4;
 pub(crate) const TIMES: u32 = 31;
 
 pub(crate) const SOURCE: &str = r#"
-#define RS "SRV(t0), SRV(t1), SRV(t2), SRV(t3), SRV(t4), UAV(u0), UAV(u1)"
+#define RS "SRV(t0), SRV(t1), SRV(t2), SRV(t3), SRV(t4), UAV(u0), UAV(u1), RootConstants(num32BitConstants=1, b0)"
+// The bytes of the clamped records' buffer.
+cbuffer Bound : register(b0) { uint dst_bytes; };
 ByteAddressBuffer src0 : register(t0);
 ByteAddressBuffer src1 : register(t1);
 ByteAddressBuffer src2 : register(t2);
@@ -42,7 +54,8 @@ ByteAddressBuffer jobs : register(t4);
 RWByteAddressBuffer dst_args : register(u0);
 // In words (Wine's compiler has Interlocked* only as functions, not as
 // methods of a byte address buffer): 0 the list's work, 1 and 2 the mesh
-// diagnostics, 3 and 4 the refused records and the largest cost.
+// diagnostics, 3 and 4 the refused records and the largest cost, 5 the
+// records whose place was not inside the clamped records' buffer.
 RWStructuredBuffer<uint> budget : register(u1);
 static const uint BUDGET = 1u << 27;
 static const uint GROUPS = 1u << 20;
@@ -170,6 +183,11 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     if (!active) {
         return;
     }
+    if (job.z >= dst_bytes || dst_bytes - job.z < words * 4u) {
+        uint outside;
+        InterlockedAdd(budget[5], 1u, outside);
+        return;
+    }
     if (fits[gi] == 0) {
         record[0] = 0;
         record[1] = 0;
@@ -185,12 +203,22 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
 
 /// The pass's root signature, as [`record`] binds it (the `[RootSignature]`
 /// of [`SOURCE`]): the sources and the table of jobs as root SRVs (t0-t4),
-/// the clamped records and the budget as root UAVs (u0, u1).
-pub(super) fn params() -> [D3D12_ROOT_PARAMETER1; SOURCES + 3] {
-    use crate::host::root_view;
+/// the clamped records and the budget as root UAVs (u0, u1), the bytes of
+/// the clamped records' buffer as a constant (b0).
+pub(super) fn params() -> [D3D12_ROOT_PARAMETER1; SOURCES + 4] {
+    use crate::host::{root_constants, root_view};
     let srv = |register| root_view(D3D12_ROOT_PARAMETER_TYPE_SRV, register);
     let uav = |register| root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, register);
-    [srv(0), srv(1), srv(2), srv(3), srv(4), uav(0), uav(1)]
+    [srv(0), srv(1), srv(2), srv(3), srv(4), uav(0), uav(1), root_constants(0, 1)]
+}
+
+/// The root parameter of the bytes of the clamped records' buffer.
+pub(crate) const BOUND: u32 = SOURCES as u32 + 3;
+
+/// The bytes the pass is told a buffer of `width` bytes has: all a job's
+/// place can reach of a wider one.
+pub(crate) fn bound(width: u64) -> u32 {
+    u32::try_from(width).unwrap_or(u32::MAX)
 }
 
 /// The words of a record of `kind` (PC argument numbering).
@@ -274,11 +302,26 @@ impl Table {
 /// Records the pass over the table at `jobs` (a host address) into `dst`,
 /// which is in state `before` and left in `INDIRECT_ARGUMENT`: after every
 /// earlier shader write (the title's argument passes), before what reads
-/// the clamped records.
+/// the clamped records. Nothing is stored outside `dst`'s bytes ([`bound`]).
 pub(super) fn record(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
     (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
+    budget: u64,
+    sources: [u64; SOURCES],
+    jobs: u64,
+) {
+    // SAFETY: a live buffer.
+    let bytes = bound(unsafe { dst.GetDesc() }.Width);
+    record_within(c, l, (dst, before, bytes), budget, sources, jobs);
+}
+
+/// [`record`], with the bytes of `dst` the pass may store in given (no
+/// more than it has).
+pub(super) fn record_within(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    (dst, before, bytes): (&ID3D12Resource, D3D12_RESOURCE_STATES, u32),
     budget: u64,
     sources: [u64; SOURCES],
     jobs: u64,
@@ -303,6 +346,7 @@ pub(super) fn record(
         l.SetComputeRootShaderResourceView(SOURCES as u32, jobs);
         l.SetComputeRootUnorderedAccessView(SOURCES as u32 + 1, dst.GetGPUVirtualAddress());
         l.SetComputeRootUnorderedAccessView(SOURCES as u32 + 2, budget);
+        l.SetComputeRoot32BitConstant(BOUND, bytes, 0);
         l.Dispatch(JOBS.div_ceil(64), 1, 1);
         // Nothing else the pass writes is read before the next full wait
         // (the budget, by the next pass): only the records have to be there.
