@@ -668,6 +668,18 @@ fn a_descriptor_of_numbers_is_title_memory_read_through_the_directory() {
         let (shader, _) = build(wide, WHOLE).expect("lowers through the directory");
         assert!(shader.root_srvs.contains(&super::SLOT_MEMORY));
         assert!(shader.root_uavs.contains(&super::SLOT_FAULTS));
+        // Each entry it reads there gives the number of a host copy, which
+        // picks a view-heap slot: bounded by the copies' run, as the page is
+        // by the directory. (An entry read once for each page looked up, or
+        // more often: no fewer bounds than pages.)
+        let minimums = super::census::minimums();
+        let pages = minimums.iter().filter(|m| m.0 == super::MEMORY_PAGES - 1).count();
+        let copies = minimums
+            .iter()
+            .filter(|&&m| m == (super::MEMORY_COPIES, Some(!super::MEMORY_READ_ONLY)))
+            .count();
+        assert!(pages > 0, "{minimums:x?}");
+        assert!(copies >= pages, "{copies} numbers bounded for {pages} pages: {minimums:x?}");
     }
 }
 

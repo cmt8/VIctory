@@ -72,6 +72,12 @@ pub const MEMORY_PAGES: u32 = 1 << 21;
 pub const MEMORY_READ_ONLY: u32 = 1 << 31;
 /// Dwords of the [`SLOT_FAULTS`] buffer.
 pub const MEMORY_FAULTS: u32 = 4096;
+/// Host copies a [`SLOT_MEMORY`] directory entry can number. The run of
+/// view-heap slots from `base` is one longer, and the host fills every slot
+/// of it with a raw view (the null one where no copy is yet). A translated
+/// program takes no number past it: whatever an entry holds, the slot it
+/// reads through is one of the run's.
+pub const MEMORY_COPIES: u32 = (1 << 12) - 1;
 /// `RootType::Other` code of a user-data dword the host computes: the view
 /// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
 pub const USER_MEMORY_BASE: u32 = 0x100;

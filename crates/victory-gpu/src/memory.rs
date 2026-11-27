@@ -76,8 +76,9 @@ use crate::descriptor::host::HostHeap;
 use crate::host::{HostList, host};
 use crate::shadow::Shadow;
 
-/// Copies that can be numbered (the run of heap slots is one longer).
-const COPIES: u32 = (1 << 12) - 1;
+/// Copies that can be numbered (the run of heap slots is one longer):
+/// what translated programs bound an entry's number by.
+const COPIES: u32 = victory_shader::emit::MEMORY_COPIES;
 /// A directory page.
 const PAGE: u64 = 1 << 16;
 /// An arena's bytes.

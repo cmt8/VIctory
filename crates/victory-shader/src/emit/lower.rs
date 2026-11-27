@@ -3817,7 +3817,9 @@ impl<'a> Lower<'a> {
     /// With `store`, a page that is not to be written ([`super::shader::MEMORY_READ_ONLY`])
     /// is the null view.
     fn memory(&mut self, lo: V, hi: V, guard: Option<V>, store: bool) -> (V, V) {
-        use super::shader::{MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
+        use super::shader::{
+            MEMORY_COPIES, MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE,
+        };
         let c = self.cur;
         let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -3849,6 +3851,14 @@ impl<'a> Lower<'a> {
         let (number, start) = (self.as_int(copy), self.as_int(start));
         let mask = k(self, !MEMORY_READ_ONLY);
         let copy = self.s.m.bin(c, Bin::And, number, mask);
+        // Inside the copies' run of view-heap slots whatever the entry holds:
+        // every slot of the run is a raw view, and a slot past it may be a
+        // view of another kind, which the card would read as a buffer's.
+        let most = k(self, MEMORY_COPIES);
+        let copy = self
+            .s
+            .op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[copy, most]);
+        self.s.m.tag(copy, Tag::Clamp);
         // A page without a copy: its number, at a place by the number. In a
         // branch: the notes lie in the PC's memory, and a store there with
         // every node of every ray would be most of what a trace does.
