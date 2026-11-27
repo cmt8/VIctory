@@ -161,6 +161,12 @@ fn build() -> [u8; 32] {
         if victory_shader::emit::early_depth_on() {
             bytes.extend_from_slice(b"VICTORY_EARLY_DEPTH=1");
         }
+        // `VICTORY_KINDS_WHY` writes its lines when a program is translated:
+        // a set of its own, so a warm-up with it translates every program
+        // and the runs' set stays as it is. Only when set, as above.
+        if victory_shader::emit::kinds_asked() {
+            bytes.extend_from_slice(b"VICTORY_KINDS_WHY");
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();

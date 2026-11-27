@@ -91,6 +91,7 @@ mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod compute_wave;
+mod kinds;
 mod lower;
 mod own_bits;
 #[cfg(all(test, windows))]
@@ -127,6 +128,7 @@ pub use compute_wave::{
     compute_wave_32, host_min_wave_set, keyed_apart, keyed_apart_any, named, set_host_min_wave, wave64_as_console,
     wave_kept,
 };
+pub use kinds::asked as kinds_asked;
 pub use lower::{host_settings, set_host_max_wave, set_host_rdna, set_thread_max_wave};
 pub use rect::rect_list_gs;
 pub use shader::{
@@ -612,13 +614,17 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
     let p = crate::spill::build(&native)?;
+    // `VICTORY_KINDS_WHY`: what kinds of instruction the program is made of (one line)
+    kinds::report(&native, &p);
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let st = structure::structure(&p);
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit(&c, &native, &p, &st, &io, &res)
+    let shader = emit(&c, &native, &p, &st, &io, &res)?;
+    kinds::report_result(&shader);
+    Ok(shader)
 }
 
 /// [`emit`] with the same second tries as [`translate`] (first halves of
