@@ -255,17 +255,23 @@ thread_local! {
 /// fxceless/victory-fork #907). Without it the host tests after the shader,
 /// and such a program writes its unordered views for pixels the test then
 /// rejects: the glass prepass's depth and motion vectors, which the title's
-/// temporal upscaler reads. `VICTORY_EARLY_DEPTH=1`: on; off by default
-/// here until a played run has shown what it does to the far trees' and
-/// signs' flicker. Part of the translation: the shader cache keys on the
-/// switch.
+/// temporal upscaler reads. `VICTORY_EARLY_DEPTH`: on, as the console has it
+/// and as the tree played before this one had it (a played run of this tree
+/// with it on was clean); `=0`: no program declares it, as this tree
+/// translated while the switch was off unless set. Part of the translation:
+/// the shader cache keys on the switch, each setting with entries of its own.
 pub fn early_depth_on() -> bool {
     #[cfg(test)]
     if let Some(on) = EARLY_DEPTH_TEST.get() {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_EARLY_DEPTH").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| early_depth_said(std::env::var("VICTORY_EARLY_DEPTH").ok().as_deref()))
+}
+
+/// What `VICTORY_EARLY_DEPTH` says: on unless it is `0`.
+fn early_depth_said(value: Option<&str>) -> bool {
+    value.is_none_or(|v| v.trim() != "0")
 }
 
 #[cfg(test)]
@@ -1825,7 +1831,13 @@ mod tests {
             let io = io::raise(&p, &native).unwrap();
             emit(&c, &native, &p, &st, &io, &res).unwrap().dxil
         };
-        // The switch on, on this thread alone (`VICTORY_EARLY_DEPTH=1`).
+        // What the switch says: on unless it is 0, so unset too.
+        assert!(super::early_depth_said(None), "on with the switch not set");
+        assert!(super::early_depth_said(Some("1")));
+        assert!(super::early_depth_said(Some("")));
+        assert!(!super::early_depth_said(Some("0")));
+        assert!(!super::early_depth_said(Some(" 0 ")));
+        // The switch on, on this thread alone (the default).
         let was = super::EARLY_DEPTH_TEST.replace(Some(true));
         let late = emitted(&color, el("SV_Target", 16, 4), 0x50);
         let early = emitted(&color, el("SV_Target", 16, 4), 0x1050);
@@ -1839,8 +1851,9 @@ mod tests {
         let late = emitted(&depth, el("SV_Depth", 17, 1), 0x51);
         let early = emitted(&depth, el("SV_Depth", 17, 1), 0x1051);
         assert_eq!(late, early, "early depth declared for a depth export");
-        // The switch off: the bit declares nothing, and the module is the
-        // one made before there was a switch (the cached translations hold).
+        // The switch off (`VICTORY_EARLY_DEPTH=0`): the bit declares nothing,
+        // and the module is the one made before there was a switch (the
+        // translations cached with it off hold for that setting).
         super::EARLY_DEPTH_TEST.set(Some(false));
         let off = emitted(&color, el("SV_Target", 16, 4), 0x1050);
         let plain = emitted(&color, el("SV_Target", 16, 4), 0x50);
