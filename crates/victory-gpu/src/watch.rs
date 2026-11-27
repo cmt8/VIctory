@@ -26,7 +26,7 @@
 //! it has nothing). `VICTORY_VIEW_GUARD=0`: each address for itself, as
 //! before.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::ops::{Bound, RangeBounds};
 use std::sync::{Condvar, Mutex, RwLock};
 
@@ -2125,6 +2125,8 @@ fn placeholder(block: usize) -> bool {
 /// runtime's mapping fills, [`reserved`].)
 pub fn title_memory_allocated(at: usize, len: usize) {
     reserved::RECORDS.forget(at, len);
+    // (And no view Windows told of before, [`MAPPED`]: the two together.)
+    forget_mapped(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     if len == 0 || !known_holes() {
         return;
     }
@@ -2143,6 +2145,9 @@ pub fn title_memory_allocated(at: usize, len: usize) {
 /// reservation is made, before the title has its address. From then on the
 /// holes among its blocks are known without asking Windows ([`reserved`]).
 pub fn title_memory_reserved(at: usize, len: usize) {
+    // (What Windows said of views at these addresses before, [`MAPPED`], was
+    // of other memory: forgotten first, the two together.)
+    forget_mapped(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     reserved::RECORDS.reserve(at, len);
 }
 
@@ -2383,9 +2388,11 @@ struct Guards {
     absent: Blocks,
     /// Of those, the ones in placeholders ([`known_holes`]).
     held: Blocks,
-    /// Blocks that were absent and turned out to be other memory than views
-    /// when something was there again: never guarded, copied every time.
-    foreign: BTreeSet<usize>,
+    /// Blocks of other memory than views in a range asked about as a view:
+    /// what was absent and turned out so when something was there again, and
+    /// what a question found so before a block was first guarded
+    /// ([`protect_here`]). Never guarded, copied every time.
+    foreign: Blocks,
     /// Blocks (first, past the last) the kernel writes now
     /// ([`kernel_writing`]), and blocks the runtime has unmapped in a change
     /// not yet done ([`title_memory_unmapping`]). Not in the sets above, and
@@ -2507,7 +2514,7 @@ static GUARDS: RwLock<Guards> = RwLock::new(Guards {
     clean: Blocks::new(),
     absent: Blocks::new(),
     held: Blocks::new(),
-    foreign: BTreeSet::new(),
+    foreign: Blocks::new(),
     kernel: Vec::new(),
     changing: Vec::new(),
     aliased: Blocks::new(),
@@ -2858,7 +2865,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             if cover(&g, block, block + 1, None) {
                 g.clean.insert(block);
             }
-        } else if !g.foreign.contains(&block) && !g.left_alone(block) && !g.rests(block, rest) {
+        } else if !g.foreign.contains(block) && !g.left_alone(block) && !g.rests(block, rest) {
             run = Some((run.map_or(block, |r| r.0), block + 1));
         } else if let Some((from, to)) = run.take() {
             protect(&g, from, to);
@@ -2882,7 +2889,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
 fn guard_shared(first: usize, last: usize, came: &[(usize, bool)], rest: std::time::Duration) -> Vec<usize> {
     if !came.is_empty() {
         // (Changes no block's protection: the sets of what is where.)
-        let mut g = guards_timed();
+        let g = guards_timed();
         for &(block, view) in came {
             if g.absent.remove(block) && !view {
                 g.foreign.insert(block);
@@ -2922,7 +2929,7 @@ fn guard_shared(first: usize, last: usize, came: &[(usize, bool)], rest: std::ti
             if g.protected.contains(block) && !g.clean.contains(block) && cover(&g, block, block + 1, Some(&mut claims)) {
                 g.clean.insert(block);
             }
-        } else if !g.foreign.contains(&block) && !g.left_alone(block) && !g.rests(block, rest) {
+        } else if !g.foreign.contains(block) && !g.left_alone(block) && !g.rests(block, rest) {
             run = Some((run.map_or(block, |r| r.0), block + 1));
         } else if let Some((from, to)) = run.take() {
             protect_claimed(&g, from, to);
@@ -3124,8 +3131,183 @@ fn protect_alias(g: &Guards, block: usize, claims: Option<&mut Claims>) -> bool 
     false
 }
 
+/// The blocks a question to Windows found to be view memory: committed, and
+/// mapped from a section ([`there`]). Only such a block is ever made
+/// read-only ([`protect_here`]). Set and looked at under the guards' lock;
+/// forgotten when the runtime tells of a change there or the title frees the
+/// memory ([`forget_mapped`]), as what else is known of a block is.
+///
+/// The answer is kept only for a view of the runtime's own ([`kept_view`]):
+/// of any other memory Windows is asked every time, before it is guarded.
+static MAPPED: Bits = Bits::new();
+
+/// Whether `block` is a view still, with no question to Windows: Windows
+/// said it was one ([`MAPPED`]), and it lies in a reservation of the
+/// runtime's where the runtime shows a view now ([`reserved`]: mapped before
+/// it told of it, and told of before it is unmapped, which waits for the
+/// guards' lock the caller holds). Neither alone will do. Windows' answer
+/// grows old with nobody telling where the memory is not the runtime's (a
+/// library's file mapping in the gap behind a reservation, unmapped, and a
+/// thread's stack put there); and the records say what the runtime did, not
+/// what is there.
+fn kept_view(block: usize) -> bool {
+    MAPPED.any(block, block + 1) && reserved::RECORDS.shows(block)
+}
+
+/// What Windows says is at a block.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum There {
+    /// A view: committed, mapped from a section.
+    View,
+    /// Nothing: a reservation (a placeholder), or free.
+    Hole,
+    /// Other memory, committed: the title's own heaps, the runtime's, a
+    /// library's, a thread's stack.
+    Other,
+}
+
+/// What is at `block` ([`There`]), by its first page, and the end
+/// (exclusive) of the whole blocks from `block` on that it holds for (`block`
+/// itself if the region ends within it), with what Windows calls its kind and
+/// protection: one question for the blocks of a region.
+fn there(block: usize) -> (There, usize, u32, u32) {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_FREE, MEM_MAPPED, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+    #[cfg(test)]
+    THERE_ASKED.set(THERE_ASKED.get() + 1);
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
+    if n == 0 {
+        // Nothing Windows knows of: not ours to guard, whatever it is.
+        return (There::Other, block, 0, 0);
+    }
+    let end = ((info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK).max(block);
+    let what = match info.State {
+        MEM_COMMIT if info.Type == MEM_MAPPED => There::View,
+        MEM_RESERVE | MEM_FREE => There::Hole,
+        _ => There::Other,
+    };
+    (what, end, info.Type, info.Protect)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The questions this thread put to Windows by [`there`].
+    static THERE_ASKED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// What a question found of `[first, last)` as view memory ([`MAPPED`]) is
+/// forgotten.
+fn forget_mapped(first: usize, last: usize) {
+    if !MAPPED.any(first, last) {
+        return;
+    }
+    let set: Vec<usize> = MAPPED.set_in(first, last).collect();
+    for block in set {
+        MAPPED.clear(block);
+    }
+}
+
 /// [`protect`] for one range, without the other views of its pages.
+///
+/// Only view memory is made read-only. A range asked about as a view is one
+/// by where it begins ([`is_view`]), and what follows in it need not be the
+/// title's at all: a window of title memory is cut on a grid (4 MiB), and the
+/// one over the end of a reservation of the title's runs on into whatever
+/// lies behind it. Under Wine that was a thread's stack for its calls into
+/// the system, put into the gap before the title's next reservation (which
+/// begins on a 2 MiB line): private memory, committed and read-write, as a
+/// view is for all a change of protection tells. Made read-only it took the
+/// thread with it, and the process: the thread's own data for the C library
+/// and the kernel lie at that stack's top, a fault in a call into the system
+/// is not one our handler is given, and what the kernel could not write
+/// there (the thread's restartable-sequence area) it ended the process for,
+/// with a segmentation fault that names no address (runs d1 and d3,
+/// 2026-11-26).
+///
+/// So each block is asked about before it is guarded ([`there`]), a region
+/// at a time, unless it is a view of the runtime's own that Windows was
+/// asked about before ([`kept_view`]): a view is guarded; a hole is noted
+/// absent, as before; other memory is left as it is and noted foreign, which
+/// is told as written at every asking and so copied every time.
+///
+/// A hole is first noted here, by Windows' word, and the runtime's records
+/// of its reservations are compared with that word ([`reserved::found_asked`]:
+/// the question put here is the one that comparison begins with, not put
+/// twice). The records make nothing a view here: what they call one is asked
+/// about as anything else is, until Windows has said so too.
 fn protect_here(g: &Guards, from: usize, to: usize) {
+    let mut block = from;
+    while block < to {
+        let mut views = block;
+        while views < to && kept_view(views) {
+            views += 1;
+        }
+        if views > block {
+            protect_views(g, block, views);
+            block = views;
+            continue;
+        }
+        let (what, end, kind, protection) = there(block);
+        let whole = end.min(to);
+        // An allocation begins on a block's line: a block whose first page
+        // is of one has nothing of another's.
+        let until = whole.max(block + 1);
+        match what {
+            There::View => {
+                (block..until).for_each(|block| MAPPED.set(block));
+                protect_views(g, block, until);
+            }
+            There::Hole => {
+                // Windows' word, whatever the runtime's records say: what is
+                // noted a hole here was one. (No further than the region
+                // asked about above, if the comparison asked again and was
+                // told of more; a block that only begins as a hole is left
+                // for the next asking, as before.)
+                let hole = reserved::found_asked(reserved::mode(), block, to, end).min(whole);
+                for block in block..hole {
+                    g.absent.insert(block);
+                    if known_holes() && placeholder(block) {
+                        g.held.insert(block);
+                    }
+                }
+                #[cfg(feature = "diagnostics")]
+                tally(9, 1);
+            }
+            There::Other => {
+                (block..until).for_each(|block| {
+                    g.foreign.insert(block);
+                });
+                not_a_view(block, until, kind, protection);
+            }
+        }
+        block = until;
+    }
+}
+
+/// Says that the guards met memory that is no view in a range asked about as
+/// one, `[from, to)` in blocks, the first few times: where the title's views
+/// end and another's memory begins is worth knowing of a run.
+fn not_a_view(from: usize, to: usize, kind: u32, protection: u32) {
+    static TOLD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if TOLD.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+        tracing::info!(
+            at = format_args!("{:#x}", from * BLOCK),
+            bytes = (to - from) * BLOCK,
+            kind = format_args!("{kind:#x}"),
+            protection = format_args!("{protection:#x}"),
+            "memory in a range asked about as a view is no view (private memory, an image, a thread's stack): the guards leave it as it is, and it is copied every time"
+        );
+    }
+}
+
+/// [`protect_here`] for blocks that are view memory: Windows said so just
+/// now, or said so before of a view the runtime shows still ([`kept_view`]).
+/// Called for nothing else.
+fn protect_views(g: &Guards, from: usize, to: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
     let set = |from: usize, to: usize| {
         let mut old = 0;
@@ -3172,6 +3354,8 @@ fn protect_here(g: &Guards, from: usize, to: usize) {
             continue;
         }
         PROTECTED.clear(block);
+        // Not guarded: asked about anew before it next is.
+        MAPPED.clear(block);
         if block >= uncommitted_until {
             // (Windows' word, whatever the runtime's records say: what is
             // noted a hole here was one.)
@@ -3208,10 +3392,12 @@ fn uncommitted_end(block: usize, limit: usize) -> usize {
 }
 
 /// [`uncommitted_end`] for a block that could not be guarded and was not
-/// noted absent before ([`protect_here`]): Windows is asked, as ever, so
-/// nothing is first taken for a hole on the records' word alone (and the
-/// records are compared with what it says, [`reserved::found`]). These are
-/// few: one for each hole that comes to be, not one at every asking.
+/// noted absent before ([`protect_views`]: a view when Windows was asked,
+/// and none now): Windows is asked, as ever, so nothing is first taken for a
+/// hole on the records' word alone (and the records are compared with what
+/// it says, [`reserved::found`]). These are few: one for each hole that
+/// comes to be, not one at every asking. (A hole that [`protect_here`] finds
+/// by its own question is compared the same way, [`reserved::found_asked`].)
 fn uncommitted_end_found(block: usize, limit: usize) -> usize {
     reserved::found(reserved::mode(), block, limit)
 }
@@ -3767,20 +3953,23 @@ pub fn title_memory_freed(at: usize, len: usize) {
     // What the runtime reserved there is its own no more ([`reserved`]): the
     // range, or the allocation that begins at `at` as Windows has it now,
     // before it goes (a placeholder the title cut out of a reservation is
-    // one).
-    if len != 0 {
-        reserved::RECORDS.forget(at, len);
-    } else if reserved::RECORDS.any(at, 1) {
-        reserved::RECORDS.forget(at, allocation_end(at, at).saturating_sub(at).max(1));
-    }
-    if len != 0 {
-        forget_views(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
-    } else if VIEWS.any(at / BLOCK, at / BLOCK + 1) {
-        forget_views(at / BLOCK, allocation_end(at, at).div_ceil(BLOCK).max(at / BLOCK + 1));
-    }
-    let mut g = guards();
+    // one). And what was known of views there ([`VIEWS`], [`MAPPED`]): the
+    // same blocks, together, if any of the three knows of the first.
     let first = at / BLOCK;
-    let noted = [g.protected.range(first..).next(), g.absent.range(first..).next(), g.foreign.range(first..).next().copied()];
+    let last = if len != 0 {
+        at.saturating_add(len).div_ceil(BLOCK)
+    } else if reserved::RECORDS.any(at, 1) || VIEWS.any(first, first + 1) || MAPPED.any(first, first + 1) {
+        allocation_end(at, at).div_ceil(BLOCK).max(first + 1)
+    } else {
+        first
+    };
+    reserved::RECORDS.forget_blocks(first, last);
+    forget_views(first, last);
+    let g = guards();
+    // (Again, with the guards held: an asking that held them until now may
+    // have found a view there since.)
+    forget_mapped(first, last);
+    let noted = [g.protected.range(first..).next(), g.absent.range(first..).next(), g.foreign.range(first..).next()];
     let Some(noted) = noted.into_iter().flatten().min() else {
         return;
     };
@@ -3792,6 +3981,7 @@ pub fn title_memory_freed(at: usize, len: usize) {
     if noted >= end {
         return;
     }
+    forget_mapped(first, end);
     let absent: Vec<usize> = g.absent.range(first..end).collect();
     for block in absent {
         g.absent.remove(block);
@@ -3799,9 +3989,9 @@ pub fn title_memory_freed(at: usize, len: usize) {
             PUBLISHED.clear(block);
         }
     }
-    let foreign: Vec<usize> = g.foreign.range(first..end).copied().collect();
+    let foreign: Vec<usize> = g.foreign.range(first..end).collect();
     for block in foreign {
-        g.foreign.remove(&block);
+        g.foreign.remove(block);
     }
     // (Memory that is still a view is not freed by that call, which fails:
     // it must not stay read-only.)
@@ -3830,6 +4020,7 @@ fn allocation_end(at: usize, inside: usize) -> usize {
 
 /// What is known of `[first, last)` as view memory ([`VIEWS`]) is forgotten.
 fn forget_views(first: usize, last: usize) {
+    forget_mapped(first, last);
     if !VIEWS.any(first, last) {
         return;
     }
@@ -3849,8 +4040,10 @@ fn title_memory_changed(at: usize, len: usize) -> std::sync::RwLockWriteGuard<'s
     crate::inplace::views_gone(at, len);
     // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
-    let mut g = guards();
+    let g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
+    // (What is there from now on is asked about anew.)
+    forget_mapped(range.start, range.end);
     let absent: Vec<usize> = g.absent.range(range.clone()).collect();
     for block in absent {
         g.absent.remove(block);
@@ -3858,9 +4051,9 @@ fn title_memory_changed(at: usize, len: usize) -> std::sync::RwLockWriteGuard<'s
             PUBLISHED.clear(block);
         }
     }
-    let foreign: Vec<usize> = g.foreign.range(range.clone()).copied().collect();
+    let foreign: Vec<usize> = g.foreign.range(range.clone()).collect();
     for block in foreign {
-        g.foreign.remove(&block);
+        g.foreign.remove(block);
     }
     let aliased: Vec<usize> = g.aliased.range(range).collect();
     for block in aliased {
@@ -4409,6 +4602,222 @@ mod tests {
         unsafe {
             for block in 0..3 {
                 VirtualFree((p + block * BLOCK) as *mut _, 0, MEM_RELEASE);
+            }
+        }
+    }
+
+    /// A range asked about as a view (it begins in one) that runs on into
+    /// memory that is no view, there before the first asking and never told
+    /// of: the view is guarded, the other memory keeps its protection and is
+    /// copied every time. (A window of title memory over the end of the
+    /// title's reservation ran on into a thread's stack under Wine: made
+    /// read-only, it ended the process, runs d1 and d3 of 2026-11-26.)
+    #[test]
+    fn memory_past_a_view_that_is_no_view_is_not_guarded() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER, MapViewOfFile3, PAGE_READONLY,
+            UnmapViewOfFile2,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let p = placeholder(4);
+        // SAFETY: a section's block in place of the first placeholder.
+        let view = unsafe {
+            let section =
+                CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, BLOCK as u32, std::ptr::null());
+            assert!(!section.is_null());
+            MapViewOfFile3(
+                section,
+                GetCurrentProcess(),
+                p as *const _,
+                0,
+                BLOCK,
+                MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        assert_eq!(view.Value as usize, p);
+        // Another's memory behind it, two blocks (a stack with its page
+        // that is not written at the bottom), and a hole.
+        private_at(p + BLOCK, PAGE_READONLY);
+        private_at(p + 2 * BLOCK, PAGE_READWRITE);
+        let block = |k: usize| p / BLOCK + k;
+        let as_made = || {
+            assert_eq!(protection(p + BLOCK), PAGE_READONLY);
+            assert_eq!(protection(p + 2 * BLOCK), PAGE_READWRITE);
+            assert!(!PROTECTED.any(block(1), block(3)));
+            let g = guards();
+            for k in 1..3 {
+                assert!(!g.protected.contains(block(k)) && !g.clean.contains(block(k)) && !g.absent.contains(block(k)));
+            }
+        };
+        // The first asking: all of it written, as far as anyone knows.
+        assert_eq!(guard(p, p + 4 * BLOCK).map(|w| w.len()), Some(4));
+        assert_eq!(protection(p), PAGE_READONLY, "the view is guarded");
+        as_made();
+        // A write there is nobody's fault.
+        // SAFETY: our allocation, read-write.
+        unsafe { ((p + 2 * BLOCK + 8) as *mut u8).write(1) };
+        for _ in 0..2 {
+            let written = guard(p, p + 4 * BLOCK).expect("as a view");
+            assert_eq!(written, vec![p / PAGE + 1, p / PAGE + 2], "copied every time, and nothing else");
+            as_made();
+        }
+        // The view is written and guarded again, as ever.
+        // SAFETY: the view, opened by the handler.
+        unsafe { ((p + 8) as *mut u8).write(1) };
+        assert_eq!(guard(p, p + 4 * BLOCK), Some(vec![p / PAGE, p / PAGE + 1, p / PAGE + 2]));
+        assert_eq!(protection(p), PAGE_READONLY);
+        as_made();
+        // Told of a change there, nothing is known of the blocks any more.
+        {
+            let g = guards();
+            assert!(g.foreign.contains(block(1)) && g.foreign.contains(block(2)));
+        }
+        title_memory_unmapping(p, 4 * BLOCK);
+        {
+            let g = guards();
+            assert!(!g.foreign.contains(block(1)) && !g.foreign.contains(block(2)));
+            assert!(!MAPPED.any(block(0), block(4)));
+        }
+        // SAFETY: our view and our allocations.
+        unsafe {
+            assert_ne!(UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER), 0);
+            for k in 0..4 {
+                VirtualFree((p + k * BLOCK) as *mut _, 0, MEM_RELEASE);
+            }
+        }
+    }
+
+    /// A view of a section of its own, one block, in place of the
+    /// placeholder of one block at `at`, of which nobody is told.
+    fn section_view_at(at: usize) -> windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, MEM_REPLACE_PLACEHOLDER, MapViewOfFile3};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        // SAFETY: a section's block in place of our placeholder; the view
+        // keeps the section, whose handle is closed.
+        unsafe {
+            let section =
+                CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, BLOCK as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let view = MapViewOfFile3(
+                section,
+                GetCurrentProcess(),
+                at as *const _,
+                0,
+                BLOCK,
+                MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            );
+            assert_eq!(view.Value as usize, at);
+            windows_sys::Win32::Foundation::CloseHandle(section);
+            view
+        }
+    }
+
+    /// What Windows said of a block once is not gone by where the memory is
+    /// not the runtime's own: a view that goes with nobody telling, and
+    /// private memory in its place (a library's mapping behind the title's
+    /// reservation, and then a thread's stack), is asked about again before
+    /// it is guarded, and left as it is.
+    #[test]
+    fn a_view_gone_with_nobody_telling_is_not_guarded_on_an_old_answer() {
+        use windows_sys::Win32::System::Memory::{MEM_PRESERVE_PLACEHOLDER, PAGE_READONLY, UnmapViewOfFile2};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let p = placeholder(2);
+        let (one, two) = (section_view_at(p), section_view_at(p + BLOCK));
+        let other = p / BLOCK + 1;
+        assert_eq!(guard(p, p + 2 * BLOCK).map(|w| w.len()), Some(2));
+        assert_eq!([protection(p), protection(p + BLOCK)], [PAGE_READONLY; 2]);
+        assert!(MAPPED.any(other, other + 1) && !reserved::RECORDS.shows(other));
+        // The second view goes and private memory comes, untold.
+        // SAFETY: our view.
+        assert_ne!(unsafe { UnmapViewOfFile2(GetCurrentProcess(), two, MEM_PRESERVE_PLACEHOLDER) }, 0);
+        private_at(p + BLOCK, PAGE_READWRITE);
+        // What was noted guarded there is opened (our own write through the
+        // kernel, say), so the next asking would guard it again.
+        writing(p + BLOCK, BLOCK);
+        assert!(!guards().protected.contains(other));
+        for _ in 0..2 {
+            assert_eq!(guard(p, p + 2 * BLOCK), Some(vec![p / PAGE + 1]), "copied every time");
+            assert_eq!(protection(p + BLOCK), PAGE_READWRITE, "asked about again: no view, and left as it is");
+            assert!(!PROTECTED.any(other, other + 1));
+            let g = guards();
+            assert!(g.foreign.contains(other) && !g.protected.contains(other));
+        }
+        assert_eq!(protection(p), PAGE_READONLY, "the view that stayed is guarded still");
+        title_memory_unmapping(p, 2 * BLOCK);
+        // SAFETY: our view and our allocations.
+        unsafe {
+            assert_ne!(UnmapViewOfFile2(GetCurrentProcess(), one, MEM_PRESERVE_PLACEHOLDER), 0);
+            for k in 0..2 {
+                VirtualFree((p + k * BLOCK) as *mut _, 0, MEM_RELEASE);
+            }
+        }
+    }
+
+    /// A view of the runtime's own, in a reservation it told of, is asked
+    /// about once: Windows said it was a view, the runtime shows it still,
+    /// and it is guarded again after each write with no question. What
+    /// Windows said and what the runtime's records hold go together: told of
+    /// other memory there, or of the view's going, neither stands, and
+    /// Windows is asked again.
+    #[test]
+    fn a_view_the_runtime_shows_is_guarded_again_with_no_question() {
+        use windows_sys::Win32::System::Memory::{MEM_PRESERVE_PLACEHOLDER, PAGE_READONLY, UnmapViewOfFile2};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let p = placeholder(2);
+        let block = p / BLOCK;
+        title_memory_reserved(p, 2 * BLOCK);
+        let view = section_view_at(p);
+        title_memory_remapped(p, BLOCK);
+        assert!(reserved::RECORDS.shows(block) && !reserved::RECORDS.shows(block + 1));
+        let asked = THERE_ASKED.get();
+        let asked = move || THERE_ASKED.get() - asked;
+        // The first asking: the view, and the hole behind it.
+        assert_eq!(guard(p, p + 2 * BLOCK).map(|w| w.len()), Some(2));
+        assert_eq!(protection(p), PAGE_READONLY);
+        assert_eq!(asked(), 2);
+        assert!(kept_view(block) && !kept_view(block + 1));
+        for _ in 0..3 {
+            // SAFETY: the view, opened by the handler.
+            unsafe { ((p + 8) as *mut u8).write(1) };
+            assert_eq!(protection(p), PAGE_READWRITE);
+            assert_eq!(guard(p, p + 2 * BLOCK), Some(vec![p / PAGE]));
+            assert_eq!(protection(p), PAGE_READONLY);
+        }
+        assert_eq!(asked(), 2, "guarded again on what is known");
+        // Told of memory the runtime allocated there (there is none: the view
+        // stands): the records are forgotten, and Windows' word with them.
+        title_memory_allocated(p, BLOCK);
+        assert!(!reserved::RECORDS.shows(block) && !MAPPED.any(block, block + 1));
+        for n in 1..3 {
+            // SAFETY: as above.
+            unsafe { ((p + 8) as *mut u8).write(1) };
+            assert!(guard(p, p + 2 * BLOCK).is_some_and(|written| written.contains(&(p / PAGE))));
+            assert_eq!(protection(p), PAGE_READONLY, "a view by Windows' word, each time");
+            assert!(asked() >= 2 + n, "asked every time from then on");
+            assert!(!kept_view(block));
+        }
+        // Reserved anew and shown: what Windows said before the telling is
+        // forgotten, and the unmapping takes both.
+        title_memory_reserved(p, 2 * BLOCK);
+        assert!(!MAPPED.any(block, block + 1) && !reserved::RECORDS.shows(block));
+        title_memory_remapped(p, BLOCK);
+        assert!(guard(p, p + 2 * BLOCK).is_some_and(|written| written.contains(&(p / PAGE))));
+        assert!(kept_view(block));
+        title_memory_unmapping(p, 2 * BLOCK);
+        assert!(!MAPPED.any(block, block + 2) && !reserved::RECORDS.shows(block));
+        title_memory_freed(p, 2 * BLOCK);
+        assert!(!reserved::RECORDS.any(p, 2 * BLOCK));
+        // SAFETY: our view and our placeholders.
+        unsafe {
+            assert_ne!(UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER), 0);
+            for k in 0..2 {
+                VirtualFree((p + k * BLOCK) as *mut _, 0, MEM_RELEASE);
             }
         }
     }
@@ -5179,7 +5588,7 @@ mod tests {
     /// The set of blocks against another of the same.
     #[test]
     fn blocks_are_a_set() {
-        let (set, mut other) = (Blocks::new(), BTreeSet::new());
+        let (set, mut other) = (Blocks::new(), std::collections::BTreeSet::new());
         let mut seed = 1u64;
         let mut next = |n: usize| {
             seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);

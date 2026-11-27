@@ -40,12 +40,19 @@
 //! (`super::title_memory_changed`).
 //!
 //! The records never make a hole of a block: they say that one is a hole
-//! still. A block is first noted a hole by Windows' word ([`found`]: it could
-//! not be guarded, and Windows says nothing is committed there), as before;
+//! still. A block is first noted a hole by Windows' word ([`found_asked`]: the
+//! guards ask what is at a block before they guard anything there, and
+//! Windows says nothing is committed; [`found`]: a view could not be guarded,
+//! and Windows says so then), as before;
 //! the questions asked at every asking after that, whether the hole has been
 //! filled ([`end`]), are the ones the records answer. So a block is taken for
 //! a hole only if Windows said it was one, and the runtime has told of no
 //! view, no freeing and no other allocation there since.
+//!
+//! Nor do they make a view of one. The guards make read-only only what
+//! Windows said was a view; what the records add is how long that answer may
+//! be kept: while the runtime shows its view there ([`Records::shows`],
+//! `super::kept_view`). Of all other memory Windows is asked each time.
 //!
 //! What the records do not know, and Windows is asked about as before: all
 //! memory that is not such a reservation (the title's own `VirtualAlloc`,
@@ -202,6 +209,14 @@ impl Records {
         self.shown.clear_all(first, last);
     }
 
+    /// Whether the runtime shows a view over `block` now, in a reservation
+    /// of its own: mapped before it told of it, and told of before it is
+    /// unmapped. For `super::kept_view`, which also wants Windows' word.
+    pub(super) fn shows(&self, block: usize) -> bool {
+        let bit = 1u64 << (block % 64);
+        self.reserved.word(block / 64) & self.shown.word(block / 64) & bit != 0
+    }
+
     /// What [`super::uncommitted_end`] asks of `block`, if the block is the
     /// records': `block` itself if a view is mapped over it, else the end of
     /// the holes from it on, at most `limit` (the caller cares for no more).
@@ -258,14 +273,30 @@ pub(super) fn end(mode: Mode, block: usize, limit: usize) -> usize {
 /// compared, and blocks they differ about are the records' no more (with
 /// `check` they stay, and it is said).
 pub(super) fn found(mode: Mode, block: usize, limit: usize) -> usize {
+    found_given(mode, block, limit, None)
+}
+
+/// [`found`] for a caller that has just asked Windows about `block` itself
+/// and was told `asked` (what [`super::uncommitted_end_asked`] says of it:
+/// `super::protect_here`, which asks what is at a block before it guards
+/// anything there). That question is not put again: where the records do not
+/// answer for the block `asked` is the answer, and where they do it is the
+/// first of the two answers of Windows' they are compared with; the second,
+/// after which alone a difference counts, is asked anew ([`differs`]).
+pub(super) fn found_asked(mode: Mode, block: usize, limit: usize, asked: usize) -> usize {
+    found_given(mode, block, limit, Some(asked))
+}
+
+fn found_given(mode: Mode, block: usize, limit: usize, given: Option<usize>) -> usize {
+    let ask = || given.unwrap_or_else(|| super::uncommitted_end_asked(block));
     if mode == Mode::Asked {
-        return super::uncommitted_end_asked(block);
+        return ask();
     }
     COUNTS[FOUND].fetch_add(1, Relaxed);
     let Some(known) = RECORDS.end(block, limit) else {
-        return super::uncommitted_end_asked(block);
+        return ask();
     };
-    match differs(&RECORDS, block, known, limit, 1) {
+    match differs_given(&RECORDS, block, known, limit, 1, given) {
         (Some(at), asked) if mode == Mode::Records => {
             RECORDS.forget_blocks(block, known.max(at + 1));
             asked
@@ -321,10 +352,34 @@ pub fn title_memory_holes_compared(at: usize, len: usize) -> (usize, Option<usiz
 /// time. And what Windows said of `block` itself ([`super::uncommitted_end_asked`]),
 /// last. At most `most` of Windows' regions are walked for the holes.
 pub(super) fn differs(records: &Records, block: usize, known: usize, limit: usize, most: usize) -> (Option<usize>, usize) {
+    differs_given(records, block, known, limit, most, None)
+}
+
+/// [`differs`]; `given`: what Windows said of `block` itself a moment ago,
+/// to the caller, which stands for the first question about it. Only for
+/// the first of the two rounds: an answer taken before this began says
+/// nothing of whether a mapping changed meanwhile, and none is needed of it.
+/// If it agrees with the records, they were right a moment ago, which is all
+/// an agreement ever says; if it does not, the second round asks Windows
+/// anew, with the changes counted around the asking as before, and only what
+/// that one finds, standing still, is a difference.
+fn differs_given(
+    records: &Records,
+    block: usize,
+    known: usize,
+    limit: usize,
+    most: usize,
+    given: Option<usize>,
+) -> (Option<usize>, usize) {
     COUNTS[COMPARED].fetch_add(1, Relaxed);
     let of_block = std::cell::Cell::new(block);
+    let given = std::cell::Cell::new(given);
     let ask = |at: usize| {
-        let end = super::uncommitted_end_asked(at);
+        // (The first question is always the one about `block`.)
+        let end = match given.take() {
+            Some(end) if at == block => end,
+            _ => super::uncommitted_end_asked(at),
+        };
         if at == block {
             of_block.set(end);
         }
@@ -958,6 +1013,47 @@ mod host_tests {
         assert_eq!(written, [4, 5]);
         assert_eq!(ask(last).1, [0usize; 0]);
         title_memory_unmapping(at, BLOCKS * BLOCK);
+    }
+
+    /// The caller that has Windows' answer about a block in hand
+    /// ([`found_asked`]: the guards, which ask what is at a block before
+    /// they guard anything) is told what [`found`] tells, and the records are
+    /// compared as there. An answer that has grown old meanwhile makes no
+    /// difference of itself: Windows is asked anew before one counts.
+    #[test]
+    fn a_hole_found_with_windows_answer_in_hand_is_compared_the_same() {
+        const BLOCKS: usize = 8;
+        let (first, section) = reservation(BLOCKS);
+        let limit = first + BLOCKS;
+        map(section, first, 1, 1);
+        map_untold(section, first, 4, 1);
+        let asked = uncommitted_end_asked;
+        for mode in [Mode::Asked, Mode::Check, Mode::Records] {
+            assert_eq!(found_asked(mode, first + 2, limit, asked(first + 2)), first + 4, "{mode:?}");
+            assert_eq!(found_asked(mode, first, limit, asked(first)), first + 1, "{mode:?}");
+            assert_eq!(found_asked(mode, first + 5, limit, asked(first + 5)), limit, "{mode:?}");
+        }
+        assert_eq!(RECORDS.end(first, limit), Some(first + 1), "nothing was forgotten");
+        assert_eq!(RECORDS.end(first + 5, limit), Some(limit));
+        // Windows' answer from before the runtime mapped and told of a view:
+        // a hole, where the records have a view now, and so has Windows. No
+        // difference (unless another test's mapping left it unsettled, when
+        // the old answer is all there is), and the records stay.
+        let hole = asked(first + 6);
+        assert_eq!(hole, limit);
+        map(section, first, 6, 1);
+        let anew = || Some(found_asked(Mode::Records, first + 6, limit, hole)).filter(|&end| end != hole);
+        assert_eq!(settled(anew), Some(first + 6), "asked anew");
+        assert_eq!(RECORDS.end(first + 6, limit), Some(first + 6), "the records were right");
+        // The view nobody told of, with a true answer in hand: what the
+        // records had wrong is theirs no more.
+        let forgotten = || {
+            assert_eq!(found_asked(Mode::Records, first + 4, limit, asked(first + 4)), first + 4);
+            RECORDS.end(first + 4, limit).is_none().then_some(())
+        };
+        assert_eq!(settled(forgotten), Some(()));
+        assert_eq!(RECORDS.end(first + 2, limit), Some(first + 4), "the holes before it are the records' still");
+        title_memory_unmapping(first * BLOCK, BLOCKS * BLOCK);
     }
 
     /// Threads that map and unmap as the runtime does, each its own blocks,
