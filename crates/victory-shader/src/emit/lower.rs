@@ -343,6 +343,9 @@ struct Lower<'a> {
     typed_rw: bool,
     /// The handles that have their load and store that never run.
     rw_handles: HashSet<V>,
+    /// The LDS dword a program without LDS of its own stores to at its start
+    /// ([`super::group_cu`]): the host then runs the group in one compute unit.
+    cu_word: Option<u32>,
     /// src0 of the current instruction as DPP fetched it.
     src0: Option<V>,
     /// Compute code that reads other lanes: thread ids follow the host
@@ -2159,6 +2162,17 @@ impl<'a> Lower<'a> {
                 s.wave_size = Some(wave);
             }
         }
+        // (`VICTORY_GROUP_CU`: a compute program that writes UAVs, meets its group at a
+        // barrier and has no LDS, neither its own nor a form's.)
+        let cu_word = (super::group_cu()
+            && x.native.stage == HwStage::Cs
+            && writes_uavs
+            && s.lds_dwords == 0
+            && insts().any(|i| i.name() == "s_barrier"))
+        .then(|| {
+            s.lds_dwords = 1;
+            0
+        });
         // The title's barriers a thread of the group may never reach, which
         // leaves the others waiting on the host: those in blocks some lanes
         // do not run, and all of them in a program with a loop closed by a
@@ -2307,6 +2321,7 @@ impl<'a> Lower<'a> {
             writes_uavs,
             typed_rw,
             rw_handles: HashSet::new(),
+            cu_word,
             src0: None,
             console_lanes,
             split_lds,
@@ -2983,6 +2998,17 @@ impl<'a> Lower<'a> {
                 self.s.m.terminate(done, Term::Ret);
                 self.s.entry = body;
             }
+        }
+        if let Some(word) = self.cu_word {
+            // Every thread that runs stores a zero to the group's one dword of shared
+            // memory: nothing reads it. A program that uses LDS is run in one compute
+            // unit by RADV ([`super::group_cu`]).
+            let e = self.s.entry;
+            let lds = self.s.lds();
+            let k = self.s.m.i32(word);
+            let ptr = self.s.m.element(e, lds, k);
+            let zero = self.s.m.i32(0);
+            self.s.m.store(e, ptr, zero);
         }
         self.find_coherent();
         let order = crate::ir::reverse_postorder(&p.blocks);
@@ -14231,6 +14257,87 @@ mod tests {
             vec![buffer],
         )
         .map(|_| ())
+    }
+
+    /// `VICTORY_GROUP_CU`: a compute program that stores to a UAV and meets
+    /// its group at an `s_barrier` without any LDS is given a dword of
+    /// group-shared memory and a store to it. Only with the switch on, not
+    /// without a barrier, and not where the program has LDS already.
+    #[test]
+    fn a_group_with_a_barrier_and_no_lds_gets_a_dword_of_it_only_when_asked() {
+        const S_BARRIER: u32 = 0xBF8A_0000;
+        let lowered = |on: bool, barrier: bool, lds: bool| {
+            let mut words = vec![
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
+                0xFA00_0000,
+                0x7E00_0200 | 1 << 17, // v_mov_b32 v1, s0
+            ];
+            if barrier {
+                words.push(S_BARRIER);
+            }
+            words.extend_from_slice(&[
+                0xE070_0000, // buffer_store_dword v0, off, s[8:11], 0
+                0x8002_0000,
+                S_ENDPGM,
+            ]);
+            let layout = vec![
+                RootParam {
+                    sgprs: 4,
+                    ..root(RootType::Constants, 0, 0)
+                },
+                root(RootType::Table, 4, 1),
+            ];
+            let used = vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            }];
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 256,
+                layout,
+                used,
+                io: StageIo::Cs(ComputeIo {
+                    // five user SGPRs; 512 bytes of LDS or none
+                    rsrc2: u32::from(lds) << 15 | 5 << 1,
+                    threads: [64, 1, 1],
+                }),
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let p = ir::build(&native.code, false, 256).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            crate::emit::GROUP_CU_TEST.set(Some(on));
+            let lowered = lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            });
+            crate::emit::GROUP_CU_TEST.set(None);
+            lowered.expect("lowers").dxil
+        };
+        assert_eq!(lowered(false, true, false), lowered(false, true, false), "one translation");
+        assert_ne!(
+            lowered(false, true, false),
+            lowered(true, true, false),
+            "a barrier, a UAV store and no LDS: the dword and its store"
+        );
+        assert_eq!(lowered(false, false, false), lowered(true, false, false), "no barrier: as before");
+        assert_eq!(lowered(false, true, true), lowered(true, true, true), "LDS of its own: as before");
     }
 
     #[test]

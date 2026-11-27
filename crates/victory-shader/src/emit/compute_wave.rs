@@ -280,6 +280,9 @@ const EVEN_BARRIERS: &str = "VICTORY_WAVE_EVEN_BARRIERS: a form's barriers where
 /// unordered buffer views that it only reads are shown to the host as written
 /// too ([`super::typed_rw`]).
 const TYPED_RW: &str = "VICTORY_TYPED_RW: typed unordered buffer views read behind a barrier are not read-only";
+/// [`keyed_apart`]'s mark of a compute program with an `s_barrier` that may
+/// get a dword of group-shared memory it does not need ([`super::group_cu`]).
+const GROUP_CU: &str = "VICTORY_GROUP_CU: a group with a barrier and no LDS uses a dword of it";
 
 /// What of the translation of `container` whoever caches translations keys
 /// apart, beside what it keys every program by: a mark for each change of
@@ -312,6 +315,10 @@ pub fn keyed_apart(container: &[u8], kept: bool) -> Vec<&'static str> {
     // with a typed read the switch reaches, all the code tells without lowering it.)
     if super::typed_rw() && console_compute(container).is_some_and(|p| has_barrier(&p.code)) {
         marks.push(TYPED_RW);
+    }
+    // (The same programs: with UAV writes and without LDS is what lowering finds out.)
+    if super::group_cu() && console_compute(container).is_some_and(|p| has_barrier(&p.code)) {
+        marks.push(GROUP_CU);
     }
     if !console && !halves && !even {
         return marks;
@@ -351,6 +358,9 @@ pub fn keyed_apart_any() -> Vec<&'static str> {
     }
     if super::typed_rw() {
         marks.push(TYPED_RW);
+    }
+    if super::group_cu() {
+        marks.push(GROUP_CU);
     }
     marks
 }
@@ -456,6 +466,28 @@ mod tests {
         assert!(on.contains(&TYPED_RW));
         assert_eq!(on.iter().filter(|m| **m != TYPED_RW).collect::<Vec<_>>(), off.iter().collect::<Vec<_>>());
         assert!(!no_program.contains(&TYPED_RW));
+    }
+
+    /// `VICTORY_GROUP_CU` is off unless it is `1`; on, it is one of the marks
+    /// some program is keyed apart by, and no mark of what is no compute
+    /// program with a barrier. Off, no key changes.
+    #[test]
+    fn a_group_in_one_unit_keys_its_programs_apart_only_when_asked() {
+        assert!(!crate::emit::group_cu_said(None), "off with the switch not set");
+        assert!(!crate::emit::group_cu_said(Some("")));
+        assert!(!crate::emit::group_cu_said(Some("0")));
+        assert!(crate::emit::group_cu_said(Some("1")));
+        assert!(crate::emit::group_cu_said(Some(" 1 ")));
+        let was = crate::emit::GROUP_CU_TEST.replace(Some(false));
+        let off = keyed_apart_any();
+        assert!(!off.contains(&GROUP_CU));
+        crate::emit::GROUP_CU_TEST.set(Some(true));
+        let on = keyed_apart_any();
+        let no_program = keyed_apart(&[], false);
+        crate::emit::GROUP_CU_TEST.set(was);
+        assert!(on.contains(&GROUP_CU));
+        assert_eq!(on.iter().filter(|m| **m != GROUP_CU).collect::<Vec<_>>(), off.iter().collect::<Vec<_>>());
+        assert!(!no_program.contains(&GROUP_CU));
     }
 
     #[test]
