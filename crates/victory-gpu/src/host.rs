@@ -9307,6 +9307,29 @@ pub(crate) fn on_wine() -> bool {
     })
 }
 
+/// Whether the host device is vkd3d-proton's: it alone answers for its own
+/// `ID3D12DeviceExt` (vkd3d-proton, include/vkd3d_device_vkd3d_ext.idl).
+/// What Windows and its drivers refuse and vkd3d-proton defines is asked
+/// for by this, not by [`on_wine`]: a Wine may run another D3D12.
+pub(crate) fn vkd3d_proton() -> bool {
+    static IS: OnceLock<bool> = OnceLock::new();
+    *IS.get_or_init(|| {
+        use windows::core::{GUID, IUnknown, Interface};
+        const DEVICE_EXT: GUID = GUID::from_u128(0x11ea7a1a_0f6a_49bf_b612_3e30f8e201dd);
+        let Some(host) = host() else { return false };
+        let mut ext = std::ptr::null_mut();
+        // SAFETY: a live device; an answer is a reference of ours, given back
+        // when the `IUnknown` made of it is dropped.
+        unsafe {
+            let ok = host.device.query(&DEVICE_EXT, &mut ext).is_ok() && !ext.is_null();
+            if ok {
+                drop(IUnknown::from_raw(ext));
+            }
+            ok
+        }
+    })
+}
+
 /// Copies title memory at submission. The ranges were checked against their
 /// resources when recorded, but the title may since have unmapped pages of
 /// them (tiled memory, page mappings), which read as zeros here; a title
