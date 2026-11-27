@@ -4614,11 +4614,28 @@ mod tests {
     /// read-only, it ended the process, runs d1 and d3 of 2026-11-26.)
     #[test]
     fn memory_past_a_view_that_is_no_view_is_not_guarded() {
+        memory_past_a_view_is_left(false);
+    }
+
+    /// The same with renderer port #6 (`VICTORY_PORT_GUARD=1`): its asking
+    /// holds the guards' lock shared and goes by the blocks' claims
+    /// ([`guard_shared`], [`protect_claimed`]), and guards through the same
+    /// question to Windows. What it notes of the whole range as view memory
+    /// for itself ([`VIEWS`]: the kernel is not asked about it) makes nothing
+    /// read-only, and is forgotten with the rest.
+    #[test]
+    fn memory_past_a_view_that_is_no_view_is_not_guarded_with_port_6() {
+        memory_past_a_view_is_left(true);
+    }
+
+    fn memory_past_a_view_is_left(port: bool) {
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER, MapViewOfFile3, PAGE_READONLY,
             UnmapViewOfFile2,
         };
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        PORT_GUARD_IN_TEST.set(port);
+        assert!(!port || port_guard());
         let p = placeholder(4);
         // SAFETY: a section's block in place of the first placeholder.
         let view = unsafe {
@@ -4675,12 +4692,17 @@ mod tests {
             let g = guards();
             assert!(g.foreign.contains(block(1)) && g.foreign.contains(block(2)));
         }
+        if port_guard() {
+            assert!(VIEWS.all(block(0), block(4)), "noted for the kernel's askings only");
+        }
         title_memory_unmapping(p, 4 * BLOCK);
         {
             let g = guards();
             assert!(!g.foreign.contains(block(1)) && !g.foreign.contains(block(2)));
             assert!(!MAPPED.any(block(0), block(4)));
+            assert!(!VIEWS.any(block(0), block(4)));
         }
+        PORT_GUARD_IN_TEST.set(false);
         // SAFETY: our view and our allocations.
         unsafe {
             assert_ne!(UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER), 0);
