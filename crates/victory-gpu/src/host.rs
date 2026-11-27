@@ -3355,6 +3355,16 @@ const WHY_FENCE: usize = 10;
 /// copy, a fill of upload memory, a texture).
 static LATE_STATS: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atomic::AtomicU64::new(0) }; 18];
 
+/// Since the start, never zeroed (`crate::framewatch` takes the difference
+/// between two presented frames): settles, and landings by the thread that
+/// copies back.
+static SETTLED_SO_FAR: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// See [`SETTLED_SO_FAR`].
+pub(crate) fn settled_so_far() -> [u64; 2] {
+    SETTLED_SO_FAR.each_ref().map(|n| n.load(Ordering::Relaxed))
+}
+
 /// Since the last frame-rate line: the microseconds settles waited for the
 /// card, by why they settled (the `WHY_` places).
 static LATE_WAITED: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
@@ -3999,6 +4009,7 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
         return;
     }
     LATE_STATS[1].fetch_add(1, Ordering::Relaxed);
+    SETTLED_SO_FAR[0].fetch_add(1, Ordering::Relaxed);
     LATE_STATS[why].fetch_add(1, Ordering::Relaxed);
     let was_working = working(false);
     let waiting = std::time::Instant::now();
@@ -5615,6 +5626,7 @@ impl Host {
                 crate::land::spent(crate::land::stat::DONE, finishing);
                 COPY_BACK[0].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
                 RELAY_STATS[0].fetch_add(1, Ordering::Relaxed);
+                SETTLED_SO_FAR[1].fetch_add(1, Ordering::Relaxed);
                 RELAY_STATS[1].fetch_add(flights.len() as u64, Ordering::Relaxed);
             }
         }
@@ -6044,6 +6056,7 @@ impl Host {
             if !counted {
                 counted = true;
                 LATE_STATS[1].fetch_add(1, Ordering::Relaxed);
+                SETTLED_SO_FAR[0].fetch_add(1, Ordering::Relaxed);
                 LATE_STATS[why].fetch_add(1, Ordering::Relaxed);
             }
             LATE_STATS[11].fetch_add(flights as u64, Ordering::Relaxed);
@@ -7833,8 +7846,10 @@ impl HostList {
                 let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
                 MESH_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
                 MESH_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
+                crate::framewatch::add(crate::framewatch::Count::MeshGroups, u64::from(all));
                 let (refused, biggest) = (words.add(3).read_volatile(), words.add(4).read_volatile());
                 BUDGET_NOTES[0].fetch_add(u64::from(refused), Ordering::Relaxed);
+                crate::framewatch::add(crate::framewatch::Count::Refused, u64::from(refused));
                 BUDGET_NOTES[1].fetch_max(u64::from(biggest), Ordering::Relaxed);
                 for k in 0..5 {
                     words.add(k).write_volatile(0);
@@ -10418,8 +10433,6 @@ impl Host {
                 crate::popwatch::take(&self.device, list, texture)
             };
             p.panel.draw(self, copy, &back, (width, height), format);
-            #[cfg(not(feature = "diagnostics"))]
-            let _ = frame;
             if composed {
                 list.ResourceBarrier(&[transition(
                     &back,
@@ -10450,6 +10463,7 @@ impl Host {
                     0
                 }
             };
+            crate::framewatch::presented(frame);
             #[cfg(feature = "diagnostics")]
             if let Some(taken) = watched {
                 crate::popwatch::sent(taken, flown, frame);
