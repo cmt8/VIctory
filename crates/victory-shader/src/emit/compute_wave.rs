@@ -225,6 +225,12 @@ pub(super) fn declares_64() -> bool {
 /// `container`'s program where it is a compute program compiled for the
 /// console's waves of 64 (the program [`super::translate`] takes).
 fn console_wave64_compute(container: &[u8]) -> Option<crate::native::NativeProgram> {
+    console_compute(container).filter(|p| p.wave64)
+}
+
+/// `container`'s program where it is a compute program (the program
+/// [`super::translate`] takes).
+fn console_compute(container: &[u8]) -> Option<crate::native::NativeProgram> {
     use crate::native::HwStage;
     let c = crate::dxbc::Container::parse(container).ok()?;
     let part = c.part(crate::dxbc::FourCC::DXIL).or(c.part(crate::dxbc::FourCC::ACCC))?;
@@ -232,7 +238,7 @@ fn console_wave64_compute(container: &[u8]) -> Option<crate::native::NativeProgr
         .ok()?
         .into_iter()
         .find(|p| matches!(p.stage, HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms))
-        .filter(|p| p.stage == HwStage::Cs && p.wave64)
+        .filter(|p| p.stage == HwStage::Cs)
 }
 
 /// Whether some dword of `code` is a `ds_bpermute_b32` (the DS encoding,
@@ -270,6 +276,10 @@ const BPERMUTE_HALVES: &str = "VICTORY_BPERMUTE_HALVES: ds_bpermute within halve
 /// host waves of 32 has its barriers only where every thread of the group
 /// passes once ([`super::even_barriers`]).
 const EVEN_BARRIERS: &str = "VICTORY_WAVE_EVEN_BARRIERS: a form's barriers where every thread passes once";
+/// [`keyed_apart`]'s mark of a compute program with an `s_barrier` whose typed
+/// unordered buffer views that it only reads are shown to the host as written
+/// too ([`super::typed_rw`]).
+const TYPED_RW: &str = "VICTORY_TYPED_RW: typed unordered buffer views read behind a barrier are not read-only";
 
 /// What of the translation of `container` whoever caches translations keys
 /// apart, beside what it keys every program by: a mark for each change of
@@ -284,6 +294,9 @@ const EVEN_BARRIERS: &str = "VICTORY_WAVE_EVEN_BARRIERS: a form's barriers where
 ///   [`super::bpermute_halves`] holds: the permute used to read within the
 ///   whole wave (as it does with `VICTORY_BPERMUTE_HALVES=0`, whose
 ///   translations so keep the key they had).
+/// * A compute program with an `s_barrier` where [`super::typed_rw`] holds
+///   (`VICTORY_TYPED_RW=1`): its typed unordered buffer views used to be
+///   read-only to the host where it only read through them.
 /// * A console wave64 compute program with an `s_barrier` in a group over
 ///   64 threads, where such programs take the forms for host waves of 32
 ///   (`VICTORY_COMPUTE_WAVE=32` or `=forms`) and [`super::even_barriers`]
@@ -295,6 +308,11 @@ pub fn keyed_apart(container: &[u8], kept: bool) -> Vec<&'static str> {
     let halves = super::bpermute_halves();
     let even = !kept && super::even_barriers() && wave64_in_forms();
     let mut marks = Vec::new();
+    // (Every compute program with a barrier, of either console wave: more than the ones
+    // with a typed read the switch reaches, all the code tells without lowering it.)
+    if super::typed_rw() && console_compute(container).is_some_and(|p| has_barrier(&p.code)) {
+        marks.push(TYPED_RW);
+    }
     if !console && !halves && !even {
         return marks;
     }
@@ -330,6 +348,9 @@ pub fn keyed_apart_any() -> Vec<&'static str> {
     }
     if super::even_barriers() && wave64_in_forms() {
         marks.push(EVEN_BARRIERS);
+    }
+    if super::typed_rw() {
+        marks.push(TYPED_RW);
     }
     marks
 }
@@ -413,6 +434,28 @@ mod tests {
         assert_eq!(parse(Some("0")), Asked::Off);
         assert_eq!(parse(Some("host")), Asked::Off);
         assert_eq!(parse(Some("64")), Asked::Off);
+    }
+
+    /// `VICTORY_TYPED_RW` is off unless it is `1`; on, it is one of the marks
+    /// some program is keyed apart by, and no mark of what is no compute
+    /// program with a barrier. Off, no key changes.
+    #[test]
+    fn typed_views_made_read_write_key_their_programs_apart_only_when_asked() {
+        assert!(!crate::emit::typed_rw_said(None), "off with the switch not set");
+        assert!(!crate::emit::typed_rw_said(Some("")));
+        assert!(!crate::emit::typed_rw_said(Some("0")));
+        assert!(crate::emit::typed_rw_said(Some("1")));
+        assert!(crate::emit::typed_rw_said(Some(" 1 ")));
+        let was = crate::emit::TYPED_RW_TEST.replace(Some(false));
+        let off = keyed_apart_any();
+        assert!(!off.contains(&TYPED_RW));
+        crate::emit::TYPED_RW_TEST.set(Some(true));
+        let on = keyed_apart_any();
+        let no_program = keyed_apart(&[], false);
+        crate::emit::TYPED_RW_TEST.set(was);
+        assert!(on.contains(&TYPED_RW));
+        assert_eq!(on.iter().filter(|m| **m != TYPED_RW).collect::<Vec<_>>(), off.iter().collect::<Vec<_>>());
+        assert!(!no_program.contains(&TYPED_RW));
     }
 
     #[test]

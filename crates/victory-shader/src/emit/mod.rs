@@ -255,17 +255,23 @@ thread_local! {
 /// fxceless/victory-fork #907). Without it the host tests after the shader,
 /// and such a program writes its unordered views for pixels the test then
 /// rejects: the glass prepass's depth and motion vectors, which the title's
-/// temporal upscaler reads. `VICTORY_EARLY_DEPTH=1`: on; off by default
-/// here until a played run has shown what it does to the far trees' and
-/// signs' flicker. Part of the translation: the shader cache keys on the
-/// switch.
+/// temporal upscaler reads. `VICTORY_EARLY_DEPTH`: on, as the console has it
+/// and as the tree played before this one had it (a played run of this tree
+/// with it on was clean); `=0`: no program declares it, as this tree
+/// translated while the switch was off unless set. Part of the translation:
+/// the shader cache keys on the switch, each setting with entries of its own.
 pub fn early_depth_on() -> bool {
     #[cfg(test)]
     if let Some(on) = EARLY_DEPTH_TEST.get() {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_EARLY_DEPTH").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| early_depth_said(std::env::var("VICTORY_EARLY_DEPTH").ok().as_deref()))
+}
+
+/// What `VICTORY_EARLY_DEPTH` says: on unless it is `0`.
+fn early_depth_said(value: Option<&str>) -> bool {
+    value.is_none_or(|v| v.trim() != "0")
 }
 
 #[cfg(test)]
@@ -320,6 +326,42 @@ pub fn even_barriers() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_EVEN_BARRIERS").is_none_or(|v| v != "0"))
+}
+
+/// Whether the typed unordered buffer views of a compute program that
+/// writes UAVs and has an `s_barrier` are shown to the host as read and
+/// written through every handle (`lower::read_and_written`: a load and a
+/// store back through each handle that never run). vkd3d-proton's dxil-spirv
+/// declares a variable per combination of read and written, restrict as
+/// Vulkan's are, and Mesa takes one the program does not store through as
+/// memory the program does not write: a load through it may be joined with
+/// an earlier one or moved ahead of the group barrier it stands behind. The
+/// face network's first stage (0aa7934094794dbf) writes its 16-bit registers
+/// through one view of a buffer and reads them through another after its
+/// barrier; on the RX 7900 XTX its output differed between runs from the
+/// same memory. Anzymanz/VIctory-ox (after FoggySky222's fork) reads such
+/// values through the slot's raw twin instead and reports natural mouths on
+/// RADV with it.
+/// `VICTORY_TYPED_RW`: off, `=1` on. Part of the translation: the shader
+/// cache keys the programs it can change apart ([`keyed_apart`]).
+pub fn typed_rw() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TYPED_RW_TEST.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| typed_rw_said(std::env::var("VICTORY_TYPED_RW").ok().as_deref()))
+}
+
+/// What `VICTORY_TYPED_RW` says: on only when it is `1`.
+fn typed_rw_said(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim() == "1")
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`typed_rw`] on its thread (`None`: the switch's).
+    pub(crate) static TYPED_RW_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// Whether `ds_bpermute_b32` in a console wave64 program reads within the
@@ -1825,7 +1867,13 @@ mod tests {
             let io = io::raise(&p, &native).unwrap();
             emit(&c, &native, &p, &st, &io, &res).unwrap().dxil
         };
-        // The switch on, on this thread alone (`VICTORY_EARLY_DEPTH=1`).
+        // What the switch says: on unless it is 0, so unset too.
+        assert!(super::early_depth_said(None), "on with the switch not set");
+        assert!(super::early_depth_said(Some("1")));
+        assert!(super::early_depth_said(Some("")));
+        assert!(!super::early_depth_said(Some("0")));
+        assert!(!super::early_depth_said(Some(" 0 ")));
+        // The switch on, on this thread alone (the default).
         let was = super::EARLY_DEPTH_TEST.replace(Some(true));
         let late = emitted(&color, el("SV_Target", 16, 4), 0x50);
         let early = emitted(&color, el("SV_Target", 16, 4), 0x1050);
@@ -1839,8 +1887,9 @@ mod tests {
         let late = emitted(&depth, el("SV_Depth", 17, 1), 0x51);
         let early = emitted(&depth, el("SV_Depth", 17, 1), 0x1051);
         assert_eq!(late, early, "early depth declared for a depth export");
-        // The switch off: the bit declares nothing, and the module is the
-        // one made before there was a switch (the cached translations hold).
+        // The switch off (`VICTORY_EARLY_DEPTH=0`): the bit declares nothing,
+        // and the module is the one made before there was a switch (the
+        // translations cached with it off hold for that setting).
         super::EARLY_DEPTH_TEST.set(Some(false));
         let off = emitted(&color, el("SV_Target", 16, 4), 0x1050);
         let plain = emitted(&color, el("SV_Target", 16, 4), 0x50);

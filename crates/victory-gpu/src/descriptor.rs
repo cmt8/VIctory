@@ -591,8 +591,9 @@ pub(crate) fn sync_heaps() {
                         // slot from this anyway, they wait for a draw
                         // or a pass: noted some frames on, unless a
                         // draw's table turns out to hold them.
-                        // (`VICTORY_HEAP_SYNC_GRACE=0`: no wait, mirrored
-                        // with the others below.)
+                        // (No wait unless `VICTORY_HEAP_SYNC_GRACE` gives
+                        // one, `host::copied_grace`: mirrored with the
+                        // others below.)
                         if matches!(word(2) >> KIND_SHIFT, CONSTANT | PLACED) && host.copied_waits() && grace > 0 {
                             out.wait.push(index);
                             continue;

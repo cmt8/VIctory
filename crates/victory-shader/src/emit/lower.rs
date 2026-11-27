@@ -338,6 +338,11 @@ struct Lower<'a> {
     tail: Vec<Option<usize>>,
     /// The program writes UAVs: barriers fence them too.
     writes_uavs: bool,
+    /// Typed unordered buffer views are read and written to the host
+    /// through every handle ([`super::typed_rw`], [`Self::read_and_written`]).
+    typed_rw: bool,
+    /// The handles that have their load and store that never run.
+    rw_handles: HashSet<V>,
     /// src0 of the current instruction as DPP fetched it.
     src0: Option<V>,
     /// Compute code that reads other lanes: thread ids follow the host
@@ -1942,6 +1947,12 @@ impl<'a> Lower<'a> {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
+        // (`VICTORY_TYPED_RW`: a compute program that writes UAVs and meets its group at a
+        // barrier; what its threads exchange through views is what a moved read loses.)
+        let typed_rw = super::typed_rw()
+            && x.native.stage == HwStage::Cs
+            && writes_uavs
+            && insts().any(|i| i.name() == "s_barrier");
         let mut console_lanes = false;
         // LDS accesses get a group barrier each (a console wave split in two host waves)
         let mut split_lds = false;
@@ -2294,6 +2305,8 @@ impl<'a> Lower<'a> {
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
             writes_uavs,
+            typed_rw,
+            rw_handles: HashSet::new(),
             src0: None,
             console_lanes,
             split_lds,
@@ -12972,6 +12985,9 @@ impl<'a> Lower<'a> {
             let void = self.s.t.void;
             self.s.op(self.cur, name, Attr::NoUnwind, void, op, &args);
             self.end_guarded(at, &[]);
+            if typed {
+                self.read_and_written(Some((args[0], args[1], halves)));
+            }
             return Ok(());
         }
         if let Some(f) = *format {
@@ -12991,6 +13007,8 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
+        // A typed load through an unordered view: (handle, element, of integers).
+        let mut read_through: Option<(V, V, bool)> = None;
         let r = if typed {
             if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
                 return Err("a typed buffer load at an offset");
@@ -13001,6 +13019,7 @@ impl<'a> Lower<'a> {
             let index = index.unwrap_or(self.s.m.i32(0));
             if halves {
                 let h = self.handle(site, src, false, (10 | u, 0x405))?;
+                read_through = uav.then_some((h, index, true));
                 let i32t = self.s.t.i32;
                 let ret = self.s.m.named_struct("dx.types.ResRet.i32", vec![i32t; 5]);
                 self.s.op(
@@ -13013,6 +13032,7 @@ impl<'a> Lower<'a> {
                 )
             } else {
                 let h = self.handle(site, src, false, (10 | u, 0x409))?;
+                read_through = uav.then_some((h, index, false));
                 self.s.op(
                     c,
                     "bufferLoad.f32",
@@ -13107,6 +13127,7 @@ impl<'a> Lower<'a> {
                 }
                 self.write(inst, Reg::V(reg + k as u8), x.expect("a channel"), guard);
             }
+            self.read_and_written(read_through);
             return Ok(());
         }
         for k in 0..count {
@@ -13115,7 +13136,72 @@ impl<'a> Lower<'a> {
             let x = if halves { x } else { self.as_int(x) };
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
+        self.read_and_written(read_through);
         Ok(())
+    }
+
+    /// With [`super::typed_rw`], after a typed load or store through the
+    /// unordered buffer view `through` names (handle, element, whether of
+    /// integers): a load and a store back through the same handle that never
+    /// run, once a handle (their guard is the element being 0xFFFF_FFFF,
+    /// which no view has: a load there reads zeros and a store there is
+    /// dropped, so they would change nothing if they ran). To the host every
+    /// such handle is then one that is read and written, and the handles of
+    /// one component type name one variable.
+    ///
+    /// Without it dxil-spirv keeps reads and writes per `annotateHandle` and
+    /// declares a heap variable for each combination (dxil_converter.cpp,
+    /// the bindless heap variable: `uav_read` and `uav_written` are part of
+    /// what tells one from another; a typed view only read through is
+    /// `NonWritable`, and only raw and structured buffers are excepted "in
+    /// case there is aliasing through different declarations"). Variables
+    /// are restrict there unless decorated otherwise ("The default in Vulkan
+    /// environment is Restrict"), so Mesa takes a variable the program does
+    /// not store through as memory the program does not write
+    /// (nir_opt_access: its loads are reorderable, which "may be arbitrarily
+    /// moved, combined, rematerialized"). RADV's dump of a program that
+    /// stores halves through one view and loads them through another view of
+    /// the same buffer after its `s_barrier` shows that load as
+    /// `readonly|reorderable|speculatable`: free to be joined with a load
+    /// before the barrier or moved ahead of it, where the group's other
+    /// waves have not stored yet. The face network's first stage (1,024
+    /// threads, a register file read and written through two views across
+    /// its barrier) is such a program. D3D12 lets two views name one buffer.
+    ///
+    /// The store alone, on the loads' handle, is not enough: the driver
+    /// drops a store that cannot run and then sees a variable nothing is
+    /// stored through. With the handles sharing one variable the program's
+    /// own stores are stores through it.
+    fn read_and_written(&mut self, through: Option<(V, V, bool)>) {
+        let Some((h, element, integers)) = through else {
+            return;
+        };
+        if !self.typed_rw || !self.rw_handles.insert(h) {
+            return;
+        }
+        self.s.flags |= flags::TYPED_UAV_LOADS;
+        // (Not the element differing from itself: the clean-up folds that
+        // and the load and the store go with it.)
+        let past = self.s.m.i32(u32::MAX);
+        let never = self.s.m.cmp(self.cur, pred::EQ, element, past);
+        let at = self.begin_guarded(Some(never));
+        let iu = self.s.m.undef(self.s.t.i32);
+        let (load, store, ret) = if integers {
+            let i32t = self.s.t.i32;
+            let ret = self.s.m.named_struct("dx.types.ResRet.i32", vec![i32t; 5]);
+            ("bufferLoad.i32", "bufferStore.i32", ret)
+        } else {
+            ("bufferLoad.f32", "bufferStore.f32", self.s.t.res_ret)
+        };
+        let was = self.s.op(self.cur, load, Attr::ReadOnly, ret, 68, &[h, element, iu]);
+        let mut args = vec![h, element, iu];
+        for k in 0..4 {
+            args.push(self.s.m.extract(self.cur, was, k));
+        }
+        args.push(self.s.m.i8(0xF));
+        let void = self.s.t.void;
+        self.s.op(self.cur, store, Attr::NoUnwind, void, 69, &args);
+        self.end_guarded(at, &[]);
     }
 
     fn export(&mut self, b: usize, i: usize) -> Result<(), Why> {

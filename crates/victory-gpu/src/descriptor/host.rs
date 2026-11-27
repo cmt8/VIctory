@@ -1197,13 +1197,16 @@ const TABLED_GRACE: u64 = 8;
 const COPIED_FRAMES: u32 = 8;
 
 /// Frames a record copied into any other slot waits for one, before it is
-/// taken for one shaders pick by index ([`HostHeap::copied_wait`]).
-const COPIED_GRACE: u64 = 4;
+/// taken for one shaders pick by index ([`HostHeap::copied_wait`]), when
+/// `VICTORY_HEAP_SYNC_GRACE` does not say: none. The wait was 4 frames
+/// (`VICTORY_HEAP_SYNC_GRACE=4` gives it back); with it whole groups of
+/// trees went for those frames, and a played run with 0 kept them.
+const COPIED_GRACE: u64 = 0;
 
-/// [`COPIED_GRACE`], or the frames `VICTORY_HEAP_SYNC_GRACE` gives; `0`: no
-/// wait, such a record is mirrored in the round that finds it, as every
-/// record was before the wait (and is with `VICTORY_HEAP_SYNC=all`, which
-/// mirrors the records of draws' tables too).
+/// [`COPIED_GRACE`] (no wait), or the frames `VICTORY_HEAP_SYNC_GRACE`
+/// gives; with no wait such a record is mirrored in the round that finds
+/// it, as every record was before the wait (and is with
+/// `VICTORY_HEAP_SYNC=all`, which mirrors the records of draws' tables too).
 ///
 /// While a record waits its host slot goes on showing the view it showed. A
 /// slot a draw reads through a table is made by that draw, so nothing is
@@ -1214,8 +1217,8 @@ const COPIED_GRACE: u64 = 4;
 /// something else by then, what is drawn from it is not the object any more:
 /// the suspect for the far trees that go for a few frames and come back,
 /// all at once (the tree this was taken from mirrors such a record at once
-/// and did not show it). Unset the wait stays as it was until a played run
-/// with `=0` has shown the trees stay.
+/// and did not show it). A played run with `=0` kept the trees, so unset
+/// there is no wait.
 pub(crate) fn copied_grace() -> u64 {
     #[cfg(test)]
     if let Some(frames) = COPIED_GRACE_TEST.get() {
@@ -6582,20 +6585,23 @@ mod tests {
     }
 
     /// A record copied into a slot no draw read through a table waits
-    /// [`COPIED_GRACE`] frames before it is taken for one shaders pick by
-    /// index, each slot once; with `VICTORY_HEAP_SYNC_GRACE` as many as that
-    /// says, and with 0 it is due in the frame it was found in.
+    /// the frames `VICTORY_HEAP_SYNC_GRACE` says before it is taken for one
+    /// shaders pick by index, each slot once (`=4`: the wait as it was);
+    /// with 0, as when unset ([`COPIED_GRACE`]), it is due in the frame it
+    /// was found in.
     #[test]
     fn a_copied_record_waits_the_frames_the_switch_says() {
+        /// The wait before it was none by default.
+        const WAS: u64 = 4;
         let Some(heap) = HostHeap::new(false, 8) else { return };
         if std::env::var_os("VICTORY_HEAP_SYNC_GRACE").is_none() {
-            assert_eq!(copied_grace(), COPIED_GRACE, "unset: the wait as it was");
+            assert_eq!(copied_grace(), 0, "unset: no wait");
         }
-        let was = COPIED_GRACE_TEST.replace(Some(COPIED_GRACE));
+        let was = COPIED_GRACE_TEST.replace(Some(WAS));
         heap.copied_wait(10, vec![3, 1]);
-        assert!(heap.copied_before(10 + COPIED_GRACE - 1).is_empty());
-        assert_eq!(heap.copied_before(10 + COPIED_GRACE), [1, 3]);
-        assert!(heap.copied_before(10 + COPIED_GRACE).is_empty(), "each once");
+        assert!(heap.copied_before(10 + WAS - 1).is_empty());
+        assert_eq!(heap.copied_before(10 + WAS), [1, 3]);
+        assert!(heap.copied_before(10 + WAS).is_empty(), "each once");
         COPIED_GRACE_TEST.set(Some(0));
         heap.copied_wait(20, vec![5]);
         assert_eq!(heap.copied_before(20), [5]);

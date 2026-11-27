@@ -1137,6 +1137,11 @@ pub enum View<'a> {
     /// The same buffer viewed as R16G16B16A16_UINT: what a translated
     /// program that moves halves is shown ([`super::HostShader::half_views`]).
     HalfUintUav(u32),
+    /// The buffer of the unordered view before this one, viewed once more
+    /// as R16G16B16A16_UINT over this many elements: a second descriptor of
+    /// one buffer, as a title makes that stores through one and loads
+    /// through another. No output of its own.
+    HalfUintUavAgain(u32),
     /// A constant buffer of these dwords.
     Cbv(&'a [u32]),
     /// A buffer SRV over these dwords.
@@ -1417,6 +1422,22 @@ impl Host {
                             D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
                         uavs.push((b, None, n, rb));
+                    }
+                    View::HalfUintUavAgain(elements) => {
+                        let Some((b, None, _, _)) = uavs.last() else {
+                            return Err("no buffer view before a second view of one".to_owned());
+                        };
+                        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                            Format: DXGI_FORMAT_R16G16B16A16_UINT,
+                            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                                Buffer: D3D12_BUFFER_UAV {
+                                    NumElements: elements,
+                                    ..Default::default()
+                                },
+                            },
+                        };
+                        dev.CreateUnorderedAccessView(b, None, Some(&desc), at);
                     }
                     View::TextureUav(w, h) => {
                         let t = make(
