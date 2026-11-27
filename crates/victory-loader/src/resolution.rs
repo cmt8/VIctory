@@ -16,7 +16,8 @@
 //!   size through the copy +0x5eb24f0 makes (+0x75e6fe0). The display mode
 //!   list it matches against is its own (+0x5a38910: 1280x720, 1664x936,
 //!   1920x1080, 2560x1440, 3840x2160 at 60 Hz, table +0x615c0c0), not the
-//!   DXGI output's, which is why `VICTORY_DISPLAY_MODE` changes nothing.
+//!   DXGI output's, which is why `VICTORY_DISPLAY_MODE` alone does not change
+//!   the output size (run 303).
 //!   Here that block becomes: write the size asked for into the settings
 //!   (+0x204/+0x208), then the title's own else-path (screen size set,
 //!   +0xd8c3a0 if the height changed). Everything that reads the settings
@@ -24,6 +25,15 @@
 //!   sees the same size. The back buffers' pool (64 MB on Series X) is
 //!   checked to be used up but for 2 MB (+0x247af25, an `int3`); for another
 //!   size that check is jumped over.
+//! - **Display mode.** With the output size patched, the display mode the
+//!   console reports (the DXGI output's one mode) is that size too
+//!   ([`display_mode_to_report`]), as a Series X plugged into a television
+//!   of that size lists it; `VICTORY_DISPLAY_MODE` set by hand still wins.
+//!   Without it the title was told 3840x2160 at a 1920x1080 output, and its
+//!   interface came out twice too large (minimap, button prompts and
+//!   objective text cut off at the screen's edges; run auto-h1). That the
+//!   interface is sized from the display mode is inferred (the one size of
+//!   4K left that the runtime reports), not seen in the title's code.
 //! - **Render scale.** The upscaler the title picks (+0x7e93f0: 6, its own,
 //!   except on Series S with a flag, 7, AMD FidelityFX) gives the render
 //!   size from the output size (+0x7e92f0 → the upscaler's +0x50 method):
@@ -58,6 +68,16 @@ pub fn parse_output(spec: &str) -> Option<(u32, u32)> {
     let (w, h) = spec.trim().split_once(['x', 'X'])?;
     let size = (w.trim().parse().ok()?, h.trim().parse().ok()?);
     MODES.contains(&size).then_some(size)
+}
+
+/// The `VICTORY_DISPLAY_MODE` to set so the display mode the title is told
+/// is its output size: `patched` is the size [`OUTPUT`] was patched to
+/// (`None` when it was not asked for or not patched), `display_mode` the
+/// variable as the user set it. `None`: leave the variable as it is (unset,
+/// the runtime's 3840x2160, or the user's own value).
+pub fn display_mode_to_report(patched: Option<(u32, u32)>, display_mode: Option<&str>) -> Option<String> {
+    let (w, h) = patched?;
+    display_mode.is_none().then(|| format!("{w}x{h}"))
 }
 
 /// `VICTORY_RENDER_SCALE=<s>`, 0.5 to 1.0 (0.5: half the output's width and
@@ -290,15 +310,18 @@ pub unsafe fn write(base: usize, size: usize, site: &Site, code: &[u8]) -> Patch
 }
 
 /// Applies what the switches ask for; a line each in the log and on
-/// standard output.
+/// standard output. Returns the output size [`OUTPUT`] was patched to, if
+/// it was (for [`display_mode_to_report`]).
 ///
 /// # Safety
 /// The image of `size` bytes at `base` stays mapped and no thread runs its
 /// code yet.
 #[cfg(windows)]
-pub unsafe fn apply_asked(base: usize, size: usize) {
+pub unsafe fn apply_asked(base: usize, size: usize) -> Option<(u32, u32)> {
     let mut asked: Vec<(&Site, Vec<u8>, String)> = Vec::new();
-    if let Some((w, h)) = asked_output() {
+    let output = asked_output();
+    let mut patched = None;
+    if let Some((w, h)) = output {
         asked.push((&OUTPUT, output_code(w, h), format!("{w}x{h}")));
         if (w, h) != (3840, 2160) {
             asked.push((&POOL_CHECK, pool_check_code(), format!("{w}x{h}")));
@@ -316,6 +339,9 @@ pub unsafe fn apply_asked(base: usize, size: usize) {
     for (site, code, value) in asked {
         // SAFETY: the caller's promise.
         let done = unsafe { write(base, size, site, &code) };
+        if site.at == OUTPUT.at && done == Patched::Done {
+            patched = output;
+        }
         let offset = format!("{:#x}", site.at);
         match done {
             Patched::Done => tracing::info!(site = %offset, what = site.what, value, "resolution: patched"),
@@ -324,6 +350,7 @@ pub unsafe fn apply_asked(base: usize, size: usize) {
         }
         println!("resolution: {} ({value}) at title+{offset}: {done:?}", site.what);
     }
+    patched
 }
 
 #[cfg(test)]
@@ -341,6 +368,22 @@ mod tests {
         assert_eq!(parse_render_scale("1"), Some(1.0));
         assert_eq!(parse_render_scale("0.4"), None);
         assert_eq!(parse_render_scale("1.5"), None);
+    }
+
+    /// The display mode follows the output size only when the output was
+    /// patched and the user did not set the mode; without the switch it is
+    /// left alone (the runtime's 3840x2160).
+    #[test]
+    fn the_display_mode_follows_the_output_size() {
+        assert_eq!(display_mode_to_report(None, None), None);
+        assert_eq!(display_mode_to_report(None, Some("1920x1080")), None);
+        assert_eq!(display_mode_to_report(Some((1920, 1080)), None).as_deref(), Some("1920x1080"));
+        assert_eq!(display_mode_to_report(Some((2560, 1440)), None).as_deref(), Some("2560x1440"));
+        assert_eq!(display_mode_to_report(Some((1920, 1080)), Some("3840x2160")), None, "the user's own wins");
+        for (w, h) in MODES {
+            let mode = display_mode_to_report(Some((w, h)), None).unwrap();
+            assert_eq!(parse_output(&mode), Some((w, h)), "read back as the same size");
+        }
     }
 
     /// The calls and loads in the bytes compared are the ones the

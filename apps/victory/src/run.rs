@@ -244,7 +244,21 @@ pub fn run(
     if execute && fsr.is_none() {
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped and nothing of it has run yet.
-        unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
+        let patched = unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
+        // The display mode the console reports follows the output size (the
+        // title's interface came out sized for the 4K mode at a 1080p
+        // output), unless VICTORY_DISPLAY_MODE is set by hand.
+        let asked_mode = std::env::var("VICTORY_DISPLAY_MODE").ok();
+        if let Some(mode) =
+            victory_loader::resolution::display_mode_to_report(patched, asked_mode.as_deref())
+        {
+            println!(
+                "resolution: display mode reported to the title follows the output size ({mode})"
+            );
+            // SAFETY: Windows supports setting the environment across
+            // threads; no title code has run or queried DXGI yet.
+            unsafe { std::env::set_var("VICTORY_DISPLAY_MODE", &mode) };
+        }
     }
     if !execute {
         println!("not executing (pass --execute to start the title)");
