@@ -43,6 +43,18 @@
 //! forgotten; the view of ours stays (shortcut: it is never unmapped, a
 //! few hundred MB of address space at most).
 //!
+//! What is asked of the host first ([`shows`]): that its card reads and
+//! writes a section's pages where a view shows them. A host may open the heap
+//! and place the buffer without an error and still give the card memory of
+//! its own for it (measured on Linux, Proton with vkd3d-proton on an AMD card:
+//! the card reads other bytes than the view shows, and its write does not
+//! show there; memory that is no section's is taken in place on the same
+//! host). Every draw would then read constants and indirect arguments
+//! nobody wrote, and the title would never see what shaders write. So the
+//! first asking tries it on a section of our own, and where the card does
+//! not show it nothing is placed: the switch does nothing on such a host,
+//! and says so.
+//!
 //! What it assumes: the CPU steps of ours that read this memory at
 //! submission (fills of constant buffers, the title's buffer copies done on
 //! the CPU) read what the title's CPU wrote, not what a submission still in
@@ -144,6 +156,9 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
 /// len)`, opened if none does, and a buffer placed in it. `Err` with the
 /// statistic to count and why.
 pub(crate) fn place_in(device: &ID3D12Device, start: u64, len: u64) -> Result<Placed, (usize, String)> {
+    if !shows(device) {
+        return Err((5, "the card does not show a section's pages where a view has them (asked once)".to_owned()));
+    }
     let at = start & !(K64 - 1);
     let end = (start + len.max(1)).next_multiple_of(K64);
     let mut regions = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
@@ -222,6 +237,98 @@ fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usiz
             unmap();
             Err((5, format!("refused by the host: {e}")))
         }
+    }
+}
+
+/// Whether the card of `device` reads and writes a section's pages where a
+/// view shows them (see the file): asked once of each adapter, on a section
+/// of our own, before anything of the title's is placed. `false` too where
+/// it could not be asked.
+fn shows(device: &ID3D12Device) -> bool {
+    static KNOWN: Mutex<Vec<((u32, i32), bool)>> = Mutex::new(Vec::new());
+    // SAFETY: a plain query.
+    let luid = unsafe { device.GetAdapterLuid() };
+    let adapter = (luid.LowPart, luid.HighPart);
+    // (Held while it is asked: whoever comes meanwhile waits for the answer.)
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, shows)) = known.iter().find(|k| k.0 == adapter) {
+        return shows;
+    }
+    let shows = match asked(device) {
+        Ok((true, true)) => {
+            tracing::info!("renderer port 1: the card reads and writes a section's pages where a view shows them: title memory can be placed");
+            true
+        }
+        Ok((reads, writes)) => {
+            tracing::warn!(
+                reads,
+                writes,
+                "renderer port 1: a heap opened on a view of a section is not the section's pages to this host's card (it reads what the view                  shows: {reads}; what it writes shows in the view: {writes}): nothing is placed, VICTORY_PORT_CONSTANTS does nothing here"
+            );
+            false
+        }
+        Err(why) => {
+            tracing::warn!(why, "renderer port 1: whether the card shows a section's pages in place could not be asked: nothing is placed");
+            false
+        }
+    };
+    known.push((adapter, shows));
+    shows
+}
+
+/// [`shows`]'s question: a section made as `xmem` makes the title's pages,
+/// two views of all of it (the title's, and ours as [`open_region`] maps
+/// it), a heap opened on ours and a buffer placed in it. Whether the card
+/// reads what is written through the title's view (twice: the second time
+/// with no call between the write and the read but the copy), and whether
+/// what the card writes shows in the title's view. On a queue of its own.
+fn asked(device: &ID3D12Device) -> Result<(bool, bool), String> {
+    const BYTES: usize = 2 * K64 as usize;
+    const PART: usize = 4096;
+    let wine = crate::host::on_wine();
+    // SAFETY: the section and the views made here, `BYTES` each, and every
+    // address used inside them.
+    unsafe {
+        let kind = if wine { mem::SEC_COMMIT } else { mem::SEC_RESERVE };
+        let section = mem::CreateFileMappingW(
+            windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE,
+            std::ptr::null(),
+            mem::PAGE_READWRITE | kind,
+            0,
+            BYTES as u32,
+            std::ptr::null(),
+        );
+        if section.is_null() {
+            return Err(format!("no section: {}", std::io::Error::last_os_error()));
+        }
+        // shortcut: the section and its two views stay for good (128 KiB,
+        // once an adapter). The host may hold their pages for a heap it is
+        // still letting go of when this returns.
+        let view = || mem::MapViewOfFile(section, mem::FILE_MAP_WRITE, 0, 0, BYTES).Value.cast::<u8>();
+        let (title, ours) = (view(), view());
+        if title.is_null() || ours.is_null() {
+            return Err(format!("no view of the section: {}", std::io::Error::last_os_error()));
+        }
+        if !wine && mem::VirtualAlloc(title.cast(), BYTES, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null() {
+            return Err(format!("the section's pages not committed: {}", std::io::Error::last_os_error()));
+        }
+        let said = |what: &str, e: windows::core::Error| format!("{what}: {e}");
+        let heap = crate::inplace::open(device, crate::inplace::From::Part(ours as usize, BYTES)).map_err(|e| said("no heap on the view", e))?;
+        let buffer = crate::inplace::place(device, &heap, 0, BYTES as u64).map_err(|e| said("no buffer in the heap", e))?;
+        let mut rig = crate::inplace::Rig::new(device).map_err(|e| said("no queue of its own", e))?;
+        // In the second page, off its beginning.
+        let at = K64 as usize + 64;
+        let mut reads = true;
+        for seed in [1u8, 77] {
+            let wrote: Vec<u8> = (0..PART).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed)).collect();
+            std::ptr::copy_nonoverlapping(wrote.as_ptr(), title.add(at), PART);
+            reads &= rig.fetch(&buffer, at as u64, PART).map_err(|e| said("the card's read", e))? == wrote;
+        }
+        // In the first.
+        let put: Vec<u8> = (0..PART).map(|i| (i as u8) ^ 0x5a).collect();
+        rig.store(&buffer, 256, &put).map_err(|e| said("the card's write", e))?;
+        let writes = std::slice::from_raw_parts(title.add(256), PART) == put.as_slice();
+        Ok((reads, writes))
     }
 }
 
@@ -388,6 +495,113 @@ mod tests {
             assert_eq!(second.bias, 0);
             // The title's views may change under the heap.
             drop((placed, second));
+            forget(base as usize, 8 * K);
+            for view in views {
+                assert!(mem::UnmapViewOfFile2(process, view, mem::MEM_PRESERVE_PLACEHOLDER) != 0, "the title's own view can be unmapped");
+            }
+            crate::inplace::views_gone(base as usize, 8 * K);
+            mem::VirtualFree(hole.cast(), 0, mem::MEM_RELEASE);
+            mem::VirtualFree(hole.add(3 * K).cast(), 0, mem::MEM_RELEASE);
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        }
+    }
+
+    /// On the adapter the layer would take (under Wine the host's card,
+    /// through its D3D12): the same stretch, made as `xmem` makes it there.
+    /// Where the card was found to show a section's pages ([`shows`]) the
+    /// stretch is placed and the card does read and write the title's bytes;
+    /// where it was not, nothing is placed and no region opened, and the
+    /// heap the host would have given is indeed not the title's pages (it
+    /// opens and takes the buffer all the same, which is why it is asked).
+    #[test]
+    fn title_memory_is_placed_only_where_the_card_shows_a_sections_pages() {
+        let _turn = crate::indirect::tests::warp_turn();
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: plain device creation on the default adapter.
+        if unsafe { D3D12CreateDevice(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0, &mut device) }.is_err() {
+            return;
+        }
+        let Some(device) = device else { return };
+        if windows::core::Interface::cast::<ID3D12Device13>(&device).is_err() {
+            return;
+        }
+        const K: usize = 64 << 10;
+        let wine = crate::host::on_wine();
+        // SAFETY (the whole test): the section, placeholder and views made
+        // here.
+        unsafe {
+            let process = windows_sys::Win32::System::Threading::GetCurrentProcess();
+            let section = mem::CreateFileMappingW(
+                windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                mem::PAGE_READWRITE | if wine { mem::SEC_COMMIT } else { mem::SEC_RESERVE },
+                0,
+                8 * K as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let hole = mem::VirtualAlloc2(process, std::ptr::null(), 8 * K, mem::MEM_RESERVE | mem::MEM_RESERVE_PLACEHOLDER, mem::PAGE_NOACCESS, std::ptr::null_mut(), 0)
+                .cast::<u8>();
+            assert!(!hole.is_null());
+            mem::VirtualFree(hole.cast(), 3 * K, mem::MEM_RELEASE | mem::MEM_PRESERVE_PLACEHOLDER);
+            let mut views = Vec::new();
+            for (page, n) in [(0usize, 3usize), (3, 5)] {
+                let view = mem::MapViewOfFile3(section, process, hole.add(page * K).cast(), (page * K) as u64, n * K, mem::MEM_REPLACE_PLACEHOLDER, mem::PAGE_READWRITE, std::ptr::null_mut(), 0);
+                assert!(!view.Value.is_null(), "{}", std::io::Error::last_os_error());
+                if !wine {
+                    assert!(!mem::VirtualAlloc(view.Value, n * K, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null());
+                }
+                crate::inplace::title_memory_view(view.Value as usize, n * K, section as usize, (page * K) as u64);
+                views.push(view);
+            }
+            let base = hole as u64;
+            let (start, len) = (base + K as u64 + 0x40, 5 * K as u64);
+            let title = |at: u64, n: usize| std::slice::from_raw_parts(at as *const u8, n);
+            for (i, b) in std::slice::from_raw_parts_mut(start as *mut u8, len as usize).iter_mut().enumerate() {
+                *b = (i * 7 + 3) as u8;
+            }
+            let mut rig = crate::inplace::Rig::new(&device).unwrap();
+            // What the card makes of a buffer over the stretch: whether it
+            // reads the title's bytes, and whether its write shows in them.
+            let mut seen = |buffer: &ID3D12Resource, bias: u64| {
+                let reads = rig.fetch(buffer, bias, len as usize).unwrap() == title(start, len as usize);
+                rig.store(buffer, bias + 3 * K as u64, &[0x5a; 256]).unwrap();
+                (reads, title(start + 3 * K as u64, 256).iter().all(|&b| b == 0x5a))
+            };
+            let shows = shows(&device);
+            eprintln!("renderer port 1 on this adapter: the card shows a section's pages in place: {shows}");
+            assert_eq!(shows, super::shows(&device), "asked once, and the answer kept");
+            let regions = REGIONS.lock().unwrap().len();
+            match place_in(&device, start, len) {
+                Ok(placed) => {
+                    assert!(shows, "placed only where the card was found to show a section's pages");
+                    assert_eq!(placed.bias, 0x40);
+                    assert_eq!(seen(&placed.buffer, placed.bias), (true, true), "what is placed is the title's bytes to the card");
+                }
+                Err((what, why)) => {
+                    assert!(!shows, "refused where the card shows a section's pages: {why}");
+                    assert_eq!(what, 5, "counted as the host's refusal: {why}");
+                    assert_eq!(REGIONS.lock().unwrap().len(), regions, "no region is opened");
+                    // What would have been placed, opened as before: if the
+                    // host gives a heap at all, it is not the title's pages.
+                    let at = start & !(K as u64 - 1);
+                    let end = (start + len).next_multiple_of(K as u64);
+                    if let Ok(region) = open_region(&device, at, end)
+                        && let Ok(buffer) = crate::inplace::place(&device, &region.heap, at - region.start, end - at)
+                    {
+                        let found = seen(&buffer, start - at);
+                        eprintln!(
+                            "renderer port 1 on this adapter: a buffer placed over the stretch all the same: the card reads the title's bytes {}, its write shows in them {}",
+                            found.0, found.1
+                        );
+                        assert_ne!(found, (true, true), "the card was said not to show what it shows");
+                        // (The look itself is sound: the card reads back what
+                        // it wrote there. The buffer is memory of the host's.)
+                        let kept = rig.fetch(&buffer, start - at + 3 * K as u64, 256).unwrap();
+                        assert!(kept.iter().all(|&b| b == 0x5a), "the card reads what it wrote into the buffer");
+                    }
+                }
+            }
             forget(base as usize, 8 * K);
             for view in views {
                 assert!(mem::UnmapViewOfFile2(process, view, mem::MEM_PRESERVE_PLACEHOLDER) != 0, "the title's own view can be unmapped");

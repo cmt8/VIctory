@@ -579,6 +579,26 @@ pub(crate) fn lock_waits(frames: f64) -> String {
     format!("ranges held {}, journal read {}, journal noted in {}, guards {}", of(0), of(1), of(2), of(3))
 }
 
+/// Tests: a submission's one asking ([`ask_once`]) is one thread's at a
+/// time, as submissions are. A test that makes that asking holds this from
+/// before it until its end, and so does the test that calls the asking's
+/// second part alone ([`ask_rest`]).
+///
+/// That part takes the ranges that stand out of the journal while it asks,
+/// and puts them back with its own. Called alone beside another test's
+/// submission, it took that submission's ranges, the submission ended its
+/// asking and came to its next one (which waits for the part's hold), and
+/// the part then put the ended asking's ranges back as standing: the next
+/// asking found its ranges held, asked the kernel nothing, and its thread
+/// read the notes of the asking before. `port7_tests::no_write_is_lost_with_port_7`
+/// failed so in about one run in fifteen of the crate's tests together
+/// ("round 260, page 16: 135936 is not after 135938": the note of the
+/// asking before, and the number that asking stood under two later), and in
+/// none of 122 runs alone. In the runtime the second part is only ever
+/// called by the one asking itself, behind its first part and under its hold.
+#[cfg(test)]
+pub(crate) static ONE_SUBMISSION: Mutex<()> = Mutex::new(());
+
 /// The page ranges some thread is asking about: asking forgets what it
 /// answers, so until the answer is in the journal no other thread may ask
 /// about any of the same pages (it would be told they were not written).
@@ -4614,12 +4634,33 @@ mod tests {
     /// read-only, it ended the process, runs d1 and d3 of 2026-11-26.)
     #[test]
     fn memory_past_a_view_that_is_no_view_is_not_guarded() {
+        memory_past_a_view_is_left(false);
+    }
+
+    /// The same with renderer port #6 (`VICTORY_PORT_GUARD=1`): its asking
+    /// holds the guards' lock shared and goes by the blocks' claims
+    /// ([`guard_shared`], [`protect_claimed`]), and guards through the same
+    /// question to Windows. What it notes of the whole range as view memory
+    /// for itself ([`VIEWS`]: the kernel is not asked about it) makes nothing
+    /// read-only, and is forgotten with the rest.
+    #[test]
+    fn memory_past_a_view_that_is_no_view_is_not_guarded_with_port_6() {
+        memory_past_a_view_is_left(true);
+    }
+
+    fn memory_past_a_view_is_left(port: bool) {
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER, MapViewOfFile3, PAGE_READONLY,
             UnmapViewOfFile2,
         };
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        PORT_GUARD_IN_TEST.set(port);
+        assert!(!port || port_guard());
         let p = placeholder(4);
+        // Nothing is known of what was at the address before: another test's
+        // memory may have been here and gone with no word of it, as no
+        // memory of the title's does (told as the runtime tells it).
+        title_memory_unmapping(p, 4 * BLOCK);
         // SAFETY: a section's block in place of the first placeholder.
         let view = unsafe {
             let section =
@@ -4675,12 +4716,17 @@ mod tests {
             let g = guards();
             assert!(g.foreign.contains(block(1)) && g.foreign.contains(block(2)));
         }
+        if port_guard() {
+            assert!(VIEWS.all(block(0), block(4)), "noted for the kernel's askings only");
+        }
         title_memory_unmapping(p, 4 * BLOCK);
         {
             let g = guards();
             assert!(!g.foreign.contains(block(1)) && !g.foreign.contains(block(2)));
             assert!(!MAPPED.any(block(0), block(4)));
+            assert!(!VIEWS.any(block(0), block(4)));
         }
+        PORT_GUARD_IN_TEST.set(false);
         // SAFETY: our view and our allocations.
         unsafe {
             assert_ne!(UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER), 0);
@@ -4857,6 +4903,9 @@ mod tests {
     /// copied.
     #[test]
     fn the_rest_of_the_one_asking_has_a_number_of_its_own() {
+        // (The second part alone takes and puts back whatever asking stands:
+        // not beside another test's submission.)
+        let _one = ONE_SUBMISSION.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: a fresh write-watched allocation, freed at the end.
         let p = unsafe {
             VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
@@ -6489,6 +6538,10 @@ mod port7_tests {
                 let mut last = [0u64; HALF];
                 let mut seed = 99;
                 for round in 0..400 {
+                    // One submission at a time, as submissions are (other
+                    // tests make them too); the askers and writers of this
+                    // test go on beside it.
+                    let _one = ONE_SUBMISSION.lock().unwrap_or_else(|e| e.into_inner());
                     PORT_JOURNAL_IN_TEST.set(port == 1 || round % 2 == 0);
                     let before: Vec<usize> = (0..3).map(|_| rng(&mut seed, HALF)).collect();
                     for &p in &before {

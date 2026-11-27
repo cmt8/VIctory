@@ -156,11 +156,12 @@ fn build() -> [u8; 32] {
             bytes.extend_from_slice(b"VICTORY_PORT_CBV=1");
         }
         // Early depth-stencil tests for the pixel programs the console
-        // tests first (`VICTORY_EARLY_DEPTH=1`). Only when on, for the same
-        // reason.
-        if victory_shader::emit::early_depth_on() {
-            bytes.extend_from_slice(b"VICTORY_EARLY_DEPTH=1");
-        }
+        // tests first (`VICTORY_EARLY_DEPTH`, on unless `=0`). Its name is
+        // added when it is on and nothing when it is off, as while it was
+        // off unless set: the translations cached with it on and those
+        // cached with it off each keep their key, and each setting is
+        // served only its own.
+        bytes.extend_from_slice(early_depth_key(victory_shader::emit::early_depth_on()));
         bytes
     });
     let mut hash = blake3::Hasher::new();
@@ -175,6 +176,14 @@ fn build() -> [u8; 32] {
     hash.update(&victory_shader::emit::host_min_wave_set().to_le_bytes());
     hash.update(&[u8::from(victory_shader::emit::compute_wave_32())]);
     *hash.finalize().as_bytes()
+}
+
+/// What the early depth-stencil declaration adds to [`build`]'s bytes: its
+/// name when on, nothing when off. These are the bytes of the runs made
+/// while the switch was off unless set to 1, so the entries of both
+/// settings are still found, each by its own.
+fn early_depth_key(on: bool) -> &'static [u8] {
+    if on { b"VICTORY_EARLY_DEPTH=1" } else { b"" }
 }
 
 /// What tells one set of translations from another: [`build`], and what
@@ -588,6 +597,16 @@ mod tests {
             }],
             half_views: vec![(0, 8), (4, 0)],
         }
+    }
+
+    /// The early depth-stencil declaration is part of the key, and each
+    /// setting keeps the bytes it was cached under before the default
+    /// turned: on its name, off nothing.
+    #[test]
+    fn early_depth_keys_each_setting_as_it_was_cached() {
+        assert_eq!(early_depth_key(true), b"VICTORY_EARLY_DEPTH=1");
+        assert_eq!(early_depth_key(false), b"");
+        assert_ne!(early_depth_key(true), early_depth_key(false));
     }
 
     #[test]
