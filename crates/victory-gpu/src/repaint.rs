@@ -48,7 +48,28 @@
 //!   first and last frame of them, the uploads recorded and the last one's
 //!   frame, the frames behind and the longest such stretch, and what the
 //!   slot's view was of at the end.
+//!
+//! The audit (third form). Runs fr1 and fr2 showed the head textures
+//! uploaded again every frame or two while the fault was on screen, which
+//! the lines above cannot tell from "the host copy is wrong": they count
+//! uploads, not what was uploaded. And in fr2 another face was speckled in
+//! patches a minute after anything was followed. So every texture the pass
+//! over textures picked by index makes ready is audited: the digest of the
+//! bytes its staging buffer was last filled from (`Staging::detile`, the one
+//! place) is kept by address, and in turns ([`AUDIT_BYTES`] of title memory
+//! a frame) the texture's memory is read whole and compared with it. A
+//! texture found other than what was detiled is looked at again
+//! [`AUDIT_AGAIN`] frames later; if it is still other, and was not detiled in
+//! between, a line "host copy stale" says so, once, with what is known of
+//! it: whether draws read it through a table and how many frames ago a list
+//! last used it (one nobody draws is not refreshed, and that is no fault),
+//! whether shaders' writes landed in its memory since it was detiled, and
+//! whether all of it is mapped. "host copy right again" follows when a later
+//! look finds it equal. A line "audit" every [`AUDIT_LINE`] frames has the
+//! counts. A run in which a face is wrong and no texture of its sizes is
+//! stale has the fault in title memory, not in what is uploaded from it.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::{Mutex, OnceLock};
 
@@ -174,6 +195,7 @@ pub(crate) fn found(heap: &crate::descriptor::Heap, slot: u32, at: u64, len: u64
     if !on() || len == 0 {
         return;
     }
+    audited(heap, slot, at, len);
     if !changed && !SIZES.contains(&len) {
         return;
     }
@@ -232,6 +254,7 @@ pub(crate) fn frame(heap: &crate::descriptor::Heap, frame: u64) {
     if !on() {
         return;
     }
+    audit_frame(heap, frame);
     let mut w = WATCH.lock().unwrap_or_else(|e| e.into_inner());
     if w.frame == frame || w.now.is_empty() {
         return;
@@ -268,6 +291,7 @@ pub(crate) fn frame(heap: &crate::descriptor::Heap, frame: u64) {
                     blocks_all_zeros = zeros,
                     uploads = f.uploads,
                     last_upload = f.last_upload,
+                    shaders_writes_landed_there_in_two_frames = crate::watch::landed_lately(f.at as usize, f.len as usize, 2),
                     "repaint watch: title memory changed"
                 );
             }
@@ -334,5 +358,284 @@ pub(crate) fn frame(heap: &crate::descriptor::Heap, frame: u64) {
     });
     if w.now.is_empty() {
         ANY.store(false, Relaxed);
+    }
+}
+
+/// Title memory read for the audit in a frame; the frames after which a
+/// texture found other than what was detiled is looked at again; the frames
+/// between lines of counts; and the largest texture audited.
+const AUDIT_BYTES: u64 = 24 << 20;
+const AUDIT_AGAIN: u64 = 8;
+const AUDIT_LINE: u64 = 256;
+const AUDIT_LARGEST: u64 = 48 << 20;
+/// Lines "host copy stale" written at most.
+const AUDIT_TOLD: u32 = 400;
+
+/// What a staging buffer was last filled from: the bytes read, their
+/// digest, and the frame.
+struct Detiled {
+    bytes: u64,
+    digest: u128,
+    frame: u64,
+}
+
+/// By the address of the texture's memory.
+static DETILED: Mutex<Option<HashMap<u64, Detiled>>> = Mutex::new(None);
+
+/// A staging buffer is filled from `tiled`, the texture's memory at
+/// `memory` (`Staging::detile`).
+pub(crate) fn detiled(memory: usize, tiled: &[u8]) {
+    if !on() {
+        return;
+    }
+    let digest = crate::texture::digest(tiled).0;
+    let frame = crate::frame::current();
+    DETILED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(memory as u64, Detiled { bytes: tiled.len() as u64, digest, frame });
+}
+
+/// What a slot's view was of when it was taken into the audit: a placed
+/// texture (1) by its address, a texture object (2) by its resource.
+fn key(heap: &crate::descriptor::Heap, slot: u32) -> Option<(u8, u64)> {
+    match heap.handle(slot).and_then(crate::descriptor::view)? {
+        View::Placed(false, _, desc) => Some((1, u64::from(desc[10]) | u64::from(desc[11]) << 32)),
+        View::Shader(resource, _) => Some((2, resource as u64)),
+        _ => None,
+    }
+}
+
+struct Audited {
+    slot: u32,
+    at: u64,
+    /// 0: let go (the slot shows something else).
+    len: u64,
+    key: (u8, u64),
+    /// Found other than what was detiled in this frame (0: not), and the
+    /// frame of that detiling.
+    other_since: u64,
+    other_than: u64,
+    /// The line "host copy stale" is written.
+    told: bool,
+}
+
+#[derive(Default)]
+struct Audit {
+    slots: Vec<Audited>,
+    by_slot: HashMap<u32, usize>,
+    next: usize,
+    /// Slots to look at again, and from which frame on: found other, or
+    /// told stale.
+    again: Vec<(u32, u64)>,
+    frame: u64,
+    /// Since the last line of counts: textures and bytes read, found equal,
+    /// found other, never detiled (or at another size), written by a copy
+    /// on the card, let go.
+    counts: [u64; 7],
+    told: u32,
+    stale: u32,
+    rounds: u64,
+}
+
+static AUDIT: Mutex<Option<Audit>> = Mutex::new(None);
+
+/// The pass made the texture of title slot `slot` at `[at, at + len)`
+/// ready, or looked at it: audited from now on.
+pub(crate) fn audited(heap: &crate::descriptor::Heap, slot: u32, at: u64, len: u64) {
+    if !on() || len == 0 || len > AUDIT_LARGEST {
+        return;
+    }
+    let Some(key) = key(heap, slot) else {
+        return;
+    };
+    let mut a = AUDIT.lock().unwrap_or_else(|e| e.into_inner());
+    let a = a.get_or_insert_with(Audit::default);
+    let new = Audited { slot, at, len, key, other_since: 0, other_than: 0, told: false };
+    match a.by_slot.get(&slot) {
+        Some(&i) => {
+            let old = &a.slots[i];
+            if old.at != at || old.len != len || old.key != key {
+                if old.told {
+                    a.stale = a.stale.saturating_sub(1);
+                }
+                a.slots[i] = new;
+            }
+        }
+        None => {
+            a.by_slot.insert(slot, a.slots.len());
+            a.slots.push(new);
+        }
+    }
+}
+
+/// The digest of title memory `[at, at + len)` read whole through the
+/// kernel (pages not there count as zeros).
+fn whole(at: u64, len: u64) -> u128 {
+    thread_local! {
+        static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    READ.with(|read| {
+        let mut read = read.borrow_mut();
+        read.clear();
+        read.resize(len as usize, 0);
+        crate::host::copy_mapped(read.as_mut_ptr(), at as usize as *const u8, len as usize, false);
+        crate::texture::digest(&read).0
+    })
+}
+
+/// One audited texture is looked at. Returns the bytes read.
+fn audit_one(heap: &crate::descriptor::Heap, a: &mut Audit, i: usize, frame: u64) -> u64 {
+    let Audit { slots, counts, stale, told, again, .. } = a;
+    let s = &mut slots[i];
+    let (slot, at, len, was) = (s.slot, s.at, s.len, s.key);
+    if key(heap, slot) != Some(was) {
+        // The slot shows something else now: no longer this texture's.
+        counts[6] += 1;
+        if s.told {
+            *stale = stale.saturating_sub(1);
+        }
+        s.len = 0;
+        s.told = false;
+        s.other_since = 0;
+        return 0;
+    }
+    let (view_of, texture, tabled, card_copied) = shown(heap, slot);
+    if card_copied {
+        counts[5] += 1;
+        return 0;
+    }
+    let held = {
+        let map = DETILED.lock().unwrap_or_else(|e| e.into_inner());
+        map.as_ref().and_then(|map| map.get(&at)).filter(|d| d.bytes == len).map(|d| (d.digest, d.frame))
+    };
+    let Some((digest, detiled_at)) = held else {
+        counts[4] += 1;
+        return 0;
+    };
+    let now = whole(at, len);
+    counts[0] += 1;
+    counts[1] += len;
+    if now == digest {
+        counts[2] += 1;
+        if s.told {
+            *stale = stale.saturating_sub(1);
+            tracing::info!(
+                slot,
+                address = format_args!("{at:#x}"),
+                bytes = len,
+                frame,
+                detiled_in_frame = detiled_at,
+                found_other_in_frame = s.other_since,
+                "repaint watch: host copy right again"
+            );
+        }
+        s.told = false;
+        s.other_since = 0;
+        return len;
+    }
+    counts[3] += 1;
+    if s.other_since == 0 || s.other_than != detiled_at {
+        // Other for the first time, or detiled meanwhile and other again
+        // (a texture the title goes on writing): looked at again soon.
+        if s.told {
+            *stale = stale.saturating_sub(1);
+            s.told = false;
+        }
+        s.other_since = frame;
+        s.other_than = detiled_at;
+        again.push((slot, frame + AUDIT_AGAIN));
+        return len;
+    }
+    if !s.told && frame >= s.other_since + AUDIT_AGAIN {
+        s.told = true;
+        *stale += 1;
+        *told += 1;
+        if *told <= AUDIT_TOLD {
+            let elsewhere = crate::inplace::shown_elsewhere(at as usize & !(BLOCK - 1), (at + len) as usize);
+            let used = texture.and_then(crate::texture::staged_used);
+            tracing::info!(
+                slot,
+                address = format_args!("{at:#x}"),
+                bytes = len,
+                frame,
+                detiled_in_frame = detiled_at,
+                found_other_in_frame = s.other_since,
+                view_of,
+                tabled,
+                a_list_used_it_frames_ago = used.map_or(-1, |at| frame.saturating_sub(at) as i64),
+                blocks_shown_elsewhere = elsewhere.len(),
+                shaders_writes_landed_there_since =
+                    crate::watch::landed_lately(at as usize, len as usize, frame.saturating_sub(detiled_at)),
+                all_mapped = crate::texture::committed(at as usize as *const u8, len as usize),
+                stale_now = *stale,
+                "repaint watch: host copy stale"
+            );
+        }
+    }
+    // Looked at again: soon until the line is written, from time to time
+    // after (for "right again").
+    let wait = if s.told { 8 * AUDIT_AGAIN } else { AUDIT_AGAIN };
+    again.push((slot, frame + wait));
+    len
+}
+
+/// Once a frame: the textures due again, then the others in turn, until
+/// [`AUDIT_BYTES`] are read.
+fn audit_frame(heap: &crate::descriptor::Heap, frame: u64) {
+    let mut a = AUDIT.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(a) = a.as_mut() else {
+        return;
+    };
+    if a.frame == frame || a.slots.is_empty() {
+        return;
+    }
+    a.frame = frame;
+    let mut read = 0;
+    let again = std::mem::take(&mut a.again);
+    for (slot, due) in again {
+        if due > frame {
+            a.again.push((slot, due));
+            continue;
+        }
+        if let Some(&i) = a.by_slot.get(&slot)
+            && a.slots[i].len != 0
+            && a.slots[i].other_since != 0
+        {
+            read += audit_one(heap, a, i, frame);
+        }
+    }
+    let mut looked = 0;
+    while read < AUDIT_BYTES && looked < a.slots.len() {
+        let i = a.next % a.slots.len();
+        a.next = i + 1;
+        if a.next >= a.slots.len() {
+            a.next = 0;
+            a.rounds += 1;
+        }
+        looked += 1;
+        // (Those found other have their own turns.)
+        if a.slots[i].len != 0 && a.slots[i].other_since == 0 {
+            read += audit_one(heap, a, i, frame);
+        }
+    }
+    if frame.is_multiple_of(AUDIT_LINE) {
+        let c = std::mem::take(&mut a.counts);
+        tracing::info!(
+            frame,
+            slots = a.slots.len(),
+            rounds = a.rounds,
+            looked_at = c[0],
+            megabytes = c[1] >> 20,
+            equal = c[2],
+            other = c[3],
+            never_detiled_at_that_size = c[4],
+            written_by_a_copy_on_the_card = c[5],
+            let_go = c[6],
+            stale_now = a.stale,
+            stale_told = a.told,
+            "repaint watch: audit"
+        );
     }
 }

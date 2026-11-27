@@ -2916,6 +2916,10 @@ impl State {
                 // next draw that reads the texture through a table stage,
                 // detile and upload all of it once more.
                 HEAP_TEXTURES_TABLED.fetch_add(1, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                if let Some((at, len)) = crate::texture::staged_memory(resource) {
+                    crate::repaint::audited(heap, index, at, len);
+                }
                 host.texture_slot_done(index, write, again);
                 continue;
             }

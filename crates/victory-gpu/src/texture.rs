@@ -1499,6 +1499,10 @@ impl Staging {
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
         self.dirty.store(true, std::sync::atomic::Ordering::Release);
+        // (`VICTORY_REPAINT_WATCH=1`: what the host copy is made from, for
+        // the audit.)
+        #[cfg(feature = "diagnostics")]
+        crate::repaint::detiled(self.memory as usize, tiled);
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
         // that gives levels their memory goes by this answer.
@@ -1661,6 +1665,15 @@ pub(crate) fn title_span(resource: This, first: u32) -> Option<(u64, u64)> {
     let layout = crate::resource::texture_layout(&desc)?;
     let layout = &layout.planes[0].layout;
     Some((memory as u64, layout.bytes_from(crate::resource::read_from(layout, first))))
+}
+
+/// The frame in which a list last recorded a use of a staged title texture
+/// (`VICTORY_REPAINT_WATCH=1`).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn staged_used(resource: This) -> Option<u64> {
+    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let used = map.as_ref()?.get(&(resource as usize))?.used.load(std::sync::atomic::Ordering::Relaxed);
+    Some(used >> 32)
 }
 
 pub(crate) fn is_staged(resource: This) -> bool {
