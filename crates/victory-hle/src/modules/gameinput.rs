@@ -340,6 +340,118 @@ fn one_pad() -> bool {
     std::env::var_os("VICTORY_ONE_PAD").is_none_or(|v| v != "0")
 }
 
+/// How long a scripted button is down, and from one press to the next: the
+/// title acts on a button going down, so a window presses again and again.
+const PRESS_DOWN: Duration = Duration::from_millis(150);
+const PRESS_EVERY: Duration = Duration::from_millis(500);
+
+/// A window of a script: the button, its name as given, from when to when.
+type Press = (u32, String, Duration, Duration);
+
+/// Buttons pressed on the title's pad by script (`VICTORY_AUTO_PRESS`, off
+/// unless set): `<button>@<from>-<to>`, comma-separated, in seconds since
+/// the hub began to poll; e.g. `a@2-15`. In its window a button is pressed
+/// again and again ([`PRESS_DOWN`] of every [`PRESS_EVERY`], from the
+/// window's start). Buttons: `a b x y menu view up down left right lb rb ls
+/// rs`.
+///
+/// For runs nobody plays: the title asks for a button before it goes on
+/// (who plays), and such a run sat there. The presses are in what this
+/// module tells the title its pad reads, and nowhere else: nothing is sent
+/// to the host, to a window or to another process.
+#[derive(Debug, PartialEq)]
+struct AutoPress {
+    windows: Vec<Press>,
+}
+
+impl AutoPress {
+    /// The script `text` is, or why it is none. One bad entry and the whole
+    /// script is refused: half a script presses something else than was meant.
+    fn parse(text: &str) -> Result<AutoPress, String> {
+        let mut windows = Vec::new();
+        for entry in text.split(',').map(str::trim) {
+            let (name, window) =
+                entry.split_once('@').ok_or_else(|| format!("`{entry}` is not <button>@<from>-<to>"))?;
+            let name = name.trim().to_ascii_lowercase();
+            let button = match name.as_str() {
+                "a" => A,
+                "b" => B,
+                "x" => X,
+                "y" => Y,
+                "menu" => MENU,
+                "view" => VIEW,
+                "up" => UP,
+                "down" => DOWN,
+                "left" => LEFT,
+                "right" => RIGHT,
+                "lb" => LEFT_SHOULDER,
+                "rb" => RIGHT_SHOULDER,
+                "ls" => LEFT_STICK,
+                "rs" => RIGHT_STICK,
+                _ => return Err(format!("`{name}` is no button")),
+            };
+            let seconds = |t: &str| {
+                let s = t.trim().parse::<f64>().ok().filter(|s| s.is_finite() && (0.0..=86_400.0).contains(s));
+                s.map(Duration::from_secs_f64).ok_or_else(|| format!("`{t}` is no time in seconds"))
+            };
+            let (from, to) = window.split_once('-').ok_or_else(|| format!("`{window}` is not <from>-<to>"))?;
+            let (from, to) = (seconds(from)?, seconds(to)?);
+            if to <= from {
+                return Err(format!("the window `{window}` ends before it begins"));
+            }
+            windows.push((button, name, from, to));
+        }
+        if windows.len() > 32 {
+            return Err("more than 32 windows".to_owned());
+        }
+        Ok(AutoPress { windows })
+    }
+
+    /// The windows open at `at` (a bit each, in the script's order).
+    fn open(&self, at: Duration) -> u32 {
+        let open = |w: &Press| (w.2..w.3).contains(&at);
+        self.windows.iter().enumerate().filter(|(_, w)| open(w)).fold(0, |all, (i, _)| all | 1 << i)
+    }
+
+    /// The buttons down at `at`.
+    fn buttons(&self, at: Duration) -> u32 {
+        let down = |w: &Press| {
+            (w.2..w.3).contains(&at) && (at - w.2).as_micros() % PRESS_EVERY.as_micros() < PRESS_DOWN.as_micros()
+        };
+        self.windows.iter().filter(|w| down(w)).fold(0, |all, w| all | w.0)
+    }
+
+    /// What `VICTORY_AUTO_PRESS` asks for: nothing if unset, empty, or no
+    /// script (a warning then).
+    fn asked(text: Option<&str>) -> Option<AutoPress> {
+        let text = text.map(str::trim).filter(|t| !t.is_empty())?;
+        match AutoPress::parse(text) {
+            Ok(script) => {
+                let windows: Vec<String> = script
+                    .windows
+                    .iter()
+                    .map(|(_, name, from, to)| {
+                        format!("{name} from {:.1} to {:.1} s", from.as_secs_f64(), to.as_secs_f64())
+                    })
+                    .collect();
+                tracing::info!(
+                    "buttons are pressed on the title's pad by script (VICTORY_AUTO_PRESS), {} ms of every {} ms, counted from now: {}",
+                    PRESS_DOWN.as_millis(),
+                    PRESS_EVERY.as_millis(),
+                    windows.join("; ")
+                );
+                Some(script)
+            }
+            Err(why) => {
+                tracing::warn!(
+                    "VICTORY_AUTO_PRESS is no script and presses nothing: {why} (the form: a@2-15,b@20-21)"
+                );
+                None
+            }
+        }
+    }
+}
+
 #[repr(C)]
 struct Table<const N: usize>([*const (); N]);
 // SAFETY: function addresses only.
@@ -538,6 +650,11 @@ pub struct Hub {
     source: Mutex<Box<dyn Source>>,
     /// The title sees one pad ([`one_pad`]).
     one_pad: bool,
+    /// Buttons pressed by script ([`AutoPress`]), counted from `began`; its
+    /// windows open at the last poll (for the log).
+    auto: Option<AutoPress>,
+    began: Instant,
+    auto_open: AtomicU32,
     state: Mutex<State>,
     /// A device callback returned.
     returned: Condvar,
@@ -561,7 +678,13 @@ fn now() -> u64 {
 }
 
 impl Hub {
+    #[cfg(test)]
     fn new(source: Box<dyn Source>, one_pad: bool) -> &'static Hub {
+        Hub::scripted(source, one_pad, None)
+    }
+
+    /// [`Hub::new`], with buttons pressed by script.
+    fn scripted(source: Box<dyn Source>, one_pad: bool, auto: Option<AutoPress>) -> &'static Hub {
         let hub = Box::into_raw(Box::new(Hub {
             object: Object {
                 vtable: &INPUT,
@@ -570,6 +693,9 @@ impl Hub {
             devices: std::array::from_fn(Device::new),
             source: Mutex::new(source),
             one_pad,
+            auto,
+            began: Instant::now(),
+            auto_open: AtomicU32::new(0),
             state: Mutex::new(State {
                 slots: Default::default(),
                 callbacks: Vec::new(),
@@ -590,7 +716,8 @@ impl Hub {
 
     /// A hub over the host's input, polled from now on.
     fn start(source: Box<dyn Source>) -> &'static Hub {
-        let hub = Hub::new(source, one_pad());
+        let auto = AutoPress::asked(std::env::var("VICTORY_AUTO_PRESS").ok().as_deref());
+        let hub = Hub::scripted(source, one_pad(), auto);
         hub.poll();
         std::thread::spawn(move || {
             loop {
@@ -607,6 +734,33 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
+        self.poll_at(self.began.elapsed());
+    }
+
+    /// The buttons the script holds down `at` after the hub began; says in
+    /// the log when a window begins and ends.
+    fn scripted_at(&self, at: Duration) -> u32 {
+        let Some(auto) = &self.auto else { return 0 };
+        let open = auto.open(at);
+        let was = self.auto_open.swap(open, Ordering::Relaxed);
+        for (i, (_, name, from, to)) in auto.windows.iter().enumerate() {
+            if (open ^ was) >> i & 1 != 0 {
+                let (from, to) = (from.as_secs_f64(), to.as_secs_f64());
+                if open >> i & 1 != 0 {
+                    tracing::info!(
+                        "the script begins to press {name} on the title's pad (VICTORY_AUTO_PRESS, {from:.1} to {to:.1} s)"
+                    );
+                } else {
+                    tracing::info!("the script presses {name} no more (VICTORY_AUTO_PRESS, {from:.1} to {to:.1} s)");
+                }
+            }
+        }
+        auto.buttons(at)
+    }
+
+    /// [`Hub::poll`] at `at` after the hub began (the script's clock).
+    fn poll_at(&self, at: Duration) {
+        let scripted = self.scripted_at(at);
         let (pads, keys, mouse) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
@@ -617,7 +771,7 @@ impl Hub {
         };
         let events = self
             .state()
-            .poll(&self.devices, self.one_pad, pads, keys, mouse);
+            .poll(&self.devices, self.one_pad, pads, keys, mouse, scripted);
         self.deliver(events);
     }
 
@@ -664,21 +818,28 @@ impl State {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
         mouse: PadState,
+        scripted: u32,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
+        // The script's buttons ([`AutoPress`]) are held on the pad the title
+        // has: the one pad, the first host pad, or the stand-in while there
+        // is none.
+        let pressed = |pad: PadState| PadState { buttons: pad.buttons | scripted, ..pad };
         let stand_in = merged(fallback(&keys), mouse);
         if one_pad {
-            let pad = pads.into_iter().flatten().fold(stand_in, merged);
+            let pad = pressed(pads.into_iter().flatten().fold(stand_in, merged));
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
             self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
             return events;
         }
-        let any_pad = pads.iter().any(Option::is_some);
+        let first = pads.iter().position(Option::is_some);
+        let any_pad = first.is_some();
         for (slot, pad) in pads.into_iter().enumerate() {
+            let pad = if first == Some(slot) { pad.map(pressed) } else { pad };
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then_some(Value::Pad(stand_in));
+        let fallback = (!any_pad).then_some(Value::Pad(pressed(stand_in)));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -2241,5 +2402,133 @@ mod tests {
         host.lock().unwrap().pads[0] = None;
         hub.poll();
         assert_eq!(host.lock().unwrap().mouse_active_log.last(), Some(&true));
+    }
+
+    /// A hub whose pad is pressed by `script`.
+    fn scripted(one_pad: bool, script: &str) -> (&'static Hub, Arc<Mutex<FakeHost>>) {
+        let host = Arc::new(Mutex::new(FakeHost::default()));
+        let auto = AutoPress::asked(Some(script));
+        let hub = Hub::scripted(Box::new(Fake(Arc::clone(&host))), one_pad, auto);
+        hub.poll_at(Duration::ZERO);
+        (hub, host)
+    }
+
+    /// The buttons the title reads on `device` after a poll at `ms`.
+    fn buttons_at(hub: &Hub, device: usize, ms: u64) -> u32 {
+        hub.poll_at(Duration::from_millis(ms));
+        let r = current(hub, GAMEPAD_KIND, device).unwrap();
+        let buttons = pad(r).buttons;
+        release(r);
+        buttons
+    }
+
+    /// `VICTORY_AUTO_PRESS`: in its window the button is on the title's pad
+    /// again and again, each press a new reading the title finds the one
+    /// before of (its edge check); outside the window, and with no script,
+    /// nothing is pressed.
+    #[test]
+    fn a_script_presses_a_button_in_its_window_and_not_after() {
+        for one_pad in [true, false] {
+            let (hub, _host) = scripted(one_pad, "a@2-4");
+            // Before the window.
+            assert_eq!(buttons_at(hub, FALLBACK, 0), 0);
+            assert_eq!(buttons_at(hub, FALLBACK, 1_990), 0);
+            // Down for 150 ms of every 500 ms from the window's start.
+            assert_eq!(buttons_at(hub, FALLBACK, 2_000), A);
+            let down = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+            assert_eq!(buttons_at(hub, FALLBACK, 2_140), A);
+            assert_eq!(buttons_at(hub, FALLBACK, 2_160), 0);
+            let up = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+            // A press is a reading of its own, and the release the next one.
+            assert_eq!(walk(hub, 0x30, up), Ok(down));
+            let (_, s1) = stamp(down);
+            let (_, s2) = stamp(up);
+            assert_eq!(s2, s1 + 1);
+            for r in [down, down, up] {
+                release(r);
+            }
+            assert_eq!(buttons_at(hub, FALLBACK, 2_490), 0);
+            assert_eq!(buttons_at(hub, FALLBACK, 2_500), A);
+            assert_eq!(buttons_at(hub, FALLBACK, 2_700), 0);
+            assert_eq!(buttons_at(hub, FALLBACK, 3_510), A);
+            // The window is over: a press under way ends with it.
+            assert_eq!(buttons_at(hub, FALLBACK, 4_000), 0);
+            assert_eq!(buttons_at(hub, FALLBACK, 4_010), 0);
+            assert_eq!(buttons_at(hub, FALLBACK, 60_000), 0);
+            // The pad was there all along.
+            assert!(hub.state().slots[FALLBACK].connected);
+        }
+    }
+
+    /// The script's buttons are pressed beside what the player holds: on the
+    /// one pad, on the first host pad where each is a device of its own, and
+    /// the keyboard's reading has none of them.
+    #[test]
+    fn a_script_presses_on_the_pad_the_title_has() {
+        let held = PadState { buttons: B, left_x: 0.5, ..Default::default() };
+        let (hub, host) = scripted(true, "a@1-2,X@1-2");
+        host.lock().unwrap().pads[2] = Some(held);
+        assert_eq!(buttons_at(hub, FALLBACK, 1_000), A | B | X);
+        assert_eq!(buttons_at(hub, FALLBACK, 1_200), B);
+
+        let (hub, host) = scripted(false, "a@1-2");
+        host.lock().unwrap().pads[1] = Some(held);
+        host.lock().unwrap().pads[3] = Some(held);
+        assert_eq!(buttons_at(hub, 1, 1_000), A | B);
+        assert_eq!(buttons_at(hub, 3, 1_000), B);
+        assert_eq!(buttons_at(hub, 1, 1_200), B);
+        let r = current(hub, GAMEPAD_KIND, 1).unwrap();
+        assert_eq!(pad(r).left_x, 0.5);
+        release(r);
+        // Nothing of it is a key.
+        hub.poll_at(Duration::from_millis(1_000));
+        let r = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
+        let count = slot::<extern "system" fn(*const Reading) -> u32, _>(r, 0x70);
+        assert_eq!(count(r), 0);
+        release(r);
+    }
+
+    /// With no script nothing changes: the same readings as before, at any
+    /// time.
+    #[test]
+    fn without_a_script_nothing_is_pressed() {
+        assert_eq!(AutoPress::asked(None), None);
+        assert_eq!(AutoPress::asked(Some("  ")), None);
+        for one_pad in [true, false] {
+            let (hub, host) = fake_with(one_pad);
+            let rest = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+            for ms in [0, 2_000, 2_100, 2_500, 9_000] {
+                hub.poll_at(Duration::from_millis(ms));
+                let now = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+                assert_eq!(now, rest);
+                assert_eq!(pad(now), PadState::default());
+                release(now);
+            }
+            release(rest);
+            host.lock().unwrap().keys = vec![key(0x0D)];
+            assert_eq!(buttons_at(hub, FALLBACK, 9_100), A);
+        }
+    }
+
+    /// A script is read as written, and one with anything wrong in it is
+    /// refused whole and presses nothing.
+    #[test]
+    fn a_bad_script_is_refused_and_presses_nothing() {
+        let s = Duration::from_secs_f64;
+        assert_eq!(
+            AutoPress::parse(" A@2-15 , menu@20.5-21"),
+            Ok(AutoPress { windows: vec![(A, "a".to_owned(), s(2.0), s(15.0)), (MENU, "menu".to_owned(), s(20.5), s(21.0))] })
+        );
+        for bad in ["a", "a@", "a@5", "a@5-", "a@5-2", "a@2-2", "q@1-2", "a@-1-2", "a@1-x", "a@1-2,", "a@1-2;b@3-4", "a@1-inf", "a@nan-2"] {
+            assert!(AutoPress::parse(bad).is_err(), "{bad}");
+            assert_eq!(AutoPress::asked(Some(bad)), None, "{bad}");
+            let (hub, _host) = scripted(true, bad);
+            for ms in [0, 1_000, 1_500, 2_000, 5_000] {
+                assert_eq!(buttons_at(hub, FALLBACK, ms), 0, "{bad}");
+            }
+        }
+        let many = vec!["a@1-2"; 33].join(",");
+        assert!(AutoPress::parse(&many).is_err());
+        assert!(AutoPress::parse(&many[..many.len() - 6]).is_ok());
     }
 }
