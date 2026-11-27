@@ -1214,6 +1214,7 @@ fn create() -> windows::core::Result<Host> {
                  and only a newer D3D12 runtime (the Agility SDK) takes them"
             );
         }
+        crate::upload::reserve_early();
         Ok(Host {
             device,
             queue,
