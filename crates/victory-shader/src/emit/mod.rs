@@ -249,6 +249,32 @@ thread_local! {
     pub(crate) static WAVE_PIN_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// Whether a pixel program the console tests depth and stencil for before
+/// it runs (`lower::early_depth`: `DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER`)
+/// declares the host's early depth-stencil test (SpaghettiMaster545's fix,
+/// fxceless/victory-fork #907). Without it the host tests after the shader,
+/// and such a program writes its unordered views for pixels the test then
+/// rejects: the glass prepass's depth and motion vectors, which the title's
+/// temporal upscaler reads. `VICTORY_EARLY_DEPTH=1`: on; off by default
+/// here until a played run has shown what it does to the far trees' and
+/// signs' flicker. Part of the translation: the shader cache keys on the
+/// switch.
+pub fn early_depth_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = EARLY_DEPTH_TEST.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_EARLY_DEPTH").is_ok_and(|v| v.trim() == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`early_depth_on`] on its thread (`None`: the
+    /// switch's).
+    pub(crate) static EARLY_DEPTH_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// Whether 16-bit typed buffer accesses through a table's views move their
 /// bits as unsigned integers (`HostShader::half_views`; tippythetaidum's
 /// fix for the faces' network). `VICTORY_HALF_BITS`: on, `=0` moves them
@@ -1747,6 +1773,88 @@ mod tests {
             let mut v = super::validator::Validator::load(Some(&path)).unwrap();
             v.validate(&mut out.dxil.clone()).unwrap();
         }
+    }
+
+    /// A pixel program the console tests depth for before it runs
+    /// (`DB_SHADER_CONTROL` 0x1050: DEPTH_BEFORE_SHADER, early Z, kill, as
+    /// the title's glass prepass has it) declares ForceEarlyDepthStencil:
+    /// the module differs from the same program without the bit only by that
+    /// flag, and the validator, where there is one, accepts it. With a depth
+    /// output the bit is not declared (the host cannot test before a shader
+    /// that writes the depth).
+    #[test]
+    fn a_pixel_program_tested_before_it_runs_declares_early_depth() {
+        // v_mov_b32 v0, 1.0; exp mrt0 v0, v0, v0, v0 done vm; s_endpgm
+        let color = [0x7E00_02F2u32, 0xF800_180F, 0x0000_0000, 0xBF81_0000];
+        // v_mov_b32 v0, 1.0; exp mrtz v0, off, off, off done vm; s_endpgm
+        let depth = [0x7E00_02F2u32, 0xF800_1881, 0x0000_0000, 0xBF81_0000];
+        let el = |name: &str, kind, cols| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 0,
+            // A render target has a register; depth and stencil do not.
+            row: (kind == 16).then_some(0),
+            col: 0,
+            cols,
+            usage: (1 << cols) - 1,
+            half: false,
+        };
+        let emitted = |words: &[u32], out: SigElement, db: u32| {
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: false,
+                vgprs: 1,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Ps {
+                    inputs: vec![],
+                    input_addr: 0,
+                    db_shader_control: db,
+                    patches: vec![],
+                },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let osg1 = container::signature(&[out], false);
+            let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+            let c = Container::parse(&bytes).unwrap();
+            let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            emit(&c, &native, &p, &st, &io, &res).unwrap().dxil
+        };
+        // The switch on, on this thread alone (`VICTORY_EARLY_DEPTH=1`).
+        let was = super::EARLY_DEPTH_TEST.replace(Some(true));
+        let late = emitted(&color, el("SV_Target", 16, 4), 0x50);
+        let early = emitted(&color, el("SV_Target", 16, 4), 0x1050);
+        assert_ne!(late, early, "the early-depth flag changed nothing");
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut early.clone()).unwrap();
+        }
+        let late = emitted(&depth, el("SV_Depth", 17, 1), 0x51);
+        let early = emitted(&depth, el("SV_Depth", 17, 1), 0x1051);
+        assert_eq!(late, early, "early depth declared for a depth export");
+        // The switch off: the bit declares nothing, and the module is the
+        // one made before there was a switch (the cached translations hold).
+        super::EARLY_DEPTH_TEST.set(Some(false));
+        let off = emitted(&color, el("SV_Target", 16, 4), 0x1050);
+        let plain = emitted(&color, el("SV_Target", 16, 4), 0x50);
+        assert_eq!(off, plain, "early depth declared with the switch off");
+        super::EARLY_DEPTH_TEST.set(was);
+        // The rule alone: the bit, and no export of depth, stencil or coverage.
+        let ps = |db| StageIo::Ps { inputs: vec![], input_addr: 0, db_shader_control: db, patches: vec![] };
+        assert!(lower::early_depth(&ps(0x1450), &[]));
+        assert!(lower::early_depth(&ps(0x1010), &[]));
+        assert!(!lower::early_depth(&ps(0x0450), &[]));
+        assert!(!lower::early_depth(&ps(0x1012), &[]));
+        assert!(!lower::early_depth(&ps(0x1150), &[]));
+        assert!(!lower::early_depth(&ps(0x1050), &[el("SV_StencilRef", 20, 1)]));
+        assert!(!lower::early_depth(&StageIo::None, &[]));
     }
 
     /// A wave64 compute program that writes only EXEC's high dword
