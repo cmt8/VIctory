@@ -4349,15 +4349,7 @@ fn late_line(frames: f64) {
                 t[3] / 1000.0,
             );
         }
-        let t: Vec<f64> = torn::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
-        if t[0] > 0.0 {
-            tracing::info!(
-                "fetched pieces checked per frame (VICTORY_FETCH_CHECK): {:.1}, of which {:.2} were not what their flight ended                  with (caught while a later flight was at them, or title bytes went up meanwhile); {:.2} were found whole when                  fetched again",
-                t[0],
-                t[1],
-                t[2],
-            );
-        }
+        torn::line(frames);
     }
     crate::land::log(frames);
     if place::on() {
@@ -5477,8 +5469,12 @@ impl Host {
         }
         // On the copy queue a later flight may be at a piece while it is
         // fetched: the pieces come down whole, to be hashed.
-        let check = (torn::on() && fetch.as_ref().is_some_and(|f| f.queue.is_some()))
-            .then(|| torn::Check::new(plans.iter().map(|p| p.0), differs.unwrap_or_default(), &mut pieces));
+        let check = match fetch.as_mut() {
+            Some(f) if torn::on() && f.queue.is_some() => {
+                Some(torn::Check::new(plans.iter().map(|p| p.0), differs.unwrap_or_default(), &mut pieces, &mut f.suspects))
+            }
+            _ => None,
+        };
         if let Some(check) = &check {
             total = check.total;
         }
@@ -5632,7 +5628,7 @@ impl Host {
         COPY_BACK[1].fetch_add(written, Ordering::Relaxed);
         if let Some(f) = fetch.as_mut() {
             if let Some(check) = &check {
-                check.done(&mut f.suspects);
+                check.done(&mut f.suspects, after);
             }
             f.had.fetched(
                 ahead,

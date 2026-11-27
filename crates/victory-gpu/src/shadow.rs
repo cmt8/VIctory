@@ -4791,6 +4791,19 @@ impl Shadow {
 }
 
 impl Shadow {
+    /// Whether bytes of offsets `[from, to)` went up to the card with a send
+    /// after `number` (`crate::host::torn`: what a fetch beside the drawing
+    /// queue brings of them is then not what a flight ended with, and the
+    /// merge leaves them out).
+    pub(crate) fn card_sent_behind(&self, number: u64, from: usize, to: usize) -> bool {
+        let Some(card) = &self.card else {
+            return false;
+        };
+        let mut near = Vec::new();
+        card.sent.lock().unwrap_or_else(|e| e.into_inner()).near(number, from, to, &mut near);
+        !near.is_empty()
+    }
+
     /// [`Shadow::card_merge_relay`] of several pieces, each within one
     /// 64 KiB block of title memory: from and to (offsets in the copy), and
     /// where the fetched bytes are. On any thread: several may land pieces
