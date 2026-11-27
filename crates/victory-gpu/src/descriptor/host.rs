@@ -1200,6 +1200,40 @@ const COPIED_FRAMES: u32 = 8;
 /// taken for one shaders pick by index ([`HostHeap::copied_wait`]).
 const COPIED_GRACE: u64 = 4;
 
+/// [`COPIED_GRACE`], or the frames `VICTORY_HEAP_SYNC_GRACE` gives; `0`: no
+/// wait, such a record is mirrored in the round that finds it, as every
+/// record was before the wait (and is with `VICTORY_HEAP_SYNC=all`, which
+/// mirrors the records of draws' tables too).
+///
+/// While a record waits its host slot goes on showing the view it showed. A
+/// slot a draw reads through a table is made by that draw, so nothing is
+/// lost there; a slot shaders pick by index (the title's mesh shaders pick
+/// their buffers so) shows the old view for the wait, then nothing until the
+/// heap's pass has made the new one (`HostHeap::mirror`: a buffer view waits
+/// for a draw or a pass). If the title has given the old view's memory to
+/// something else by then, what is drawn from it is not the object any more:
+/// the suspect for the far trees that go for a few frames and come back,
+/// all at once (the tree this was taken from mirrors such a record at once
+/// and did not show it). Unset the wait stays as it was until a played run
+/// with `=0` has shown the trees stay.
+pub(crate) fn copied_grace() -> u64 {
+    #[cfg(test)]
+    if let Some(frames) = COPIED_GRACE_TEST.get() {
+        return frames;
+    }
+    static FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FRAMES.get_or_init(|| {
+        std::env::var("VICTORY_HEAP_SYNC_GRACE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(COPIED_GRACE)
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`copied_grace`] on its thread (`None`: the
+    /// switch's).
+    static COPIED_GRACE_TEST: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
 /// In [`HostHeap::tabled`]: a draw read the slot in that frame.
 const TABLED_READ: u32 = 1 << 31;
 
@@ -2308,6 +2342,7 @@ impl HostHeap {
             }
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
+            crate::framewatch::add(crate::framewatch::Count::TablesRefused, 1);
             #[cfg(feature = "diagnostics")]
             {
                 use crate::copystat::{C, add};
@@ -4030,7 +4065,8 @@ impl HostHeap {
     pub(crate) fn copied_before(&self, frame: u64) -> Vec<u32> {
         let mut waiting = self.waiting.lock().unwrap_or_else(|e| e.into_inner());
         let mut out = Vec::new();
-        while waiting.front().is_some_and(|(written, _)| written + COPIED_GRACE <= frame) {
+        let grace = copied_grace();
+        while waiting.front().is_some_and(|(written, _)| written + grace <= frame) {
             out.extend(waiting.pop_front().into_iter().flat_map(|(_, slots)| slots));
         }
         drop(waiting);
@@ -4222,6 +4258,9 @@ impl HostHeap {
             }
             self.quick_is(index, 0);
             if later {
+                if shown != 0 {
+                    crate::framewatch::add(crate::framewatch::Count::WaitNull, 1);
+                }
                 self.made.set(index, 0);
                 // Null of the view's kind: when nothing sent may still read
                 // what the slot shows ([`HostHeap::clear`]).
@@ -4316,6 +4355,17 @@ impl HostHeap {
     /// would find before it did nothing for one that holds no view.
     pub(crate) fn shows_none(&self, index: u32) -> bool {
         self.made.get(index).unwrap_or(0) == 0
+    }
+
+    /// Whether host slot `index` shows a view made from another record than
+    /// the view the title has at `handle` now (`crate::framewatch`: a look
+    /// without the slot's lock, for counting).
+    pub(crate) fn shows_another(&self, index: u32, handle: u64) -> bool {
+        // SAFETY: the handle is a descriptor slot in title memory.
+        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let key = u64::from(generation) << 32 | u64::from(i);
+        let shown = self.made.get(index).unwrap_or(0);
+        tag == VIEW_TAG && shown != 0 && shown != key
     }
 
     /// Slot `index` is made from record `key` and stays so (0: not). Under
@@ -5751,10 +5801,10 @@ fn same_bytes(old: u64, new: u64) {
     }
 }
 
-/// For `crate::popwatch`, since the start: slots made null as they were
-/// written with another texture, such that kept the old one, slots given the
-/// neutral texture, slots made null as their memory was another's.
-#[cfg(feature = "diagnostics")]
+/// For `crate::popwatch` and `crate::framewatch`, since the start: slots
+/// made null as they were written with another texture, such that kept the
+/// old one, slots given the neutral texture, slots made null as their
+/// memory was another's.
 pub(crate) fn pop_causes() -> [u64; 4] {
     use std::sync::atomic::Ordering::Relaxed;
     let all: u64 = REWRITTEN[..4].iter().map(|n| n.load(Relaxed)).sum();
@@ -6439,6 +6489,50 @@ mod tests {
             assert!(!heap.texture_slot_gone(4), "shown on for the wait");
             assert_eq!(heap.made.get(4), Some(key));
         }
+    }
+
+    /// A record copied into a slot no draw read through a table waits
+    /// [`COPIED_GRACE`] frames before it is taken for one shaders pick by
+    /// index, each slot once; with `VICTORY_HEAP_SYNC_GRACE` as many as that
+    /// says, and with 0 it is due in the frame it was found in.
+    #[test]
+    fn a_copied_record_waits_the_frames_the_switch_says() {
+        let Some(heap) = HostHeap::new(false, 8) else { return };
+        if std::env::var_os("VICTORY_HEAP_SYNC_GRACE").is_none() {
+            assert_eq!(copied_grace(), COPIED_GRACE, "unset: the wait as it was");
+        }
+        let was = COPIED_GRACE_TEST.replace(Some(COPIED_GRACE));
+        heap.copied_wait(10, vec![3, 1]);
+        assert!(heap.copied_before(10 + COPIED_GRACE - 1).is_empty());
+        assert_eq!(heap.copied_before(10 + COPIED_GRACE), [1, 3]);
+        assert!(heap.copied_before(10 + COPIED_GRACE).is_empty(), "each once");
+        COPIED_GRACE_TEST.set(Some(0));
+        heap.copied_wait(20, vec![5]);
+        assert_eq!(heap.copied_before(20), [5]);
+        COPIED_GRACE_TEST.set(Some(2));
+        heap.copied_wait(30, vec![6]);
+        assert!(heap.copied_before(31).is_empty());
+        assert_eq!(heap.copied_before(32), [6]);
+        COPIED_GRACE_TEST.set(was);
+    }
+
+    /// A slot shows another view than the title's record says when it was
+    /// made from another record, not when it shows nothing or that one
+    /// (`crate::framewatch` counts the records mirrored over another view).
+    #[test]
+    fn a_slot_made_from_another_record_shows_another() {
+        let Some(heap) = HostHeap::new(false, 8) else { return };
+        static BYTES: [u8; 65536] = [10; 65536];
+        static OTHER: [u8; 65536] = [20; 65536];
+        let (view, record) = placed_record(&BYTES);
+        let (_, other) = placed_record(&OTHER);
+        let (handle, other) = (descriptor(record), descriptor(other));
+        set_card(&heap, ON_CARD, ON_CARD, 1);
+        assert!(!heap.shows_another(2, handle), "shows nothing");
+        assert_eq!(heap.mirror(2, handle, true), Some(view));
+        assert!(heap.kept_in(2).is_some());
+        assert!(!heap.shows_another(2, handle), "shows that one");
+        assert!(heap.shows_another(2, other), "made from the first record");
     }
 
     /// A structured view of `bytes`, 16-byte elements (a buffer the title
