@@ -350,7 +350,8 @@ type Press = (u32, String, Duration, Duration);
 
 /// Buttons pressed on the title's pad by script (`VICTORY_AUTO_PRESS`, off
 /// unless set): `<button>@<from>-<to>`, comma-separated, in seconds since
-/// the hub began to poll; e.g. `a@2-15`. In its window a button is pressed
+/// the hub began to poll; e.g. `a@2-15` (`a:2-15` is the same, for where an
+/// `@` cannot be written). In its window a button is pressed
 /// again and again ([`PRESS_DOWN`] of every [`PRESS_EVERY`], from the
 /// window's start). Buttons: `a b x y menu view up down left right lb rb ls
 /// rs`.
@@ -371,7 +372,7 @@ impl AutoPress {
         let mut windows = Vec::new();
         for entry in text.split(',').map(str::trim) {
             let (name, window) =
-                entry.split_once('@').ok_or_else(|| format!("`{entry}` is not <button>@<from>-<to>"))?;
+                entry.split_once(['@', ':']).ok_or_else(|| format!("`{entry}` is not <button>@<from>-<to>"))?;
             let name = name.trim().to_ascii_lowercase();
             let button = match name.as_str() {
                 "a" => A,
@@ -2516,10 +2517,10 @@ mod tests {
     fn a_bad_script_is_refused_and_presses_nothing() {
         let s = Duration::from_secs_f64;
         assert_eq!(
-            AutoPress::parse(" A@2-15 , menu@20.5-21"),
+            AutoPress::parse(" A@2-15 , menu:20.5-21"),
             Ok(AutoPress { windows: vec![(A, "a".to_owned(), s(2.0), s(15.0)), (MENU, "menu".to_owned(), s(20.5), s(21.0))] })
         );
-        for bad in ["a", "a@", "a@5", "a@5-", "a@5-2", "a@2-2", "q@1-2", "a@-1-2", "a@1-x", "a@1-2,", "a@1-2;b@3-4", "a@1-inf", "a@nan-2"] {
+        for bad in ["a", "a@", "a@5", "a@5-", "a@5-2", "a@2-2", "q@1-2", "a@-1-2", "a@1-x", "a@1-2,", "a@1-2;b@3-4", "a@1-inf", "a@nan-2", "a:", "a:5-2", "q:1-2", "a 1-2"] {
             assert!(AutoPress::parse(bad).is_err(), "{bad}");
             assert_eq!(AutoPress::asked(Some(bad)), None, "{bad}");
             let (hub, _host) = scripted(true, bad);
