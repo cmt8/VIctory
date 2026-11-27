@@ -416,6 +416,7 @@ pub(crate) fn sync_heaps() {
     let mut short = 0u64;
     let mut wait: Vec<u32> = Vec::new();
     let frame = crate::frame::current();
+    let grace = host::copied_grace();
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for &(start, end, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
@@ -440,7 +441,12 @@ pub(crate) fn sync_heaps() {
                 if host.copied_tabled(index, frame) {
                     of_tables.fetch_add(1, Relaxed);
                 } else {
-                    host.mirror(index, start + u64::from(index) * step, false);
+                    let handle = start + u64::from(index) * step;
+                    crate::framewatch::add(crate::framewatch::Count::Waited, 1);
+                    if host.shows_another(index, handle) {
+                        crate::framewatch::add(crate::framewatch::Count::WaitedOver, 1);
+                    }
+                    host.mirror(index, handle, false);
                 }
             }
         });
@@ -585,7 +591,9 @@ pub(crate) fn sync_heaps() {
                         // slot from this anyway, they wait for a draw
                         // or a pass: noted some frames on, unless a
                         // draw's table turns out to hold them.
-                        if matches!(word(2) >> KIND_SHIFT, CONSTANT | PLACED) && host.copied_waits() {
+                        // (`VICTORY_HEAP_SYNC_GRACE=0`: no wait, mirrored
+                        // with the others below.)
+                        if matches!(word(2) >> KIND_SHIFT, CONSTANT | PLACED) && host.copied_waits() && grace > 0 {
                             out.wait.push(index);
                             continue;
                         }
@@ -642,9 +650,15 @@ pub(crate) fn sync_heaps() {
         let phase = crate::timeline::span("the heaps' records: made");
         crate::land::each_view(true, make.len().div_ceil(records_a_job), &|n| {
             for &index in make.chunks(records_a_job).nth(n).unwrap_or_default() {
-                host.mirror(index, start + u64::from(index) * step, false);
+                let handle = start + u64::from(index) * step;
+                if !samplers && host.shows_another(index, handle) {
+                    crate::framewatch::add(crate::framewatch::Count::AtOnceOver, 1);
+                }
+                host.mirror(index, handle, false);
             }
         });
+        crate::framewatch::add(crate::framewatch::Count::AtOnce, make.len() as u64);
+        crate::framewatch::add(crate::framewatch::Count::Waits, wait.len() as u64);
         phase.end();
         spent[2] += since(began);
         if !wait.is_empty() {

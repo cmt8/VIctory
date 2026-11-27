@@ -2993,12 +2993,14 @@ impl State {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::framewatch::add(crate::framewatch::Count::DroppedOther, 1);
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::framewatch::add(crate::framewatch::Count::DroppedBuilder, 1);
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
@@ -3012,6 +3014,7 @@ impl State {
                 "a dispatch without a host pipeline dropped"
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::framewatch::add(crate::framewatch::Count::Dropped, 1);
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_drop(self.pipeline as This);
@@ -3025,6 +3028,7 @@ impl State {
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::framewatch::add(crate::framewatch::Count::DroppedOther, 1);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
             if crate::pipeline::is_builder(self.pipeline as This) {
@@ -3489,6 +3493,7 @@ impl State {
             };
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::framewatch::add(self.dropped_why(), 1);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -4075,6 +4080,7 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::framewatch::add(self.dropped_why(), 1);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -4180,6 +4186,7 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::framewatch::add(self.dropped_why(), 1);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -4187,6 +4194,16 @@ impl State {
 }
 
 impl State {
+    /// Why a draw or mesh dispatch that was not run was not, for
+    /// `crate::framewatch`: no host pipeline, or one that could not be bound.
+    fn dropped_why(&self) -> crate::framewatch::Count {
+        if crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
+            crate::framewatch::Count::Dropped
+        } else {
+            crate::framewatch::Count::DroppedOther
+        }
+    }
+
     /// Shaders that can write buffers were recorded: arguments may be others
     /// from here on.
     fn buffers_written(&mut self) {
