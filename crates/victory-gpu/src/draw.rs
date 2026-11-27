@@ -2637,7 +2637,7 @@ impl State {
                     again_in = 1;
                 }
                 #[cfg(feature = "diagnostics")]
-                crate::repaint::found(index, at, len, frame, true);
+                crate::repaint::found(heap, index, at, len, frame, true);
                 let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
                 if n < 200 || n.is_multiple_of(1000) {
                     // Whether its pages are the title's at other addresses
@@ -2811,7 +2811,7 @@ impl State {
                     Some((at, len)) => {
                         let print = crate::texture::fingerprint(at, len);
                         #[cfg(feature = "diagnostics")]
-                        crate::repaint::found(index, at, len, frame, false);
+                        crate::repaint::found(heap, index, at, len, frame, false);
                         host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
                     }
                     None => host.texture_slot_done(index, write, again),
@@ -2943,7 +2943,7 @@ impl State {
                 Some((at, len)) => {
                     let print = crate::texture::fingerprint(at, len);
                     #[cfg(feature = "diagnostics")]
-                    crate::repaint::found(index, at, len, frame, false);
+                    crate::repaint::found(heap, index, at, len, frame, false);
                     host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
                 }
                 None => host.texture_slot_done(index, write, again),

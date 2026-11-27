@@ -854,6 +854,12 @@ impl PreludeUpload {
         };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexUploads, 1);
+        // (`VICTORY_REPAINT_WATCH=1`: the uploads of the textures followed.)
+        #[cfg(feature = "diagnostics")]
+        {
+            let (memory, bytes) = self.staging.memory();
+            crate::repaint::uploaded(memory, bytes);
+        }
         // A host copy that took the place of one with fewer levels: the slots
         // that show that one are made again once this upload has run.
         if self.staging.first == self.staging.level0 && self.copy.grown.swap(false, Relaxed) {
