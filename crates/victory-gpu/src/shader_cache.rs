@@ -174,7 +174,8 @@ fn build() -> [u8; 32] {
 /// What tells one set of translations from another: [`build`], and what
 /// some programs are keyed apart by (`victory_shader::emit::keyed_apart_any`:
 /// console wave64 compute programs translated for host waves of 64 that
-/// they declare, their backward permutes within halves of 32 lanes). That
+/// they declare, their backward permutes within halves of 32 lanes, their
+/// forms' barriers where every thread of a group passes once). That
 /// is not in [`build`], which every other program's translation stays keyed
 /// by ([`named`]).
 pub(crate) fn translation() -> [u8; 32] {
@@ -221,8 +222,12 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
 /// (`victory_shader::emit::keyed_apart`): where it is translated for host
 /// waves of 64 that it declares (`VICTORY_COMPUTE_WAVE` unset on a host of
 /// waves of 32 and 64: the switch unset used to mean a form for host waves
-/// of 32 for it), and where its `ds_bpermute_b32` reads within halves of 32
-/// lanes (`VICTORY_BPERMUTE_HALVES`, on unless `=0`). The translations made
+/// of 32 for it), where its `ds_bpermute_b32` reads within halves of 32
+/// lanes (`VICTORY_BPERMUTE_HALVES`, on unless `=0`), and, with
+/// `VICTORY_COMPUTE_WAVE=32` or `=forms`, where it has a barrier in a group
+/// over 64 threads and so takes a form for host waves of 32 only with the
+/// form's barriers where every thread passes once
+/// (`VICTORY_WAVE_EVEN_BARRIERS`, on unless `=0`). The translations made
 /// before those changes sit in the cache under [`build`]; the other
 /// programs' are the same as then, and keep that key.
 fn named(container: &[u8]) -> (String, [u8; 32]) {

@@ -1131,3 +1131,130 @@ fn permutes_within_halves_on_the_card_and_within_the_whole_wave_with_the_switch_
     }
     eprintln!("{ran} dispatches on the hardware device");
 }
+
+/// A group of two console waves that share LDS across the program's own barrier, with LDS
+/// accesses that only one of the two console waves runs (a branch on a scalar the wave's
+/// first lane gives, which the waves of a group answer differently): every thread zeroes
+/// three dwords, the group meets, the console wave of thread 0 writes 0x77 to the three,
+/// the group meets again, and every thread reads the third: 0x77 on the console.
+const UNEVEN64: &[u32] = &[
+    0xBE85_0380, // s_mov_b32 s5, 0
+    0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+    0x3414_0084, // v_lshlrev_b32 v10, 4, v0
+    0x7E04_0280, // v_mov_b32 v2, 0
+    0x7E02_0280, // v_mov_b32 v1, 0
+    0xD834_0000, 0x0000_0102, // ds_write_b32 v2, v1
+    0xD834_0004, 0x0000_0102, // ds_write_b32 v2, v1 offset:4
+    0xD834_0008, 0x0000_0102, // ds_write_b32 v2, v1 offset:8
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xBF8A_0000, // s_barrier
+    0x7E1C_0500, // v_readfirstlane_b32 s14, v0
+    0xBF07_800E, // s_cmp_lg_u32 s14, 0
+    0xBF85_0009, // s_cbranch_scc1 skip
+    0x7E02_02FF, 0x0000_0077, // v_mov_b32 v1, 0x77
+    0xD834_0000, 0x0000_0102, // ds_write_b32 v2, v1
+    0xD834_0004, 0x0000_0102, // ds_write_b32 v2, v1 offset:4
+    0xD834_0008, 0x0000_0102, // ds_write_b32 v2, v1 offset:8
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xBF8A_0000, // skip: s_barrier
+    0xD8D8_0008, 0x0300_0002, // ds_read_b32 v3, v2 offset:8
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xE070_1000, 0x8002_030A, // buffer_store_dword v3, v10, s[8:11], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
+/// [`UNEVEN64`] without its branch (an `s_nop` in its place): every console wave writes, and
+/// every LDS access stands where each thread of the group passes once.
+fn even64() -> Vec<u32> {
+    UNEVEN64.iter().map(|&w| if w == 0xBF85_0009 { 0xBF80_0000 } else { w }).collect()
+}
+
+/// `words` (console wave64) translated in `form` with `VICTORY_WAVE_EVEN_BARRIERS` as `even`
+/// says.
+fn evenly(words: &[u32], threads: u32, form: Form, even: bool) -> Result<(HostShader, Option<u32>), ShaderError> {
+    let was = super::EVEN_BARRIERS_TEST.replace(Some(even));
+    let r = translated(words, true, threads, false, form);
+    super::EVEN_BARRIERS_TEST.set(was);
+    r
+}
+
+/// Where a form for host waves of 32 may put its group barriers (no device needed). The
+/// host's barrier lets the waves of a group go on once each waits at one, so in a group of
+/// several console waves with a barrier of the program's own, the form's barriers must be
+/// passed alike by all of them: [`UNEVEN64`]'s LDS writes stand behind a branch that one of
+/// two console waves takes, and the program keeps its waves of 64 (`=32` on a host that has
+/// them); with `VICTORY_WAVE_EVEN_BARRIERS=0` it takes the form as before. A group of one
+/// console wave (its two host waves take the branch alike, having exchanged what it tests)
+/// and a program whose accesses every thread passes once keep the form. The forms for a
+/// host of 64-lane waves, and NVIDIA's, are the same either way.
+#[test]
+fn a_forms_barriers_stand_where_every_thread_of_the_group_passes_once() {
+    let declared = |words: &[u32], threads: u32, even: bool| evenly(words, threads, Form::Waves32, even).map(|t| t.1);
+    assert_eq!(declared(UNEVEN64, 128, true), Ok(Some(64)));
+    assert_eq!(declared(UNEVEN64, 128, false), Ok(Some(32)));
+    for even in [true, false] {
+        assert_eq!(declared(UNEVEN64, 64, even), Ok(Some(32)), "{even}");
+        assert_eq!(declared(&even64(), 128, even), Ok(Some(32)), "{even}");
+        assert_eq!(declared(&even64(), 64, even), Ok(Some(32)), "{even}");
+    }
+    for form in [Form::Host64, Form::Console, Form::Host32] {
+        for threads in [64, 128] {
+            let code = |even: bool| {
+                evenly(UNEVEN64, threads, form, even).unwrap_or_else(|e| panic!("{form:?} {threads} {even}: {e}")).0.dxil
+            };
+            assert!(code(true) == code(false), "{form:?} {threads}");
+        }
+    }
+}
+
+/// [`UNEVEN64`] and [`even64`] on the card, in groups of one and of two console waves: every
+/// thread reads 0x77 after the program's second barrier, as on the console, in the forms for
+/// a host of 64-lane waves and with `VICTORY_COMPUTE_WAVE=32` and unset. (Before
+/// [`super::even_barriers`], `=32` gave 0 in threads 64..127 of the group of 128: the console
+/// wave that takes the branch around the writes passed three barriers fewer, went through
+/// the program's barrier while the other still waited before its second write, and read
+/// before the third. That is shown, not asserted, with `VICTORY_WAVE_EVEN_BARRIERS=0`.)
+#[test]
+fn a_group_of_two_console_waves_meets_at_its_own_barriers_on_the_card() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let wrong = |got: &[u32]| -> Vec<usize> { (0..got.len() / 4).filter(|&t| got[4 * t] != 0x77).collect() };
+    let mut ran = 0;
+    for (name, words) in [("uneven", UNEVEN64.to_vec()), ("even", even64())] {
+        for threads in [64u32, 128] {
+            for form in [Form::Host64, Form::Waves32, Form::Console] {
+                let (shader, declared) =
+                    evenly(&words, threads, form, true).unwrap_or_else(|e| panic!("{name} {threads} {form:?}: {e}"));
+                for round in 0..3 {
+                    let Some(got) = run(&host, &shader, 4 * threads) else {
+                        eprintln!("{name} {threads} {form:?}: declared {declared:?}: the device takes no such pipeline");
+                        break;
+                    };
+                    ran += 1;
+                    let wrong = wrong(&got);
+                    assert!(
+                        wrong.is_empty(),
+                        "{name} x{threads} {form:?} declared {declared:?} round {round}: {} threads read no 0x77, from thread {}",
+                        wrong.len(),
+                        wrong[0],
+                    );
+                }
+            }
+        }
+    }
+    // as before the switch (shown only: what a barrier out of step gives is the card's)
+    if let Ok((shader, declared)) = evenly(UNEVEN64, 128, Form::Waves32, false)
+        && let Some(got) = run(&host, &shader, 4 * 128)
+    {
+        let wrong = wrong(&got);
+        eprintln!(
+            "uneven x128 Waves32 with VICTORY_WAVE_EVEN_BARRIERS=0: declared {declared:?}: {} threads read no 0x77{}",
+            wrong.len(),
+            wrong.first().map(|t| format!(", from thread {t}")).unwrap_or_default(),
+        );
+    }
+    eprintln!("{ran} dispatches on the hardware device");
+}

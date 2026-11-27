@@ -270,6 +270,32 @@ pub fn missing_upper_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_MISSING_UPPER").is_none_or(|v| v != "0"))
 }
 
+/// Whether a form for host waves of 32 puts its group barriers only where
+/// every thread of the group passes exactly once, in a console wave64
+/// compute program whose group holds several console waves (over 64
+/// threads) and that has a barrier of its own, on a host that also runs
+/// waves of 64 ([`compute_wave_32`]). The host's barrier lets a group's
+/// waves go on once each waits at one, whichever: a barrier the form adds
+/// behind a branch that one console wave of the group takes and another
+/// does not (a branch on a scalar of the wave's own) sets them out of step,
+/// and the program's own barrier no longer holds one back until the other
+/// has written what it reads after it. On the RX 7900 XTX half of a group
+/// of 128 threads read LDS before the other half wrote it (the test
+/// `a_group_of_two_console_waves_meets_at_its_own_barriers_on_the_card`).
+/// A program whose LDS accesses or exchanges stand elsewhere takes no form
+/// for host waves of 32 and keeps its waves of 64.
+/// `VICTORY_WAVE_EVEN_BARRIERS`: on, `=0` places the barriers as before, for
+/// A/B runs. Part of the translation: the shader cache keys the programs it
+/// can change apart ([`keyed_apart`]).
+pub fn even_barriers() -> bool {
+    #[cfg(test)]
+    if let Some(on) = EVEN_BARRIERS_TEST.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_EVEN_BARRIERS").is_none_or(|v| v != "0"))
+}
+
 /// Whether `ds_bpermute_b32` in a console wave64 program reads within the
 /// lane's own half of 32 lanes: lane l takes the data of lane
 /// (l & 32) | ((address + offset) / 4 & 31). That is what the console's
@@ -298,6 +324,8 @@ pub fn bpermute_halves() -> bool {
 thread_local! {
     /// A test's choice for [`bpermute_halves`] on its thread (`None`: the switch's).
     pub(crate) static BPERMUTE_HALVES_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// A test's choice for [`even_barriers`] on its thread (`None`: the switch's).
+    pub(crate) static EVEN_BARRIERS_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// Whether a 16-bit result written by SDWA with `dst_unused` 1 (sext) into

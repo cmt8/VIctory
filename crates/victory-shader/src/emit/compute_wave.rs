@@ -44,7 +44,12 @@
 //!   32-lane forms would refuse or take only approximately (each half-wave on
 //!   its own) is translated as before instead ([`super::emit_sized`]), in
 //!   waves of 64 where it declares a size. What the switch did unset until
-//!   the forms' rectangles were seen.
+//!   the forms' rectangles were seen. In a group of several console waves
+//!   with a barrier of the program's own, a form's barriers stand only where
+//!   every thread of the group passes once ([`super::even_barriers`],
+//!   `VICTORY_WAVE_EVEN_BARRIERS`, `=0`: wherever every lane runs, as
+//!   before): elsewhere they set the group's console waves out of step at
+//!   the program's barriers, and such a program keeps its waves of 64.
 //! * `=pin`: console wave32 programs declare 32; console wave64 programs are
 //!   translated as before the switch (64 declared only by those that use the
 //!   host's wave operations, `VICTORY_WAVE_PIN`). `=forms`: console wave64
@@ -240,6 +245,20 @@ fn has_bpermute(code: &[u8]) -> bool {
     })
 }
 
+/// Whether some dword of `code` is an `s_barrier` if it is an instruction's
+/// first: every program with the instruction, and perhaps one whose literal
+/// looks like it.
+fn has_barrier(code: &[u8]) -> bool {
+    code.chunks_exact(4).any(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]) >> 16 == 0xBF8A)
+}
+
+/// Whether console wave64 compute programs take the forms for host waves of
+/// 32 where those are exact (`VICTORY_COMPUTE_WAVE=32` or `=forms` on a
+/// host of waves of 32 and 64).
+fn wave64_in_forms() -> bool {
+    compute_wave_32() && !wave64_as_console() && takes(true)
+}
+
 /// [`keyed_apart`]'s mark of a console wave64 compute program translated
 /// for host waves of 64 that it declares ([`wave64_as_console`]).
 const WAVE64_AS_CONSOLE: &str = "VICTORY_COMPUTE_WAVE=console: wave64 compute programs declare 64";
@@ -247,6 +266,10 @@ const WAVE64_AS_CONSOLE: &str = "VICTORY_COMPUTE_WAVE=console: wave64 compute pr
 /// backward permutes read within halves of 32 lanes
 /// ([`super::bpermute_halves`]).
 const BPERMUTE_HALVES: &str = "VICTORY_BPERMUTE_HALVES: ds_bpermute within halves of 32 lanes";
+/// [`keyed_apart`]'s mark of a console wave64 compute program whose form for
+/// host waves of 32 has its barriers only where every thread of the group
+/// passes once ([`super::even_barriers`]).
+const EVEN_BARRIERS: &str = "VICTORY_WAVE_EVEN_BARRIERS: a form's barriers where every thread passes once";
 
 /// What of the translation of `container` whoever caches translations keys
 /// apart, beside what it keys every program by: a mark for each change of
@@ -261,11 +284,18 @@ const BPERMUTE_HALVES: &str = "VICTORY_BPERMUTE_HALVES: ds_bpermute within halve
 ///   [`super::bpermute_halves`] holds: the permute used to read within the
 ///   whole wave (as it does with `VICTORY_BPERMUTE_HALVES=0`, whose
 ///   translations so keep the key they had).
+/// * A console wave64 compute program with an `s_barrier` in a group over
+///   64 threads, where such programs take the forms for host waves of 32
+///   (`VICTORY_COMPUTE_WAVE=32` or `=forms`) and [`super::even_barriers`]
+///   holds: the form's barriers used to stand wherever every lane runs (as
+///   they do with `VICTORY_WAVE_EVEN_BARRIERS=0`). Not one
+///   `VICTORY_WAVE_KEEP` lists.
 pub fn keyed_apart(container: &[u8], kept: bool) -> Vec<&'static str> {
     let console = !kept && wave64_as_console();
     let halves = super::bpermute_halves();
+    let even = !kept && super::even_barriers() && wave64_in_forms();
     let mut marks = Vec::new();
-    if !console && !halves {
+    if !console && !halves && !even {
         return marks;
     }
     let Some(p) = console_wave64_compute(container) else {
@@ -276,6 +306,13 @@ pub fn keyed_apart(container: &[u8], kept: bool) -> Vec<&'static str> {
     }
     if halves && has_bpermute(&p.code) {
         marks.push(BPERMUTE_HALVES);
+    }
+    let group = match &p.io {
+        crate::native::StageIo::Cs(cs) => cs.threads.iter().product::<u32>(),
+        _ => 0,
+    };
+    if even && group > 64 && has_barrier(&p.code) {
+        marks.push(EVEN_BARRIERS);
     }
     marks
 }
@@ -290,6 +327,9 @@ pub fn keyed_apart_any() -> Vec<&'static str> {
     }
     if super::bpermute_halves() {
         marks.push(BPERMUTE_HALVES);
+    }
+    if super::even_barriers() && wave64_in_forms() {
+        marks.push(EVEN_BARRIERS);
     }
     marks
 }
@@ -373,6 +413,16 @@ mod tests {
         assert_eq!(parse(Some("0")), Asked::Off);
         assert_eq!(parse(Some("host")), Asked::Off);
         assert_eq!(parse(Some("64")), Asked::Off);
+    }
+
+    #[test]
+    fn a_group_barrier_is_found_in_a_programs_code() {
+        let bytes = |words: &[u32]| words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
+        // s_waitcnt, s_barrier, s_endpgm
+        assert!(has_barrier(&bytes(&[0xBF8C_C07F, 0xBF8A_0000, 0xBF81_0000])));
+        // s_waitcnt, s_cbranch_execz, s_endpgm
+        assert!(!has_barrier(&bytes(&[0xBF8C_C07F, 0xBF88_0001, 0xBF81_0000])));
+        assert!(!has_barrier(&[]));
     }
 
     #[test]

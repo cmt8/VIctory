@@ -538,6 +538,64 @@ fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
     Some(regions)
 }
 
+/// Per IR block: every thread of the group runs it exactly once whatever the data – it is on
+/// every path from the entry to an end of the program, and on no cycle. Stricter than
+/// [`all_lane_blocks`], which also has the blocks behind a branch on a scalar and those of a
+/// loop the wave leaves together: one wave takes such a branch as one, but the waves of a
+/// group need not take it alike (the scalar may be a wave's own: its first lane's value, a
+/// count of its lanes). An indirect exit counts as an end (the callers have none).
+///
+/// What it is for: the host's group barrier lets the waves of a group go on once each of
+/// them waits at a barrier, whichever barrier that is. A barrier the translation adds where
+/// one console wave of a group passes and another does not (or passes more often) sets the
+/// two out of step: the second one's next barrier, the program's own, is then met by the
+/// first one's added barrier, and it reads LDS the first has not written yet
+/// ([`super::even_barriers`]).
+fn once_blocks(st: &Structured) -> Vec<bool> {
+    let n = st.exits.len();
+    let succ: Vec<Vec<usize>> = st
+        .exits
+        .iter()
+        .map(|e| match *e {
+            LaneExit::Jump(t) => vec![t],
+            LaneExit::Branch { taken, not_taken, .. } => vec![taken, not_taken],
+            LaneExit::End | LaneExit::Indirect => Vec::new(),
+        })
+        .collect();
+    // whether an end is reached from the entry without passing `skip`
+    let ends_without = |skip: usize| {
+        let mut seen = vec![false; n];
+        let mut stack = vec![0usize];
+        while let Some(b) = stack.pop() {
+            if b == skip || b >= n || seen[b] {
+                continue;
+            }
+            seen[b] = true;
+            if succ[b].is_empty() {
+                return true;
+            }
+            stack.extend(succ[b].iter().copied());
+        }
+        false
+    };
+    let on_cycle = |b: usize| {
+        let mut seen = vec![false; n];
+        let mut stack = succ[b].clone();
+        while let Some(t) = stack.pop() {
+            if t == b {
+                return true;
+            }
+            if t >= n || seen[t] {
+                continue;
+            }
+            seen[t] = true;
+            stack.extend(succ[t].iter().copied());
+        }
+        false
+    };
+    (0..n).map(|b| !ends_without(b) && !on_cycle(b)).collect()
+}
+
 /// The per-lane branches (by block) whose regions hold a block of `needs` (blocks where two
 /// host waves must meet, [`take_needs`]): the ones to take wave-wide
 /// ([`crate::structure::structure_wide`]) so that every lane runs those blocks. None if one
@@ -1868,6 +1926,8 @@ impl<'a> Lower<'a> {
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
+        // such a program kept from those waves by `once_blocks` alone (for `VICTORY_WAVE_WHY`)
+        let mut uneven = false;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -1925,15 +1985,50 @@ impl<'a> Lower<'a> {
                             && !(i.name().starts_with("ds_swizzle") || i.name().contains("permute"))
                     };
                     if let Some(all) = all_lane_blocks(x.st) {
-                        let ok = p.blocks.iter().enumerate().all(|(b, blk)| {
-                            blk.insts.iter().all(|inst| {
-                                !lds(inst) || all.get(b).copied().unwrap_or(false)
-                            })
-                        });
+                        // A group of several console waves that meets at the program's own
+                        // barriers: a barrier of the form (before an LDS access, where the host
+                        // waves meet around a lane branch, in an exchange) only where every
+                        // thread of the group passes exactly once (`once_blocks`), so that the
+                        // console waves stay in step up to each of the program's barriers. On a
+                        // host that runs waves of 64, where a program refused here keeps them.
+                        // (NVIDIA's forms are left as they were: there no form in waves of 64
+                        // is left to fall back on.)
+                        let once = (group > 64
+                            && super::even_barriers()
+                            && super::compute_wave_32()
+                            && insts().any(|i| i.name() == "s_barrier"))
+                        .then(|| once_blocks(x.st));
+                        let in_all = |b: usize| all.get(b).copied().unwrap_or(false);
+                        let met = |b: usize| {
+                            in_all(b) && once.as_ref().is_none_or(|o| o.get(b).copied().unwrap_or(false))
+                        };
+                        if once.is_some() && super::compute_wave::why() {
+                            let apart = (0..p.blocks.len()).filter(|&b| in_all(b) && !met(b)).count();
+                            eprintln!(
+                                "WAVE64-EVEN {} group={group}: no barrier of a form in {apart} of {} blocks every lane runs (not passed once by every thread)",
+                                super::compute_wave::name(),
+                                (0..p.blocks.len()).filter(|&b| in_all(b)).count(),
+                            );
+                        }
+                        // every block with an LDS access is one of `f`
+                        let accesses_in = |f: &dyn Fn(usize) -> bool| {
+                            p.blocks.iter().enumerate().all(|(b, blk)| !blk.insts.iter().any(lds) || f(b))
+                        };
+                        let ok = accesses_in(&met);
                         let mut lds_ok = !(s.lds_dwords > 0 && group > 32) || ok;
                         if !lds_ok && let Some(meet) = lds_meetings(p, x.st, &all) {
-                            lds_meet = Some((all.clone(), meet));
-                            lds_ok = true;
+                            // (the meetings, and the barriers of the accesses every lane runs)
+                            let alike = p.blocks.iter().enumerate().all(|(b, blk)| {
+                                let barrier = meet.get(b).is_some_and(|m| m.0 || m.1)
+                                    || in_all(b) && blk.insts.iter().any(lds);
+                                !barrier || met(b)
+                            });
+                            if alike {
+                                lds_meet = Some((all.clone(), meet));
+                                lds_ok = true;
+                            } else {
+                                uneven = true;
+                            }
                         }
                         if !lds_ok {
                             // (the blocks whose LDS accesses not every lane runs: with the
@@ -1950,7 +2045,9 @@ impl<'a> Lower<'a> {
                             if crosses {
                                 // lanes 32..63 are the other host wave: masks, lane reads and lane
                                 // numbers go through two exchange dwords past the program's LDS
-                                exchange = Some((s.lds_dwords, group <= 32, all));
+                                // (where the halves may exchange: at two barriers each time)
+                                let places: Vec<bool> = (0..all.len()).map(met).collect();
+                                exchange = Some((s.lds_dwords, group <= 32, places));
                                 s.lds_dwords += 2 * group.div_ceil(64);
                             }
                         }
@@ -1980,6 +2077,9 @@ impl<'a> Lower<'a> {
                     }
                     if lane_constant_masks(x.st) {
                         why.push("lane-constant mask");
+                    }
+                    if uneven {
+                        why.push("an LDS barrier the group's console waves would not pass alike");
                     }
                     if s.lds_dwords > 0 && group > 32 {
                         why.push("LDS in a group over 32");
