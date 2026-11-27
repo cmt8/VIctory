@@ -4482,6 +4482,15 @@ impl HostHeap {
         tag == VIEW_TAG && shown != 0 && shown != key
     }
 
+    /// Whether a new view of slot `index` waits to be shown: until the lists
+    /// sent before its texture was made have run ([`show_new_later`]), or
+    /// until its upload has ([`show_after`]). (`VICTORY_REPAINT_WATCH`.)
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn flip_waits(&self, index: u32) -> bool {
+        let heap = std::ptr::from_ref(self) as usize;
+        FLIPS.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|f| f.heap == heap && f.index == index)
+    }
+
     /// Slot `index` is made from record `key` and stays so (0: not). Under
     /// the lock of `made`.
     fn quick_is(&self, index: u32, key: u64) {

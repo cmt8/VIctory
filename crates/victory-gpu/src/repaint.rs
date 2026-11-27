@@ -98,7 +98,20 @@
 //!   title memory), and what the texture held before the first one (zeros,
 //!   the title's bytes). Two runs' lists of these can be laid side by side:
 //!   the scene is the same, the faulty character is not;
-//! - "a slot shows a texture copies on the card wrote": which slots.
+//! - "a slot shows a texture copies on the card wrote": which slots;
+//! - "the title's bytes are uploaded into a texture a copy on the card
+//!   wrote": at a list's submission, when its prelude is given such an
+//!   upload and another list recorded the copies (and whether that list was
+//!   submitted before: then the title's bytes land over the baked texels);
+//! - "bake sources": for every bake draw, what the slots it can pick from
+//!   show when it is recorded (which slots: from the draw's own constants
+//!   and decoration records, after readmet3xt-lab b3d49db): how many are
+//!   right, and how many are null or the neutral texture, a kept view of
+//!   another texture, without a host copy, or a host copy of other bytes
+//!   than title memory holds (read whole), and how many have a new view
+//!   waiting to be shown (`VICTORY_SHOW_NEW_LATER`, `VICTORY_SHOW_AFTER`).
+//!   The card reads the heap when the bake's list runs, not when it is
+//!   recorded: a slot counted here as waiting is at risk, no more.
 //!
 //! `VICTORY_REPAINT_WATCH=2` adds the exact form of the question, at the
 //! cost of a pause in every frame with a bake: before the frame's first
@@ -883,6 +896,97 @@ pub(crate) fn bake_pass(frame: u64, pass: u64, served: bool, uploaded: u64, byte
         oldest_due_waited_frames = queue[4],
         host_copies_stale_now = stale,
         "repaint watch: bake pass"
+    );
+}
+
+/// A draw of the title's bake is recorded, and `slots` are the title slots
+/// it can pick textures from (`State::watch_bake_sources`): a line of what
+/// they show at this moment, after the pass made for the draw. Each slot
+/// counts once, by the first of: its memory's first page is not mapped; the
+/// host slot is null or the neutral texture; it shows a view made from
+/// another record than the title's present one (a kept view); it is not
+/// made from the present record otherwise; its texture is one copies on the
+/// card wrote; its texture has no host copy; the host copy was not filled
+/// from the bytes title memory holds now (read whole); else it is right.
+/// Apart from that: how many have a new view waiting to be shown.
+pub(crate) fn bake_sources(
+    heap: &crate::descriptor::Heap,
+    host: &crate::descriptor::host::HostHeap,
+    frame: u64,
+    slots: &[u32],
+) {
+    if !on() {
+        return;
+    }
+    static LINES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let line = LINES.fetch_add(1, Relaxed) + 1;
+    let mut n = [0u64; 9];
+    let mut named = Vec::new();
+    for &slot in slots {
+        let Some(handle) = heap.handle(slot) else {
+            continue;
+        };
+        let view = crate::descriptor::view(handle);
+        let (address, first) = match &view {
+            Some(View::Placed(false, _, desc)) => {
+                (u64::from(desc[10]) | u64::from(desc[11]) << 32, crate::resource::first_mip(desc))
+            }
+            _ => (0, 0),
+        };
+        let (_, texture, _, card_copied) = shown(heap, slot);
+        if host.flip_waits(slot) {
+            n[8] += 1;
+        }
+        let why = if address != 0 && !crate::texture::committed(address as usize as *const u8, 1) {
+            0
+        } else if host.shows_none(slot) {
+            1
+        } else if host.shows_another(slot, handle) {
+            2
+        } else if !host.texture_slot_made_from(slot, handle) {
+            3
+        } else if card_copied {
+            4
+        } else {
+            match texture {
+                Some(texture) if crate::resource::made_copy(texture).is_none() => 5,
+                Some(texture) if !crate::texture::unchanged(texture, first) => 6,
+                Some(_) => 7,
+                None => 5,
+            }
+        };
+        n[why] += 1;
+        if !matches!(why, 0 | 4 | 7) && named.len() < 8 {
+            let words = [
+                "",
+                "null or neutral",
+                "a kept view",
+                "not made",
+                "",
+                "no host copy",
+                "host copy of other bytes",
+            ][why];
+            named.push(format!("slot {slot} at {address:#x}: {words}"));
+        }
+    }
+    if line > 600 {
+        return;
+    }
+    tracing::info!(
+        frame,
+        bake_draw = line,
+        sources = slots.len(),
+        right = n[7],
+        written_by_the_card = n[4],
+        not_mapped = n[0],
+        on_null_or_the_neutral_texture = n[1],
+        on_a_kept_view = n[2],
+        not_made_otherwise = n[3],
+        no_host_copy = n[5],
+        host_copy_of_other_bytes = n[6],
+        with_a_new_view_waiting = n[8],
+        the_first = ?named,
+        "repaint watch: bake sources"
     );
 }
 

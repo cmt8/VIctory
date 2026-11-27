@@ -2278,6 +2278,119 @@ impl State {
     /// title's bake programs. The uploads are recorded into `list` ahead
     /// of the draw being bound, as the world's pass records them.
     fn early_textures(&self, list: &HostList, p: &HostPipeline, compute: bool) {
+        self.early_textures_pass(list, p, compute);
+        // (`VICTORY_REPAINT_WATCH`: what the slots a bake draw picks from
+        // show when it is recorded, whatever the pass did.)
+        #[cfg(feature = "diagnostics")]
+        if !compute
+            && crate::repaint::on()
+            && p.stages.iter().any(|s| BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str()))
+        {
+            self.watch_bake_sources(p);
+        }
+    }
+
+    /// For `VICTORY_REPAINT_WATCH`: the title slots a draw of the title's
+    /// bake can pick textures from, and a line of what they show
+    /// (`crate::repaint::bake_sources`). Reading only.
+    ///
+    /// Which slots: after readmet3xt-lab b3d49db's `bake_sources` (the bake
+    /// programs name no texture in a table: the skin's texture is the heap
+    /// slot at byte 0x20 of the constants at table 1, each decoration's are
+    /// named in its 304-byte record of the structured buffer at table 1, the
+    /// records being those from the one the constants hold at 0x78 to the
+    /// one at 0x7c). So: every word of the draw's constants and of those
+    /// records that is the number of a slot holding a texture view; a word
+    /// that is one by chance is counted with the others.
+    #[cfg(feature = "diagnostics")]
+    fn watch_bake_sources(&self, p: &HostPipeline) {
+        const MOST_BYTES: u64 = 64 << 10;
+        const RANGE_AT: usize = 0x78 / 4;
+        let Some(heap) = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())
+        else {
+            return;
+        };
+        let Some(host) = heap.host() else {
+            return;
+        };
+        let read = |address: u64, len: u64, words: &mut Vec<u32>| {
+            let mut bytes = vec![0u8; (len.min(MOST_BYTES) as usize) & !3];
+            if !bytes.is_empty() && crate::host::read_into(address as *const u8, &mut bytes) {
+                words.extend(bytes.chunks_exact(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])));
+            }
+        };
+        let roots = self.roots_ref(false);
+        let entry = |slot: u8, dwords: u32| -> Option<View> {
+            let Some(Root::Table(table)) = roots.get(usize::from(slot)) else {
+                return None;
+            };
+            crate::descriptor::view(table + u64::from(dwords) * 4)
+        };
+        let mut words = Vec::new();
+        let last = p.stages.len().saturating_sub(1);
+        for (i, stage) in p.stages.iter().enumerate() {
+            let t = stage.translated();
+            // Constants first: they say which records the buffers' are.
+            let mut range = None;
+            for u in t.used.iter().filter(|u| u.root == RootType::Table && u.kind == ResourceType::Cbv) {
+                let Some(View::Constant(address, size)) = entry(u.slot, u.table_offset_dwords) else {
+                    continue;
+                };
+                let from = words.len();
+                read(address, u64::from(size), &mut words);
+                range = match words[from..].get(RANGE_AT..RANGE_AT + 2) {
+                    Some(&[first, end]) if end > first && end - first <= 256 => Some((first, end)),
+                    _ => range,
+                };
+            }
+            for u in t.used.iter().filter(|u| u.root == RootType::Constants) {
+                if let Some(Root::Constants(constants)) = roots.get(usize::from(u.slot)) {
+                    words.extend_from_slice(constants);
+                }
+            }
+            // The pixel stage's buffers alone: a mesh stage's are vertices.
+            if i != last {
+                continue;
+            }
+            for u in t.used.iter().filter(|u| u.root == RootType::Table && u.kind == ResourceType::Srv) {
+                let Some((address, len)) =
+                    entry(u.slot, u.table_offset_dwords).as_ref().and_then(crate::descriptor::host::buffer_range)
+                else {
+                    continue;
+                };
+                let stride = u64::from(u.stride);
+                match range {
+                    Some((first, end)) if stride > 0 && u64::from(end) * stride <= len => {
+                        read(address + u64::from(first) * stride, u64::from(end - first) * stride, &mut words);
+                    }
+                    _ => read(address, len, &mut words),
+                }
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        let slots: Vec<u32> = words
+            .into_iter()
+            .filter(|&w| {
+                w != 0
+                    && seen.insert(w)
+                    && heap
+                        .handle(w)
+                        .and_then(crate::descriptor::view)
+                        .as_ref()
+                        .is_some_and(crate::descriptor::host::is_texture_view)
+            })
+            .take(1024)
+            .collect();
+        crate::repaint::bake_sources(heap, host, crate::frame::current(), &slots);
+    }
+
+    /// [`State::early_textures`]' pass.
+    fn early_textures_pass(&self, list: &HostList, p: &HostPipeline, compute: bool) {
         let (early_ms, bake_ms) = early_budgets();
         if compute || (early_ms == 0 && bake_ms == 0) {
             return;
