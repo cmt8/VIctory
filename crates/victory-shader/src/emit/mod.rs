@@ -328,6 +328,100 @@ pub fn even_barriers() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_EVEN_BARRIERS").is_none_or(|v| v != "0"))
 }
 
+/// Whether the typed unordered buffer views of a compute program that
+/// writes UAVs and has an `s_barrier` are shown to the host as read and
+/// written through every handle (`lower::read_and_written`: a load and a
+/// store back through each handle that never run). vkd3d-proton's dxil-spirv
+/// declares a variable per combination of read and written, restrict as
+/// Vulkan's are, and Mesa takes one the program does not store through as
+/// memory the program does not write: a load through it may be joined with
+/// an earlier one or moved ahead of the group barrier it stands behind. The
+/// face network's first stage (0aa7934094794dbf) writes its 16-bit registers
+/// through one view of a buffer and reads them through another after its
+/// barrier; on the RX 7900 XTX its output differed between runs from the
+/// same memory. Anzymanz/VIctory-ox (after FoggySky222's fork) reads such
+/// values through the slot's raw twin instead and reports natural mouths on
+/// RADV with it.
+/// `VICTORY_TYPED_RW`: off, `=1` on. Part of the translation: the shader
+/// cache keys the programs it can change apart ([`keyed_apart`]).
+pub fn typed_rw() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TYPED_RW_TEST.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| typed_rw_said(std::env::var("VICTORY_TYPED_RW").ok().as_deref()))
+}
+
+/// What `VICTORY_TYPED_RW` says: on only when it is `1`.
+fn typed_rw_said(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim() == "1")
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`typed_rw`] on its thread (`None`: the switch's).
+    pub(crate) static TYPED_RW_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether a compute program that writes UAVs, has an `s_barrier` and uses
+/// no LDS gets one dword of thread-group shared memory and an atomic add to
+/// it at its start (`lower`: `cu_word`), so that the host runs the group's waves
+/// in one compute unit.
+///
+/// Why (Mesa 26.3.1, read in its sources; the RX 7900 XTX is GFX11): RADV
+/// runs a compute program without LDS in WGP mode (`radv_should_use_wgp_mode`:
+/// "LDS is faster with CU mode", so only programs with LDS get CU mode), where
+/// the waves of one group run on the two compute units of a work group
+/// processor, each with its own first-level cache. A load reads past that
+/// cache only with GLC, which RADV sets for an access marked coherent or
+/// volatile (`ac_get_hw_cache_flags`: "GLC means device scope for loads
+/// only"; without it "you always get LRU caching in CU scope"). vkd3d-proton
+/// asks for that on every typed load of a program with a barrier
+/// (MakeTexelVisible), but under VK_EXT_descriptor_heap RADV turns image
+/// accesses into heap accesses (`vk_nir_lower_descriptor_heaps`) before
+/// `nir_lower_memory_model` runs, and that pass knows only the forms before
+/// (and skips loads it took for reorderable): no typed load of ours comes
+/// out coherent (RADV's own dump: none of 62 in the programs with barriers of
+/// a captured frame, while raw buffer loads do). So a wave can read, after
+/// the barrier, the line its unit cached before another unit's wave stored
+/// to it. ACO's wait insertion says of the other mode: "In non-WGP, the L1
+/// (L0 on GFX10+) cache keeps all memory operations in-order for the same
+/// workgroup".
+///
+/// The face network's first stage (0aa7934094794dbf: 1,024 threads in one
+/// group, no LDS, 14 typed stores and 16 typed loads around one barrier in a
+/// loop, loads before the barrier too) gave different results from the same
+/// memory on that card. Not shown yet: that this switch ends it.
+///
+/// The dword is added to atomically, once by every thread, and what it holds
+/// is used by nothing. A plain store to it does not keep it: Mesa drops a
+/// shared variable that is only stored to (`nir_remove_dead_variables`,
+/// `deref_used_for_not_store`), seen in RADV's dump of the face program with
+/// such a store added (no shared store left, the divergence as before).
+///
+/// `VICTORY_GROUP_CU`: off, `=1` on. Part of the translation: the shader
+/// cache keys the programs it can change apart ([`keyed_apart`]).
+pub fn group_cu() -> bool {
+    #[cfg(test)]
+    if let Some(on) = GROUP_CU_TEST.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| group_cu_said(std::env::var("VICTORY_GROUP_CU").ok().as_deref()))
+}
+
+/// What `VICTORY_GROUP_CU` says: on only when it is `1`.
+fn group_cu_said(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim() == "1")
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`group_cu`] on its thread (`None`: the switch's).
+    pub(crate) static GROUP_CU_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// Whether `ds_bpermute_b32` in a console wave64 program reads within the
 /// lane's own half of 32 lanes: lane l takes the data of lane
 /// (l & 32) | ((address + offset) / 4 & 31). That is what the console's

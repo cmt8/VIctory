@@ -3056,7 +3056,11 @@ impl State {
             self.twin_why(p, true);
         }
         #[cfg(feature = "diagnostics")]
-        list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        list.note_op(|| {
+            // (The console's flags, where the title gave any: `DispatchX`.)
+            let flags = if flags == 0 { String::new() } else { format!("/f{flags:#x}") };
+            self.op_text(format!("dispatch {x}x{y}x{z}{flags}"), true)
+        });
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_builder(self.pipeline as This) {
             crate::capture::op(list as *const _ as usize, || format!("builder {}", p.name));
@@ -3078,6 +3082,11 @@ impl State {
                 // SAFETY: an open list; the root signature has the word.
                 unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
             }
+        }
+        if dispatch_sync() {
+            let wait = D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_UAV, ..Default::default() };
+            // SAFETY: an open list; the barrier names no resource.
+            unsafe { list.list.barriers(&[wait]) };
         }
         #[cfg(feature = "diagnostics")]
         let stamp = crate::host::rtstamps::before(&list.list);
@@ -4622,6 +4631,26 @@ const THREAD_DIMENSIONS: u32 = 0x20;
 fn thread_dimensions() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_THREAD_DIMENSIONS").is_none_or(|v| v != "0"))
+}
+
+/// `VICTORY_DISPATCH_SYNC=1` (off by default; an experiment, A/B-able with
+/// `VICTORY_AB=<s>,VICTORY_DISPATCH_SYNC`): a wait for every shader write
+/// before each dispatch, whether the title asked for one or not. If a
+/// picture is right with it and wrong without, a dispatch reads what one
+/// before it in the list had not finished writing.
+fn dispatch_sync() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_DISPATCH_SYNC") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_DISPATCH_SYNC").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("every dispatch waits for the shader writes before it (VICTORY_DISPATCH_SYNC=1)");
+        }
+        on
+    })
 }
 
 /// The groups of `size` threads that hold `threads`.

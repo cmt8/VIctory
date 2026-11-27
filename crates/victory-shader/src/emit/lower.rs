@@ -338,6 +338,14 @@ struct Lower<'a> {
     tail: Vec<Option<usize>>,
     /// The program writes UAVs: barriers fence them too.
     writes_uavs: bool,
+    /// Typed unordered buffer views are read and written to the host
+    /// through every handle ([`super::typed_rw`], [`Self::read_and_written`]).
+    typed_rw: bool,
+    /// The handles that have their load and store that never run.
+    rw_handles: HashSet<V>,
+    /// The LDS dword a program without LDS of its own adds to at its start
+    /// ([`super::group_cu`]): the host then runs the group in one compute unit.
+    cu_word: Option<u32>,
     /// src0 of the current instruction as DPP fetched it.
     src0: Option<V>,
     /// Compute code that reads other lanes: thread ids follow the host
@@ -1942,6 +1950,12 @@ impl<'a> Lower<'a> {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
+        // (`VICTORY_TYPED_RW`: a compute program that writes UAVs and meets its group at a
+        // barrier; what its threads exchange through views is what a moved read loses.)
+        let typed_rw = super::typed_rw()
+            && x.native.stage == HwStage::Cs
+            && writes_uavs
+            && insts().any(|i| i.name() == "s_barrier");
         let mut console_lanes = false;
         // LDS accesses get a group barrier each (a console wave split in two host waves)
         let mut split_lds = false;
@@ -2148,6 +2162,17 @@ impl<'a> Lower<'a> {
                 s.wave_size = Some(wave);
             }
         }
+        // (`VICTORY_GROUP_CU`: a compute program that writes UAVs, meets its group at a
+        // barrier and has no LDS, neither its own nor a form's.)
+        let cu_word = (super::group_cu()
+            && x.native.stage == HwStage::Cs
+            && writes_uavs
+            && s.lds_dwords == 0
+            && insts().any(|i| i.name() == "s_barrier"))
+        .then(|| {
+            s.lds_dwords = 1;
+            0
+        });
         // The title's barriers a thread of the group may never reach, which
         // leaves the others waiting on the host: those in blocks some lanes
         // do not run, and all of them in a program with a loop closed by a
@@ -2294,6 +2319,9 @@ impl<'a> Lower<'a> {
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
             writes_uavs,
+            typed_rw,
+            rw_handles: HashSet::new(),
+            cu_word,
             src0: None,
             console_lanes,
             split_lds,
@@ -2970,6 +2998,20 @@ impl<'a> Lower<'a> {
                 self.s.m.terminate(done, Term::Ret);
                 self.s.entry = body;
             }
+        }
+        if let Some(word) = self.cu_word {
+            // Every thread that runs adds one, atomically, to the group's one dword of
+            // shared memory, and nothing uses what the dword holds. A program that uses
+            // LDS is run in one compute unit by RADV ([`super::group_cu`]). A plain
+            // store would not do: Mesa drops a shared variable that is only stored to
+            // (`nir_remove_dead_variables`), and the program then has no LDS again; an
+            // atomic counts as a use there.
+            let e = self.s.entry;
+            let lds = self.s.lds();
+            let k = self.s.m.i32(word);
+            let ptr = self.s.m.element(e, lds, k);
+            let one = self.s.m.i32(1);
+            self.s.m.atomic(e, Rmw::Add, ptr, one);
         }
         self.find_coherent();
         let order = crate::ir::reverse_postorder(&p.blocks);
@@ -12972,6 +13014,9 @@ impl<'a> Lower<'a> {
             let void = self.s.t.void;
             self.s.op(self.cur, name, Attr::NoUnwind, void, op, &args);
             self.end_guarded(at, &[]);
+            if typed {
+                self.read_and_written(Some((args[0], args[1], halves)));
+            }
             return Ok(());
         }
         if let Some(f) = *format {
@@ -12991,6 +13036,8 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
+        // A typed load through an unordered view: (handle, element, of integers).
+        let mut read_through: Option<(V, V, bool)> = None;
         let r = if typed {
             if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
                 return Err("a typed buffer load at an offset");
@@ -13001,6 +13048,7 @@ impl<'a> Lower<'a> {
             let index = index.unwrap_or(self.s.m.i32(0));
             if halves {
                 let h = self.handle(site, src, false, (10 | u, 0x405))?;
+                read_through = uav.then_some((h, index, true));
                 let i32t = self.s.t.i32;
                 let ret = self.s.m.named_struct("dx.types.ResRet.i32", vec![i32t; 5]);
                 self.s.op(
@@ -13013,6 +13061,7 @@ impl<'a> Lower<'a> {
                 )
             } else {
                 let h = self.handle(site, src, false, (10 | u, 0x409))?;
+                read_through = uav.then_some((h, index, false));
                 self.s.op(
                     c,
                     "bufferLoad.f32",
@@ -13107,6 +13156,7 @@ impl<'a> Lower<'a> {
                 }
                 self.write(inst, Reg::V(reg + k as u8), x.expect("a channel"), guard);
             }
+            self.read_and_written(read_through);
             return Ok(());
         }
         for k in 0..count {
@@ -13115,7 +13165,72 @@ impl<'a> Lower<'a> {
             let x = if halves { x } else { self.as_int(x) };
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
+        self.read_and_written(read_through);
         Ok(())
+    }
+
+    /// With [`super::typed_rw`], after a typed load or store through the
+    /// unordered buffer view `through` names (handle, element, whether of
+    /// integers): a load and a store back through the same handle that never
+    /// run, once a handle (their guard is the element being 0xFFFF_FFFF,
+    /// which no view has: a load there reads zeros and a store there is
+    /// dropped, so they would change nothing if they ran). To the host every
+    /// such handle is then one that is read and written, and the handles of
+    /// one component type name one variable.
+    ///
+    /// Without it dxil-spirv keeps reads and writes per `annotateHandle` and
+    /// declares a heap variable for each combination (dxil_converter.cpp,
+    /// the bindless heap variable: `uav_read` and `uav_written` are part of
+    /// what tells one from another; a typed view only read through is
+    /// `NonWritable`, and only raw and structured buffers are excepted "in
+    /// case there is aliasing through different declarations"). Variables
+    /// are restrict there unless decorated otherwise ("The default in Vulkan
+    /// environment is Restrict"), so Mesa takes a variable the program does
+    /// not store through as memory the program does not write
+    /// (nir_opt_access: its loads are reorderable, which "may be arbitrarily
+    /// moved, combined, rematerialized"). RADV's dump of a program that
+    /// stores halves through one view and loads them through another view of
+    /// the same buffer after its `s_barrier` shows that load as
+    /// `readonly|reorderable|speculatable`: free to be joined with a load
+    /// before the barrier or moved ahead of it, where the group's other
+    /// waves have not stored yet. The face network's first stage (1,024
+    /// threads, a register file read and written through two views across
+    /// its barrier) is such a program. D3D12 lets two views name one buffer.
+    ///
+    /// The store alone, on the loads' handle, is not enough: the driver
+    /// drops a store that cannot run and then sees a variable nothing is
+    /// stored through. With the handles sharing one variable the program's
+    /// own stores are stores through it.
+    fn read_and_written(&mut self, through: Option<(V, V, bool)>) {
+        let Some((h, element, integers)) = through else {
+            return;
+        };
+        if !self.typed_rw || !self.rw_handles.insert(h) {
+            return;
+        }
+        self.s.flags |= flags::TYPED_UAV_LOADS;
+        // (Not the element differing from itself: the clean-up folds that
+        // and the load and the store go with it.)
+        let past = self.s.m.i32(u32::MAX);
+        let never = self.s.m.cmp(self.cur, pred::EQ, element, past);
+        let at = self.begin_guarded(Some(never));
+        let iu = self.s.m.undef(self.s.t.i32);
+        let (load, store, ret) = if integers {
+            let i32t = self.s.t.i32;
+            let ret = self.s.m.named_struct("dx.types.ResRet.i32", vec![i32t; 5]);
+            ("bufferLoad.i32", "bufferStore.i32", ret)
+        } else {
+            ("bufferLoad.f32", "bufferStore.f32", self.s.t.res_ret)
+        };
+        let was = self.s.op(self.cur, load, Attr::ReadOnly, ret, 68, &[h, element, iu]);
+        let mut args = vec![h, element, iu];
+        for k in 0..4 {
+            args.push(self.s.m.extract(self.cur, was, k));
+        }
+        args.push(self.s.m.i8(0xF));
+        let void = self.s.t.void;
+        self.s.op(self.cur, store, Attr::NoUnwind, void, 69, &args);
+        self.end_guarded(at, &[]);
     }
 
     fn export(&mut self, b: usize, i: usize) -> Result<(), Why> {
@@ -14145,6 +14260,87 @@ mod tests {
             vec![buffer],
         )
         .map(|_| ())
+    }
+
+    /// `VICTORY_GROUP_CU`: a compute program that stores to a UAV and meets
+    /// its group at an `s_barrier` without any LDS is given a dword of
+    /// group-shared memory and an atomic add to it. Only with the switch on, not
+    /// without a barrier, and not where the program has LDS already.
+    #[test]
+    fn a_group_with_a_barrier_and_no_lds_gets_a_dword_of_it_only_when_asked() {
+        const S_BARRIER: u32 = 0xBF8A_0000;
+        let lowered = |on: bool, barrier: bool, lds: bool| {
+            let mut words = vec![
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
+                0xFA00_0000,
+                0x7E00_0200 | 1 << 17, // v_mov_b32 v1, s0
+            ];
+            if barrier {
+                words.push(S_BARRIER);
+            }
+            words.extend_from_slice(&[
+                0xE070_0000, // buffer_store_dword v0, off, s[8:11], 0
+                0x8002_0000,
+                S_ENDPGM,
+            ]);
+            let layout = vec![
+                RootParam {
+                    sgprs: 4,
+                    ..root(RootType::Constants, 0, 0)
+                },
+                root(RootType::Table, 4, 1),
+            ];
+            let used = vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            }];
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 256,
+                layout,
+                used,
+                io: StageIo::Cs(ComputeIo {
+                    // five user SGPRs; 512 bytes of LDS or none
+                    rsrc2: u32::from(lds) << 15 | 5 << 1,
+                    threads: [64, 1, 1],
+                }),
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let p = ir::build(&native.code, false, 256).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            crate::emit::GROUP_CU_TEST.set(Some(on));
+            let lowered = lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            });
+            crate::emit::GROUP_CU_TEST.set(None);
+            lowered.expect("lowers").dxil
+        };
+        assert_eq!(lowered(false, true, false), lowered(false, true, false), "one translation");
+        assert_ne!(
+            lowered(false, true, false),
+            lowered(true, true, false),
+            "a barrier, a UAV store and no LDS: the dword and the add to it"
+        );
+        assert_eq!(lowered(false, false, false), lowered(true, false, false), "no barrier: as before");
+        assert_eq!(lowered(false, true, true), lowered(true, true, true), "LDS of its own: as before");
     }
 
     #[test]

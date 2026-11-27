@@ -195,6 +195,46 @@ pub(super) unsafe fn remove(this: *mut c_void) {
     }
 }
 
+/// Runs `f` while each of `objects` that points at a shim of ours points at
+/// its own table, and at its shim again after. vkd3d-proton knows a command
+/// list by its table (`d3d12_command_list_from_iface`, libs/vkd3d/command.c:
+/// one with another table is no list to it, and `ExecuteCommandLists` then
+/// reads through a null pointer), so a list goes to the queue as it was made.
+///
+/// # Safety
+/// Live COM objects (or null) whose methods no other thread calls meanwhile.
+pub(super) unsafe fn bare<R>(objects: &[*mut c_void], f: impl FnOnce() -> R) -> R {
+    let bared: Vec<(*mut c_void, usize, usize)> = {
+        let made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+        objects
+            .iter()
+            .filter(|p| !p.is_null())
+            .filter_map(|&p| {
+                // SAFETY: as in `install`; a table in `MADE` is a shim's.
+                unsafe {
+                    let at = *p.cast::<usize>();
+                    made.contains(&at).then(|| {
+                        let own = (*shim(p)).orig as usize;
+                        p.cast::<usize>().write(own);
+                        (p, at, own)
+                    })
+                }
+            })
+            .collect()
+    };
+    let out = f();
+    for (p, at, own) in bared {
+        // SAFETY: the caller's objects. One whose table was set anew
+        // meanwhile keeps that.
+        unsafe {
+            if *p.cast::<usize>() == own {
+                p.cast::<usize>().write(at);
+            }
+        }
+    }
+    out
+}
+
 /// Classes of [`uncounted`] calls.
 pub(super) const LIST: usize = 0;
 pub(super) const DEVICE: usize = 1;
@@ -344,6 +384,46 @@ mod tests {
             remove(this);
             assert!(std::ptr::eq(a.vtbl, &other));
             assert_eq!(call(&mut a, 0), 115);
+        }
+    }
+
+    /// A host that knows its objects by their tables (vkd3d-proton, a list
+    /// at `ExecuteCommandLists`) is handed them as it made them.
+    #[test]
+    fn objects_are_their_own_while_bare() {
+        static STATE: u64 = 1000;
+        let vtbl = Vtbl {
+            methods: [add as *const () as usize; 8],
+        };
+        let mut a = Object {
+            vtbl: &vtbl,
+            value: 100,
+        };
+        let mut b = Object {
+            vtbl: &vtbl,
+            value: 200,
+        };
+        let own = &raw const vtbl as usize;
+        // SAFETY: the test's objects; entries of `Add`'s type.
+        unsafe {
+            let this: *mut c_void = (&raw mut a).cast();
+            let other: *mut c_void = (&raw mut b).cast();
+            assert!(install(this, (&raw const STATE).cast(), |t| t[0] = double as *const () as usize));
+            let shim = table(this);
+            assert_ne!(shim, own);
+            // The same object twice, one without a shim, and none.
+            let all = [this, other, std::ptr::null_mut(), this];
+            let seen = bare(&all, || (table(this), table(other), call(&mut *this.cast::<Object>(), 0)));
+            assert_eq!(seen, (own, own, 115), "its own table and method meanwhile");
+            assert_eq!(table(this), shim, "and its shim again after");
+            assert_eq!(table(other), own);
+            assert_eq!(call(&mut a, 0), 230 + 1000);
+            // One whose table was set anew meanwhile keeps that.
+            let anew = Vtbl {
+                methods: [add as *const () as usize; 8],
+            };
+            bare(&[this], || (*this.cast::<Object>()).vtbl = &anew);
+            assert!(std::ptr::eq(a.vtbl, &anew));
         }
     }
 }
