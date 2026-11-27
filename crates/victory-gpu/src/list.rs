@@ -1816,6 +1816,11 @@ mod state {
         if indirect != 0 {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
+            crate::dropwhy::dropped(
+                std::ptr::null(),
+                crate::dropwhy::Kind::Mesh,
+                crate::dropwhy::Cause::Other("a mesh dispatch with its group count in GPU memory"),
+            );
             return;
         }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
@@ -1907,6 +1912,12 @@ extern "system" fn execute_indirect(
     count_draw();
     TOTALS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let Some((stride, args)) = crate::signature::layout(signature) else {
+        #[cfg(windows)]
+        crate::dropwhy::dropped(
+            std::ptr::null(),
+            crate::dropwhy::Kind::Indirect(u32::MAX),
+            crate::dropwhy::Cause::Other("its command signature is not one of ours"),
+        );
         return;
     };
     let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);

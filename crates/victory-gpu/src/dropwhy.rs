@@ -135,6 +135,31 @@ struct Table {
     /// What the title had created at the last report
     /// (`crate::pipeline::created`, `crate::device::unknown_pipelines`).
     created: ([u64; 3], [u32; 2]),
+    /// Drops told since the start, and at the last report what was
+    /// recorded, what ran and what was told ([`account`]).
+    told: u64,
+    accounted: [u64; 3],
+}
+
+/// The line that says whether every draw and dispatch recorded either ran
+/// or was told here as not run: `now` and `was` are what was recorded, what
+/// ran and what was told as not run, since the start, now and at the last
+/// report. What is neither is a draw that was left out without a word; the
+/// numbers are read while the title records, so a few either way mean
+/// nothing, and a number that grows with the frames does.
+fn account(now: [u64; 3], was: [u64; 3], frames: f64) -> String {
+    let per = |i: usize| now[i].saturating_sub(was[i]) as f64 / frames.max(1.0);
+    let neither = |n: [u64; 3]| n[0] as i64 - n[1] as i64 - n[2] as i64;
+    format!(
+        "drop why: per frame {:.1} draws and dispatches recorded, {:.1} run, {:.1} told as not run, {:.1} neither; since the start \
+         {} recorded, {} neither",
+        per(0),
+        per(1),
+        per(2),
+        (neither(now) - neither(was)) as f64 / frames.max(1.0),
+        now[0],
+        neither(now)
+    )
 }
 
 /// How long after its last drop an entry is settled, in ms.
@@ -182,6 +207,7 @@ impl Table {
                 i
             }
         };
+        self.told += 1;
         let e = &mut self.entries[i];
         e.total += 1;
         e.lately += 1;
@@ -451,6 +477,13 @@ pub(crate) fn report(frames: f64, now: bool) {
                  implemented: the title got none of those"
             ));
         }
+        // Whether everything recorded is accounted for.
+        let [draws, dispatches, _] = crate::list::totals();
+        let now = [draws + dispatches, crate::draw::drawn() + crate::draw::dispatched(), table.told];
+        if now[0] != table.accounted[0] {
+            lines.push(account(now, table.accounted, frames));
+            table.accounted = now;
+        }
         lines
     };
     for line in lines {
@@ -562,6 +595,18 @@ mod tests {
             ]
         );
         assert!(t.report(10.0, 300).is_empty());
+    }
+
+    /// The accounting line says what was recorded, run and told as not run
+    /// since the last report, and what is neither.
+    #[test]
+    fn the_account_names_what_is_neither_run_nor_told() {
+        let line = account([1000, 900, 60], [500, 450, 40], 10.0);
+        assert_eq!(
+            line,
+            "drop why: per frame 50.0 draws and dispatches recorded, 45.0 run, 2.0 told as not run, 3.0 neither; since the \
+             start 1000 recorded, 40 neither"
+        );
     }
 
     /// A quarter of a minute after the last drop an entry is settled: the
