@@ -842,6 +842,12 @@ impl PreludeUpload {
         self.staging.memory()
     }
 
+    /// The title texture (`VICTORY_REPAINT_WATCH`).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn resource(&self) -> usize {
+        self.resource
+    }
+
     /// Called on the submitting thread after `self.staging.refresh()` has
     /// completed for this submission. Returns `Some(first_upload)` when the
     /// list's prelude must record `CopyTextureRegion` into `self.copy.texture`.

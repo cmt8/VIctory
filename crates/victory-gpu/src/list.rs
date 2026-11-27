@@ -1184,6 +1184,7 @@ extern "system" fn copy_texture_region(
                 boxed,
                 watch_source,
                 watch_first,
+                list.epoch(),
             );
         }
         if same {

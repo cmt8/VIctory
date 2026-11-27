@@ -903,6 +903,9 @@ struct Copied {
     sources: [u32; 3],
     lines: u32,
     address: u64,
+    /// The lists that recorded copies into it since the last first one, by
+    /// their epochs (the last sixteen).
+    epochs: Vec<u64>,
 }
 
 #[derive(Default)]
@@ -977,6 +980,7 @@ pub(crate) fn card_copy(
     boxed: Option<[u32; 6]>,
     source: usize,
     first: u8,
+    epoch: u64,
 ) {
     if !on() {
         return;
@@ -999,7 +1003,19 @@ pub(crate) fn card_copy(
         sources: [0; 3],
         lines: 0,
         address: crate::resource::texture_memory(dst).map_or(0, |(at, _)| at as u64),
+        epochs: Vec::new(),
     });
+    if first != 0 {
+        // A texture made anew at this place: the copies of the one before
+        // are not its own.
+        copied.epochs.clear();
+    }
+    if copied.epochs.last() != Some(&epoch) {
+        if copied.epochs.len() >= 16 {
+            copied.epochs.remove(0);
+        }
+        copied.epochs.push(epoch);
+    }
     if new || first != 0 {
         *lines += 1;
         if *lines <= COPY_LINES {
@@ -1044,6 +1060,70 @@ pub(crate) fn card_copy(
         Some(_) => {}
         None => copied.whole += 1,
     }
+}
+
+/// The epochs of the lists submitted lately, in order (the last 4,096).
+static SUBMITTED: Mutex<std::collections::VecDeque<u64>> = Mutex::new(std::collections::VecDeque::new());
+
+/// A list is submitted (`HostList::run_deferred`).
+pub(crate) fn submitted(epoch: u64) {
+    if !on() {
+        return;
+    }
+    let mut s = SUBMITTED.lock().unwrap_or_else(|e| e.into_inner());
+    if s.len() >= 4096 {
+        s.pop_front();
+    }
+    s.push_back(epoch);
+}
+
+/// At a list's submission its prelude is given an upload of title memory
+/// `memory` (address, bytes) into title texture `resource`. If a copy on the
+/// card wrote that texture already, a line says so, unless only this list
+/// recorded such copies (its prelude runs before them). The line says how
+/// many of the lists that recorded copies were submitted before this one:
+/// then the title's bytes land over what the card wrote, and stay (the
+/// texture is never uploaded again, and its memory never held the copy).
+pub(crate) fn upload_after_copy(resource: usize, memory: (usize, usize), epoch: u64, first_upload: bool) {
+    if !on() || !crate::texture::host_wrote(resource) {
+        return;
+    }
+    static COUNTS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+    let c = COPIES.lock().unwrap_or_else(|e| e.into_inner());
+    let copied = c.as_ref().and_then(|c| c.by_texture.get(&resource));
+    let own = copied.is_some_and(|c| c.epochs.contains(&epoch));
+    let others = copied.map_or(0, |c| c.epochs.iter().filter(|&&e| e != epoch).count());
+    let before = copied.map_or(0, |c| {
+        let s = SUBMITTED.lock().unwrap_or_else(|e| e.into_inner());
+        c.epochs.iter().filter(|&&e| e != epoch && s.contains(&e)).count()
+    });
+    let kind = if before > 0 {
+        2
+    } else if others > 0 || !own {
+        1
+    } else {
+        0
+    };
+    let n = COUNTS[kind].fetch_add(1, Relaxed) + 1;
+    if kind == 0 || n > 200 {
+        return;
+    }
+    tracing::info!(
+        texture = format_args!("{resource:#x}"),
+        address = format_args!("{:#x}", memory.0),
+        bytes = memory.1,
+        frame = crate::frame::current(),
+        first_upload,
+        this_list_recorded_copies_too = own,
+        other_lists_that_recorded_copies = others,
+        of_them_submitted_before_this_one = before,
+        copies_so_far = copied.map_or(0, |c| c.copies),
+        last_copy_in_frame = copied.map_or(0, |c| c.frame),
+        uploads_by_the_copying_list_alone_so_far = COUNTS[0].load(Relaxed),
+        with_copies_by_lists_not_submitted_yet_so_far = COUNTS[1].load(Relaxed),
+        with_copies_by_lists_submitted_before_so_far = COUNTS[2].load(Relaxed),
+        "repaint watch: the title's bytes are uploaded into a texture a copy on the card wrote"
+    );
 }
 
 /// The audit met title slot `slot` showing `texture`, which copies on the

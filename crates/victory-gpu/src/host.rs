@@ -8134,6 +8134,9 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let (mut copies, mut refreshes, mut refreshed) = (0u64, 0u64, 0u64);
         let mut textures: Vec<crate::texture::PreludeUpload> = Vec::new();
+        // (`VICTORY_REPAINT_WATCH`: the order lists are submitted in.)
+        #[cfg(feature = "diagnostics")]
+        crate::repaint::submitted(self.epoch());
         for (i, step) in self.deferred().copies.iter().enumerate() {
             if matches!(step, Step::Copy(..) | Step::Fill(..)) && taken(i) {
                 continue;
@@ -8279,6 +8282,10 @@ impl HostList {
         let mut uploads = Vec::new();
         for upload in textures {
             if let Some(first_upload) = upload.finish_refresh() {
+                // (`VICTORY_REPAINT_WATCH`: an upload of the title's bytes
+                // into a texture a copy on the card wrote already.)
+                #[cfg(feature = "diagnostics")]
+                crate::repaint::upload_after_copy(upload.resource(), upload.memory(), self.epoch(), first_upload);
                 uploads.push((upload, first_upload));
             }
         }
