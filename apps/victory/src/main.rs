@@ -4,6 +4,7 @@
 //! the user's cache directory (outside the repository).
 
 mod census;
+mod fastmem;
 mod inspect;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod replay;
