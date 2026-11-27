@@ -589,11 +589,14 @@ const MAKING: u8 = 3;
 /// was not run for the 8 to 25 s after, in frames of 0.3 to 0.6 s that
 /// waited for them.
 ///
-/// `VICTORY_PIPELINE_SLOW=0`: in the order the title creates them, as it was
-/// at first; `VICTORY_PIPELINE_SLOW=<n>`: `n` of the workers at all times;
-/// `VICTORY_PIPELINE_SLOW=auto`: a quarter while those made lately took
-/// long, all but a quarter while they came quickly ([`slow_share`],
-/// [`slow_quick`]).
+/// Unset or `VICTORY_PIPELINE_SLOW=auto`: a quarter while those made lately
+/// took long, all but a quarter while they came quickly ([`slow_share`],
+/// [`slow_quick`]); a cold cache, where they never come quickly, keeps the
+/// quarter. With it none were unmade at the world's first frame (run dr4).
+/// `VICTORY_PIPELINE_SLOW=quarter`: a quarter at all times, as it was before
+/// `auto` was the default; `VICTORY_PIPELINE_SLOW=0`: in the order the title
+/// creates them, as it was at first; `VICTORY_PIPELINE_SLOW=<n>`: `n` of the
+/// workers at all times.
 fn slow_limit() -> usize {
     static LIMIT: OnceLock<(usize, usize)> = OnceLock::new();
     let (slowly, quickly) = *LIMIT.get_or_init(|| {
@@ -620,18 +623,18 @@ fn slow_limit() -> usize {
 /// while those made lately took long and while they came quickly: `0` is no
 /// limit; a number is that many workers at all times (one at least, and
 /// never all of them where there are two or more: one stays for what draws
-/// ask for); `auto` is a quarter of them and all but a quarter; anything
-/// else or nothing is a quarter at all times.
+/// ask for); `auto` or nothing is a quarter of them and all but a quarter;
+/// `quarter`, or anything else, is a quarter at all times.
 fn slow_share(asked: Option<&str>, workers: usize) -> (usize, usize) {
     let quarter = (workers / 4).max(1);
     match asked.map(str::trim) {
         Some("0") => (usize::MAX, usize::MAX),
-        Some("auto") => (quarter, workers.saturating_sub(quarter).max(quarter)),
+        None | Some("auto") => (quarter, workers.saturating_sub(quarter).max(quarter)),
+        Some("quarter") => (quarter, quarter),
         Some(n) => {
             let n = n.parse::<usize>().map_or(quarter, |n| n.clamp(1, workers.saturating_sub(1).max(1)));
             (n, n)
         }
-        None => (quarter, quarter),
     }
 }
 
@@ -890,15 +893,20 @@ mod tests {
         assert_eq!(worker_count(Some(20), 24), 20);
     }
 
-    /// Pipelines known to take long get a quarter of the workers unless the
-    /// switch says otherwise: 0 is no limit, a number is the share at all
-    /// times and leaves one worker to what draws ask for, `auto` is a
-    /// quarter while they take long and all but a quarter while they come
-    /// quickly.
+    /// Pipelines known to take long get a quarter of the workers while they
+    /// take long and all but a quarter while they come quickly (`auto`, and
+    /// nothing) unless the switch says otherwise: 0 is no limit, `quarter`
+    /// is a quarter at all times, a number is the share at all times and
+    /// leaves one worker to what draws ask for.
     #[test]
     fn the_share_for_long_pipelines_follows_the_switch() {
-        assert_eq!(slow_share(None, 10), (2, 2));
+        assert_eq!(slow_share(None, 10), (2, 8));
+        assert_eq!(slow_share(None, 16), (4, 12));
         assert_eq!(slow_share(None, 2), (1, 1));
+        assert_eq!(slow_share(Some("quarter"), 10), (2, 2));
+        assert_eq!(slow_share(Some(" quarter "), 16), (4, 4));
+        assert_eq!(slow_share(Some("quarter"), 2), (1, 1));
+        assert_eq!(slow_share(Some("quarter"), 1), (1, 1));
         assert_eq!(slow_share(Some("0"), 10), (usize::MAX, usize::MAX));
         assert_eq!(slow_share(Some("2"), 10), (2, 2));
         assert_eq!(slow_share(Some("6"), 10), (6, 6));
