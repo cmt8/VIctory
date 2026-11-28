@@ -1,10 +1,25 @@
 # Ray tracing in this fork: what the title does and what has been built
 
-Status, 2026-11-25, midday: **with `VICTORY_BVH_BUILDER=1` rooms get their
-indirect light** (runs light-10, light-11, n19), for some 40 ms more of the
-card's time a frame (the dorm: 75 of 90 ms busy against 34 of 64). Off by
-default. **`VICTORY_AMBIENT=1`** puts an estimate of that light in its place
-for next to nothing (below).
+Status, 2026-11-27 (RX 7900 XTX, RADV, linux/belo-rt1): **with
+`VICTORY_BVH_BUILDER=1` the builder runs on this card** (all 53 of its
+pipelines have host pipelines; no panic, no lost device, no GPU reset in four
+runs), rooms are lit by the title's own traced light and the glow in
+characters' eyes is gone, but **frames take about 2.7 times as long on the
+boat** (release, 250-385 s after the A press: 162-168 ms a frame, 6 fps,
+against 62 ms, 16 fps without it; runs brt3, brt2) and about twice as long in
+the opening cutscene (129 against 59 ms). The card is the limit: by its own
+stamps (diagnostics run brt4) the programs that walk the structures take
+81 ms a frame on the boat in 16 dispatches (8-355 ms, depending on the
+shot), the builder 4 ms in 144, all other dispatches 23 ms; without the
+builder the walkers take 0.2 ms (brt5). The bound on pages taken from faults
+(2048) is met 42 s after the A press, and from then on 30-970 pages a frame
+that rays touch read zeros. Off by default. **`VICTORY_AMBIENT=1`** puts an
+estimate of the diffuse light in its place for next to nothing (below); it
+does not touch reflections.
+
+Earlier (2026-11-25, runs light-10, light-11, n19): rooms got their indirect
+light for some 40 ms more of the card's time a frame (the dorm: 75 of 90 ms
+busy against 34 of 64).
 
 ## What the title does
 
@@ -126,10 +141,11 @@ dispatches, faults and what came.
   cache 3.5, primary probes 2.3, shadows 1.6).
 - Captures made on 2026-11-25 (builder on or off) hang the card in a replay
   (cause unknown; do not try).
-- Five shadow-mask trace programs do not translate (a structure's address out
-  of a descriptor picked from the heap by a computed index: the host would have
-  to give a table of addresses by slot). The title did not create them in any
-  run so far.
+- Five shadow-mask trace programs did not translate (a structure's address out
+  of a descriptor picked from the heap by a computed index). Since 027e367af
+  the host gives a table of addresses by slot (`VIEW_ADDRESSES`) and four of
+  the five translate (by that commit's own test); the FullAdaptive one still
+  stops, at a lane mask. The title did not create them in any run so far.
 - An access to a page that is not there is lost (a read gives zero, a store is
   dropped).
 - Not publicly documented, and assumed: the instruction's rounding, the order
