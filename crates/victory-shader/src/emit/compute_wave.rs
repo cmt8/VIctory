@@ -318,10 +318,6 @@ pub const GROUP_CU: &str = "VICTORY_GROUP_CU: a group with a barrier and no LDS 
 /// [`keyed_apart`]'s mark of a program with a ray-tracing node test whose
 /// tests all miss ([`super::bvh_miss`]).
 const BVH_MISS: &str = "VICTORY_BVH_MISS=1: every ray-tracing node test a miss";
-/// [`keyed_apart`]'s mark of every program with a ray-tracing node test:
-/// its instance and procedural nodes give all ones (no child), as the
-/// console's instruction does, where they gave a triangle miss before.
-pub(super) const BVH_OTHER_NONE: &str = "node test: instance and procedural nodes return no child";
 /// [`keyed_apart`]'s mark of a program with a ray-tracing node test that
 /// counts what its walks do ([`super::bvh_count`]). (The translator's version
 /// does not key translations: a change of what is counted changes the mark,
@@ -474,9 +470,6 @@ pub fn keyed_apart(container: &[u8], kept: bool) -> Vec<&'static str> {
     if console_program(container).is_some_and(|p| bvh_marked(&p)) {
         marks.push(BVH_MISS);
     }
-    if console_program(container).is_some_and(|p| has_bvh(&p.code)) {
-        marks.push(BVH_OTHER_NONE);
-    }
     if super::bvh_count() && bvh_count_slot(container).is_some() {
         marks.push(BVH_COUNT);
     }
@@ -544,7 +537,6 @@ pub fn keyed_apart_any() -> Vec<&'static str> {
     if super::bvh_miss() {
         marks.push(BVH_MISS);
     }
-    marks.push(BVH_OTHER_NONE);
     if super::bvh_count() {
         marks.push(BVH_COUNT);
     }
@@ -722,7 +714,7 @@ mod tests {
     /// node test, of any stage: one without keeps its key with the switch
     /// on. Off, no program is keyed apart and no key changes.
     #[test]
-    fn walkers_in_waves_of_32_and_their_node_kinds_key_them_apart() {
+    fn walkers_in_waves_of_32_key_them_apart() {
         let was = WALKER_WAVE32_TEST.replace(Some(false));
         let off = keyed_apart_any();
         WALKER_WAVE32_TEST.set(Some(true));
@@ -731,9 +723,7 @@ mod tests {
         WALKER_WAVE32_TEST.set(was);
         assert!(!off.contains(&BVH_WAVE32) && on.contains(&BVH_WAVE32));
         assert_eq!(on.len(), off.len() + 1);
-        assert!(!no_program.contains(&BVH_WAVE32) && !no_program.contains(&BVH_OTHER_NONE));
-        // The node kinds' change is in every set of translations.
-        assert!(off.contains(&BVH_OTHER_NONE));
+        assert!(!no_program.contains(&BVH_WAVE32));
         // Only console wave64 compute programs with a node test walk.
         // image_bvh64_intersect_ray v[13:16], [v1 .. v12], s[8:11]; s_endpgm
         let wide: Vec<u8> = [0xF19C_9F07u32, 0x0002_0D01, 0x0504_0302, 0x0908_0706, 0x000C_0B0A, 0xBF81_0000]
