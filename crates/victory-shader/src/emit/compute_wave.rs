@@ -319,8 +319,10 @@ pub const GROUP_CU: &str = "VICTORY_GROUP_CU: a group with a barrier and no LDS 
 /// tests all miss ([`super::bvh_miss`]).
 const BVH_MISS: &str = "VICTORY_BVH_MISS=1: every ray-tracing node test a miss";
 /// [`keyed_apart`]'s mark of a program with a ray-tracing node test that
-/// counts what its walks do ([`super::bvh_count`]).
-const BVH_COUNT: &str = "VICTORY_BVH_COUNT=1: ray-tracing node tests counted into u252";
+/// counts what its walks do ([`super::bvh_count`]). (The translator's version
+/// does not key translations: a change of what is counted changes the mark,
+/// or the cache serves the counting translations made before it.)
+const BVH_COUNT: &str = "VICTORY_BVH_COUNT=1: ray-tracing node tests counted into u252, with the cycle check";
 
 /// [`keyed_apart`]'s mark of a compute program with a ray-tracing node test
 /// whose loops are left at [`super::bvh_loop_limit`]'s count, with the count.
