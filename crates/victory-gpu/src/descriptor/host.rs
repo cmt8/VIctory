@@ -1180,18 +1180,24 @@ pub(crate) fn remapped(at: usize, len: usize) {
     }
     let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
     STALE[1].fetch_add(1, Relaxed);
-    // Pages are mapped one after the other.
+    // Merge adjacent/overlapping notifications; on queue overflow, trigger a
+    // full-range rescan instead of silently dropping notifications (DexNom 921d8d3b).
+    if start >= end {
+        return;
+    }
     if let Some(last) = ranges.last_mut()
-        && last.1 == start
+        && last.0 <= end
+        && start <= last.1
     {
-        last.1 = end;
+        last.0 = last.0.min(start);
+        last.1 = last.1.max(end);
         return;
     }
     if ranges.len() >= MOST {
-        // No pass runs (no shader that picks textures by index is bound):
-        // the slots there are looked at when they are due, as before.
-        STALE[2].fetch_add(ranges.len() as u64, Relaxed);
+        STALE[2].fetch_add(1, Relaxed);
         ranges.clear();
+        ranges.push((0, u64::MAX));
+        return;
     }
     ranges.push((start, end));
 }

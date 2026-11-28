@@ -1893,7 +1893,6 @@ fn committed_by_query(at: *const u8, len: usize) -> bool {
 /// answer is none without a look at the pages between (two queries for the
 /// slots whose texture is away, which are asked again and again).
 pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
     if len == 0 {
         return 0;
     }
@@ -1909,10 +1908,12 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     {
         return there;
     }
-    if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
+    let query = by_query();
+    let ends_missing = !query && !committed(at, 1) && !committed((end - 1) as *const u8, 1);
+    if ends_missing && (end - 1) / 4096 - start / 4096 <= 1 {
         return 0;
     }
-    if !by_query() {
+    if !query && !ends_missing {
         static BY_PAGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *BY_PAGE.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_PAGE").is_some_and(|v| v == "1")) {
             // By page, without the walk: whole pages, cut to the range.
@@ -1939,6 +1940,27 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         }
         return there;
     }
+    mapped_regions(start, end, false)
+}
+
+/// Returns whether `[start, start + len)` has any committed readable pages,
+/// including interior-only streamed texture mips (DexNom/VIctory `921d8d3b`).
+#[allow(dead_code)]
+pub(crate) fn any_mapped(start: usize, len: usize) -> bool {
+    let end = start.saturating_add(len);
+    if start == end {
+        return false;
+    }
+    if committed(start as *const u8, 1) {
+        return true;
+    }
+    (end - 1) / 4096 > start / 4096 && mapped_regions(start, end, true) > 0
+}
+
+fn mapped_regions(start: usize, end: usize, first_only: bool) -> u64 {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
     let (mut p, mut there) = (start, 0u64);
     while p < end {
         // SAFETY: plain data filled in by the query.
@@ -1949,8 +1971,11 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         if n == 0 || next <= p {
             break;
         }
-        if info.State == MEM_COMMIT {
+        if info.State == MEM_COMMIT && info.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 {
             there += (next - p) as u64;
+            if first_only {
+                break;
+            }
         }
         p = next;
     }
