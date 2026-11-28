@@ -4127,8 +4127,8 @@ pub(crate) unsafe fn wait_fence(
 
 /// [`wait_fence`] for a wait that has no other way out: a failure ends the
 /// run, said once, instead of going on as if the card had run what was
-/// waited for. (The late helper went on to settle flights off a value the
-/// card never reached; the relay slept a millisecond and asked again.)
+/// waited for. (The late helper did not retry: on a failed registration it
+/// went on to settle flights off a value the card never reached.)
 ///
 /// # Safety
 ///
@@ -4138,6 +4138,109 @@ unsafe fn wait_host_fence(fence: &ID3D12Fence, target: u64, event: HANDLE, conte
     if let Err(e) = unsafe { wait_fence(fence, target, event, context) } {
         fence_failed(format_args!("{context}: waiting for fence value {target} failed: {e}"));
     }
+}
+
+/// Failed waits in a row after which a retried wait ([`wait_fence_retried`])
+/// ends the run: about two seconds, a millisecond apart.
+const WAIT_RETRIES: u32 = 2000;
+
+/// What a retried wait does after a failure that is not a lost device.
+#[derive(Debug, PartialEq, Eq)]
+enum AfterFailure {
+    /// The first failure: said, with its error; then a millisecond's sleep
+    /// and another try.
+    WarnAndRetry,
+    /// Another try after a millisecond, saying nothing.
+    Retry,
+    /// [`WAIT_RETRIES`] failures in a row: the run ends.
+    GiveUp,
+}
+
+/// The failures of one retried wait: how many in a row, and whether the
+/// first was said (once for the wait's whole life, not once a streak).
+#[derive(Default)]
+struct Retries {
+    in_a_row: u32,
+    said: bool,
+}
+
+impl Retries {
+    fn failed(&mut self) -> AfterFailure {
+        self.in_a_row += 1;
+        if self.in_a_row >= WAIT_RETRIES {
+            AfterFailure::GiveUp
+        } else if !std::mem::replace(&mut self.said, true) {
+            AfterFailure::WarnAndRetry
+        } else {
+            AfterFailure::Retry
+        }
+    }
+
+    fn succeeded(&mut self) {
+        self.in_a_row = 0;
+    }
+}
+
+/// One try of [`wait_fence`] for a wait that slept a millisecond and tried
+/// again after a failure before (the relay's) or went on regardless (the up
+/// queue's CPU fallback): true once the value is there. A lost device (the
+/// fence answers `u64::MAX`, or the device gives a removal reason) ends the
+/// run, said once. Any other failure is said once with its error, sleeps a
+/// millisecond and returns false for the caller to try again; only
+/// [`WAIT_RETRIES`] of them in a row end the run. A success resets the count.
+///
+/// # Safety
+///
+/// As [`wait_fence`].
+unsafe fn wait_fence_retried(
+    device: &ID3D12Device,
+    fence: &ID3D12Fence,
+    target: u64,
+    event: HANDLE,
+    context: &str,
+    retries: &mut Retries,
+) -> bool {
+    // SAFETY: the caller's.
+    let Err(e) = (unsafe { wait_fence(fence, target, event, context) }) else {
+        retries.succeeded();
+        return true;
+    };
+    // SAFETY: a plain query.
+    if let Err(removed) = unsafe { device.GetDeviceRemovedReason() } {
+        fence_failed(format_args!(
+            "{context}: waiting for fence value {target} failed ({e}): the host device is gone ({removed})"
+        ));
+    }
+    match retries.failed() {
+        AfterFailure::WarnAndRetry => tracing::warn!(
+            error = %e,
+            target,
+            "{context}: a fence wait failed; it is tried again every millisecond, and {WAIT_RETRIES} failures in a row end the run (said once)"
+        ),
+        AfterFailure::Retry => {}
+        AfterFailure::GiveUp => fence_failed(format_args!(
+            "{context}: waiting for fence value {target} failed {WAIT_RETRIES} times in a row, the last: {e}"
+        )),
+    }
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    false
+}
+
+#[cfg(test)]
+#[test]
+fn a_retried_wait_gives_up_only_after_its_failures_in_a_row() {
+    let mut r = Retries::default();
+    assert_eq!(r.failed(), AfterFailure::WarnAndRetry);
+    for _ in 2..WAIT_RETRIES {
+        assert_eq!(r.failed(), AfterFailure::Retry);
+    }
+    // A success: the count starts again, and the first failure is not said
+    // again.
+    r.succeeded();
+    for _ in 1..WAIT_RETRIES {
+        assert_eq!(r.failed(), AfterFailure::Retry);
+    }
+    assert_eq!(r.failed(), AfterFailure::GiveUp);
 }
 
 /// The thread that settles the flights once the card has run them all
@@ -4299,6 +4402,7 @@ fn relay_worker() {
         fail(format_args!("no event for the thread that lands submissions sent ahead (VICTORY_RELAY=1)"));
     };
     let mut fetch: Option<RelayFetch> = None;
+    let mut retries = Retries::default();
     loop {
         let next = {
             let mut line = line();
@@ -4347,13 +4451,28 @@ fn relay_worker() {
             }
         };
         match next {
-            Ok(items) => host.relay_land(items, &mut fetch),
+            Ok(items) => {
+                // The card got on: failures since are no longer in a row.
+                retries.succeeded();
+                host.relay_land(items, &mut fetch)
+            }
             Err(target) => {
                 let waiting = std::time::Instant::now();
                 #[cfg(feature = "diagnostics")]
                 let _card = crate::timeline::card_wait(Some(target));
                 // SAFETY: the host's fence and this thread's event.
-                unsafe { wait_host_fence(&host.fence, target, event, "the thread that lands submissions sent ahead (VICTORY_RELAY=1)") };
+                // A failure that is not a lost device: a millisecond's sleep
+                // and the line looked at again, as before (bounded now).
+                unsafe {
+                    wait_fence_retried(
+                        &host.device,
+                        &host.fence,
+                        target,
+                        event,
+                        "the thread that lands submissions sent ahead (VICTORY_RELAY=1)",
+                        &mut retries,
+                    )
+                };
                 RELAY_STATS[2].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
         }

@@ -195,17 +195,24 @@ pub(super) unsafe fn send(
         // The drawing queue cannot be made to wait: wait here, so that
         // what follows still finds the bytes.
         tracing::warn!(error = %e, "the drawing queue could not wait for the up queue: waited on the CPU");
+        // A lost device ends the run; any other failure (ignored before,
+        // and what follows went on before the bytes were there) is tried
+        // again a millisecond later, and only enough of them in a row end
+        // the run.
+        static RETRIES: std::sync::Mutex<super::Retries> =
+            std::sync::Mutex::new(super::Retries { in_a_row: 0, said: false });
+        let mut retries = RETRIES.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: as above; a null event waits until the value is reached.
-        // A failure ends the run (said once) rather than going on before
-        // the bytes are there; so does a lost device.
-        unsafe {
-            super::wait_host_fence(
+        while !unsafe {
+            super::wait_fence_retried(
+                &host.device,
                 &q.fence,
                 q.sent,
                 windows::Win32::Foundation::HANDLE::default(),
                 "the CPU's wait for the up queue",
+                &mut retries,
             )
-        };
+        } {}
     }
     let mut at = 0u64;
     for (i, r) in ranges.iter().enumerate() {
