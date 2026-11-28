@@ -3108,7 +3108,7 @@ impl State {
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         crate::dropwhy::ran(self.pipeline as This);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
-            && crate::ambient::on()
+            && crate::ambient::follows(role)
             && self.ambient(list, p, role)
         {
             self.host_pipeline = 0;
@@ -3131,11 +3131,13 @@ impl State {
             Role::Resolve => LIGHT,
             Role::Radiance => RADIANCE,
             Role::Air => AIR,
+            Role::Miss => return self.reflections(list, p, t),
         };
         let image = entry(ResourceType::Uav, at);
         let depth = match role {
             Role::Resolve => entry(ResourceType::Srv, DEPTH),
             Role::Radiance | Role::Air => image,
+            Role::Miss => return false,
         };
         let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
             once!(?role, "no stand-in for the indirect light: other tables");
@@ -3153,7 +3155,188 @@ impl State {
             depth,
             size: [of.Width as u32, of.Height],
             slices: u32::from(of.DepthOrArraySize),
+            depth_size: [seen.Width as u32, seen.Height],
         })
+    }
+
+    /// The stand-in for reflections after a dispatch of the miss program `p`
+    /// (`crate::ambient`, `Role::Miss`; readmet3xt-lab/foxhound 2db59d4,
+    /// f89b79d, d226814, bda6e59, 9b91d27, 9f6fb77). Whether it recorded
+    /// anything.
+    fn reflections(&self, list: &HostList, p: &HostPipeline, t: &crate::pipeline::Translated) -> bool {
+        use crate::ambient::{MISS_DEPTH, MISS_LIGHT, MissNote, Role, Views};
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+            DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32G8X24_TYPELESS,
+        };
+        let role = Role::Miss;
+        // Which surfaces the miss program's rays are of (its first root
+        // constant): water's reflections are left as they are (the depth
+        // here is of what lies under it), and the alpha layer's unless
+        // `VICTORY_AMBIENT_SPECULAR_ALPHA=1` (its pixels are of transparent
+        // surfaces; the depth read is the opaque one behind them).
+        let layer = t
+            .used
+            .iter()
+            .find(|u| u.root == RootType::Constants)
+            .and_then(|u| match self.roots_ref(true).get(usize::from(u.slot)) {
+                Some(Root::Constants(c)) => c.first().copied(),
+                _ => None,
+            })
+            .unwrap_or(u32::MAX);
+        if !(layer == crate::ambient::MISS_OPAQUE
+            || (crate::ambient::specular_alpha() && layer == crate::ambient::MISS_ALPHA))
+        {
+            crate::ambient::note_miss(MissNote::Water);
+            return false;
+        }
+        // Views of textures the title placed in its memory are resolved to
+        // their host textures here (bda6e59: the miss program's depth and
+        // most of its textures are such views), which the other roles'
+        // lookup does not do.
+        let entry = |kind: ResourceType, at: (u8, u32)| self.table_view_as(t, true, kind, at, true);
+        // A depth-stencil texture's view of its stencil plane (formats
+        // X32_TYPELESS_G8X24_UINT, X24_TYPELESS_G8_UINT, or a 2D view of plane
+        // 1) is no depth: the estimate made of it puts every point far away
+        // with its normal to the camera (d226814). (The description's words
+        // are D3D12_SHADER_RESOURCE_VIEW_DESC's: its union starts at word 4,
+        // so a 2D view's plane is word 6, bda6e59.)
+        fn stencil_view(view: Option<View>) -> bool {
+            let view = view.map(|v| crate::descriptor::host::placed_texture(&v).unwrap_or(v));
+            match view {
+                Some(View::Shader(_, Some(d))) => {
+                    matches!(crate::resource::pc_format(d[0]), 22 | 47) || (d[1] == 4 && d[6] == 1)
+                }
+                _ => false,
+            }
+        }
+        let stencil_at = |(slot, offset): (u8, u32)| {
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
+                return false;
+            };
+            stencil_view(crate::descriptor::view(table + u64::from(offset) * 4))
+        };
+        let depth_like = |d: &D3D12_RESOURCE_DESC| {
+            d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                && matches!(
+                    d.Format,
+                    DXGI_FORMAT_R32_TYPELESS
+                        | DXGI_FORMAT_D32_FLOAT
+                        | DXGI_FORMAT_R32G8X24_TYPELESS
+                        | DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+                        | DXGI_FORMAT_R24G8_TYPELESS
+                        | DXGI_FORMAT_D24_UNORM_S8_UINT
+                )
+        };
+        // Variants of the miss program bind the rays' image and the depth at
+        // other places of their tables than the one found first (f89b79d):
+        // where the usual place has none, the first table entry of that kind
+        // that fits.
+        let scan = |kind: ResourceType, fits: &dyn Fn(&D3D12_RESOURCE_DESC) -> bool| {
+            t.used
+                .iter()
+                .filter(|u| u.kind == kind && u.root == RootType::Table)
+                .filter(|u| kind != ResourceType::Srv || !stencil_at((u.slot, u.table_offset_dwords)))
+                .filter_map(|u| entry(kind, (u.slot, u.table_offset_dwords)))
+                .find(|(desc, _)| fits(desc))
+        };
+        let image = entry(ResourceType::Uav, MISS_LIGHT).or_else(|| {
+            scan(ResourceType::Uav, &|d| d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Format.0 == 26)
+        });
+        let usual_depth = |at: (u8, u32)| {
+            if stencil_at(at) {
+                static STENCIL: AtomicU64 = AtomicU64::new(0);
+                if STENCIL.fetch_add(1, Ordering::Relaxed) == 0 {
+                    tracing::info!(?role, ?at, "stand-in: the depth place names a stencil plane; another depth view of the tables is taken (counted once)");
+                }
+                None
+            } else {
+                entry(ResourceType::Srv, at)
+            }
+        };
+        // The picture's depth: twice the rays' image each way, 32-bit
+        // (9b91d27), at the usual place or found among the tables.
+        let twice = |d: &D3D12_RESOURCE_DESC, (w, h): (u64, u32)| {
+            d.Width.abs_diff(w * 2) <= 1 && u64::from(d.Height).abs_diff(u64::from(h) * 2) <= 1
+        };
+        let half = image.as_ref().map(|(d, _)| (d.Width, d.Height));
+        let depth = usual_depth(MISS_DEPTH)
+            .filter(|(d, _)| half.is_some_and(|half| twice(d, half)))
+            .or_else(|| {
+                scan(ResourceType::Srv, &|d| {
+                    depth_like(d)
+                        && matches!(
+                            d.Format,
+                            DXGI_FORMAT_R32_TYPELESS
+                                | DXGI_FORMAT_D32_FLOAT
+                                | DXGI_FORMAT_R32G8X24_TYPELESS
+                                | DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+                        )
+                        && half.is_some_and(|half| twice(d, half))
+                })
+            });
+        let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
+            once!(?role, "no stand-in for the indirect light: other tables");
+            crate::ambient::note_miss(MissNote::NotReady);
+            // Once per program: what its tables hold, so one run names the
+            // place of the rays' image and of the depth (d226814).
+            static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            if seen.len() < 16 && !seen.contains(&p.name) {
+                seen.push(p.name.clone());
+                let held: Vec<String> = t
+                    .used
+                    .iter()
+                    .filter(|u| u.root == RootType::Table && matches!(u.kind, ResourceType::Uav | ResourceType::Srv))
+                    .map(|u| {
+                        let at = (u.slot, u.table_offset_dwords);
+                        match entry(u.kind, at) {
+                            Some((d, _)) => format!(
+                                "{:?}{:?} {}x{} f{} dim{}{}",
+                                u.kind,
+                                at,
+                                d.Width,
+                                d.Height,
+                                d.Format.0,
+                                d.Dimension.0,
+                                if stencil_at(at) { " stencil" } else { "" }
+                            ),
+                            None => format!("{:?}{:?} -", u.kind, at),
+                        }
+                    })
+                    .collect();
+                tracing::info!(program = %p.name, tables = %held.join("; "), "reflections stand-in: a miss program whose rays' image or depth was not found");
+            }
+            return false;
+        };
+        // The miss program's image is of half the picture's size (R11G11B10),
+        // its depth (32-bit) of the whole.
+        let sizes = matches!(
+            seen.Format,
+            DXGI_FORMAT_R32_TYPELESS
+                | DXGI_FORMAT_R32_FLOAT
+                | DXGI_FORMAT_D32_FLOAT
+                | DXGI_FORMAT_R32G8X24_TYPELESS
+                | DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+        ) && seen.Width >= of.Width
+            && seen.Height >= of.Height
+            && seen.Width <= of.Width * 4;
+        if of.Format.0 != 26 || !sizes || of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+            once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");
+            crate::ambient::note_miss(MissNote::NotReady);
+            return false;
+        }
+        let ran = crate::ambient::after(list, role, &Views {
+            image,
+            depth,
+            size: [of.Width as u32, of.Height],
+            slices: u32::from(of.DepthOrArraySize),
+            depth_size: [seen.Width as u32, seen.Height],
+        });
+        if ran {
+            crate::ambient::note_miss(MissNote::Ran(layer));
+        }
+        ran
     }
 
     /// The view a shader of the bound pipeline reads through a table, at
@@ -3165,7 +3348,23 @@ impl State {
         t: &crate::pipeline::Translated,
         compute: bool,
         kind: ResourceType,
+        at: (u8, u32),
+    ) -> Option<(D3D12_RESOURCE_DESC, D3D12_GPU_DESCRIPTOR_HANDLE)> {
+        self.table_view_as(t, compute, kind, at, false)
+    }
+
+    /// [`State::table_view`]; with `placed`, a view of a texture the title
+    /// placed in its memory is taken as a view of the host texture made for
+    /// that memory (`crate::descriptor::host::placed_texture`, made on first
+    /// use), as the draw path does: only for the stand-in for reflections
+    /// (readmet3xt-lab/foxhound bda6e59).
+    fn table_view_as(
+        &self,
+        t: &crate::pipeline::Translated,
+        compute: bool,
+        kind: ResourceType,
         (slot, offset): (u8, u32),
+        placed: bool,
     ) -> Option<(D3D12_RESOURCE_DESC, D3D12_GPU_DESCRIPTOR_HANDLE)> {
         let heap = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This).host()).flatten()?;
         t.used.iter().find(|u| {
@@ -3174,7 +3373,9 @@ impl State {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
             return None;
         };
-        let resource = match crate::descriptor::view(table + u64::from(offset) * 4)? {
+        let view = crate::descriptor::view(table + u64::from(offset) * 4)?;
+        let view = if placed { crate::descriptor::host::placed_texture(&view).unwrap_or(view) } else { view };
+        let resource = match view {
             View::Shader(r, _) | View::Unordered(r, ..) => r,
             _ => return None,
         };
@@ -4615,6 +4816,18 @@ impl State {
             self.buffers_written();
         } else {
             self.drew(list, Some(p));
+        }
+        // The stand-in for reflections after the program that gives rays
+        // that found nothing the sky (`crate::ambient`, `Role::Miss`), which
+        // the title dispatches indirectly (foxhound 2db59d4; this tree
+        // records each indirect execution at once, so nothing is held back).
+        if kind == DISPATCH
+            && let Some(role @ crate::ambient::Role::Miss) = p.stages.first().and_then(|s| s.shader.ambient)
+            && crate::ambient::follows(role)
+            && self.ambient(list, p, role)
+        {
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
         }
         // The scratch buffer stays readable as arguments: the next draw of
         // the window reads it with no barrier, and the next clamp moves it
