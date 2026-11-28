@@ -1042,6 +1042,10 @@ pub(crate) fn host() -> Option<&'static Host> {
 }
 
 fn create() -> windows::core::Result<Host> {
+    // Before any program is translated (a translation asks for the host
+    // first): with the structure builder off, ray walks end at their first
+    // node unless `VICTORY_BVH_MISS` says otherwise.
+    victory_shader::emit::set_bvh_miss_default(!std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"));
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
         // The debug layer only in builds with diagnostics.
