@@ -100,12 +100,30 @@ after it was given them as an unordered access view.
 | `VICTORY_BVH_FAULTS_ALL=<n>` | pages taken from faults in all (2048). Do not raise it: run rtf-2 (no bound) gave every committed page a copy, still had 110-730 faulted pages a frame of memory that is not the title's, and filled the 3 GiB of pages in 4 minutes (reports/RT-FLICKER.md) |
 | `VICTORY_MEMORY_CARD_MB` | the most of it on the card (4096) |
 | `VICTORY_MEMORY_DUMP=<folder>` | a file `go` there writes the arenas out (diagnostics) |
+| `VICTORY_BVH_COUNT=1` | the walking programs count their node tests: by kind, pages with no copy, lanes by nodes tested, lanes at the loop limit, walks that come back to a node (diagnostics; a line per program with the frame lines) |
+| `VICTORY_BVH_LOOP_LIMIT=<n>` | the loops of the walking programs are left after n iterations (16 to 4096) instead of 4096 (diagnostics) |
 | `VICTORY_UPLOAD_LOW=0`, `VICTORY_LENT_HEAP=0` | lists' upload memory above 2^40, no view heap for lists without one, as before |
 
 Every ten seconds the log has a line "title memory by address: ..." with pages,
 dispatches, faults and what came.
 
 ## Known gaps
+
+- **Why the walking programs are slow** (runs rw1-rw11, 2026-11-27,
+  `VICTORY_BVH_COUNT=1`): on the boat 210-320 million node tests a frame,
+  300-500 a lane that walks, and 2,000-36,000 lanes a frame that run their
+  loop into the translation's compute loop limit (4,096 iterations). Every
+  one of those lanes tests the same node again and again (from test 512 at
+  the latest, about 3,580 of its 4,096 tests), mostly a leaf; on a page with
+  no copy (reads zeros) in some runs, on a page that has one in others. A
+  wave of 64 waits for its slowest lane, so those 1-6 % of the lanes set
+  most of the waves' time: with the walking programs' loops left at 2,048
+  (`VICTORY_BVH_LOOP_LIMIT`) their time on the boat went from 81-98 ms to
+  33 ms a frame, with the console's waves of 64 taken in two of 32
+  (`VICTORY_COMPUTE_WAVE=forms`) to 46 ms, with both to 25 ms (frame 119
+  against 192 ms). More pages (`VICTORY_BVH_FAULTS_ALL`)
+  did not help: the lanes then spin on pages that have a copy. Where the
+  nodes they spin on come from is open.
 
 - Dynamic structures overlap each other (8 of 65 good in run light-10, 48 of
   275 in light-15). Part of the cause, run light-11's trace (`VICTORY_BVH_TRACE=1`): the title asks for a new
