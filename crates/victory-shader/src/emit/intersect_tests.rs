@@ -713,6 +713,10 @@ fn counted_node_tests_add_up_on_the_card() {
         assert_eq!(named(count::LANES).1, n);
         assert_eq!(named(count::THREADS).1, THREADS);
         assert_eq!(named(count::LOOP_LIMIT).1, 0);
+        // One test a lane: none comes back to a node, none is cut.
+        for k in count::REPEATS..=count::LIMIT_TESTS {
+            assert_eq!(named(k).1, 0, "{}", COUNT_NAMES[k]);
+        }
         assert_eq!(named(count::MOST).1, u32::from(n > 0));
         assert_eq!(counts[COUNT_HISTOGRAM as usize + 1], n, "lanes of one test");
         assert_eq!(counts[COUNT_HISTOGRAM as usize + 2..].iter().sum::<u32>(), 0);
@@ -748,6 +752,21 @@ fn node_tests_are_counted_only_with_the_switch() {
         assert_ne!(off.dxil, on.dxil);
         assert_eq!(any_on.len(), any_off.len() + 1);
     }
+}
+
+/// `VICTORY_BVH_LOOP_LIMIT` keys apart only with a value, and names it; a
+/// program with a node test is one whose loops take it.
+#[test]
+fn a_walking_programs_loop_limit_is_keyed_by_its_value() {
+    let was = super::BVH_LOOP_LIMIT_TEST.replace(None);
+    let off = super::keyed_apart_any();
+    super::BVH_LOOP_LIMIT_TEST.set(Some(1024));
+    let on = super::keyed_apart_any();
+    super::BVH_LOOP_LIMIT_TEST.set(was);
+    assert_eq!(on.len(), off.len() + 1);
+    assert!(on.iter().any(|m| m.contains("VICTORY_BVH_LOOP_LIMIT=1024")));
+    assert!(super::compute_wave::walks(&native(&program(true, WHOLE)).code));
+    assert!(!super::compute_wave::walks(&[0x00, 0x00, 0x81, 0xBF]));
 }
 
 #[test]

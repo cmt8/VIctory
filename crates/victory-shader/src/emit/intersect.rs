@@ -240,7 +240,7 @@ impl<'a> Lower<'a> {
         }
         if super::super::bvh_count() && self.s.threads.is_some() {
             let found: [V; 4] = std::array::from_fn(|k| results[k].0);
-            self.bvh_count_test(at, kind, &found, descriptor, pointer, wide);
+            self.bvh_count_test(at, kind, &found, descriptor, (pointer, pointer_high));
         }
         let results = self.end_guarded(gate, &results);
         for (k, &r) in results.iter().enumerate() {
@@ -654,6 +654,19 @@ pub(in crate::emit) mod count {
     pub const THREADS: usize = 16;
     pub const MOST: usize = 17;
     pub const CHILDREN: usize = 18;
+    pub const REPEATS: usize = 19;
+    pub const REPEAT_LANES: usize = 20;
+    pub const LIMIT_REPEAT_LANES: usize = 21;
+    pub const LIMIT_REPEATS: usize = 22;
+    pub const REPEAT_BOX: usize = 23;
+    pub const REPEAT_OTHER: usize = 24;
+    pub const REPEAT_NO_COPY: usize = 25;
+    pub const LIMIT_TESTS: usize = 26;
+    /// Past the counts: whether the lane left at the loop limit, and the
+    /// node pointer of its last test numbered a power of two (two dwords).
+    pub const ABORTED: usize = super::super::super::shader::COUNT_NAMES.len();
+    pub const CHECK_LOW: usize = ABORTED + 1;
+    pub const CHECK_HIGH: usize = ABORTED + 2;
 }
 
 impl Lower<'_> {
@@ -664,7 +677,7 @@ impl Lower<'_> {
         if self.bvh_counts.is_none() {
             let zero = self.s.m.i32(0);
             let names = super::super::shader::COUNT_NAMES;
-            let globals = (0..=names.len())
+            let globals = (0..names.len() + 3)
                 .map(|n| self.s.m.private_global(&format!("victory.bvh.count.{n}"), zero))
                 .collect();
             self.bvh_counts = Some(globals);
@@ -691,8 +704,10 @@ impl Lower<'_> {
     /// Diagnostics: counts one node test of a lane that runs it, from its
     /// node, kind and results (`descriptor`: the descriptor's first two
     /// dwords, over title memory). May go on in another block.
-    fn bvh_count_test(&mut self, at: NodeAt, kind: V, results: &[V; 4], descriptor: Option<(V, V)>, pointer: V, wide: bool) {
+    fn bvh_count_test(&mut self, at: NodeAt, kind: V, results: &[V; 4], descriptor: Option<(V, V)>, pointers: (V, Option<V>)) {
         use count::*;
+        let (pointer, pointer_high) = pointers;
+        let wide = pointer_high.is_some();
         let one = self.s.m.i32(1);
         self.bvh_count_add(TESTS, one);
         if wide {
@@ -763,6 +778,43 @@ impl Lower<'_> {
         let blank = self.s.m.cmp(c, pred::EQ, any, zero);
         let zero_box = self.s.m.bin(c, Bin::And, blank, box_there);
         self.bvh_count_if(ZERO_BOX, zero_box);
+        // A walk round a cycle (Brent's): the node is the one the lane tested
+        // at its last test numbered a power of two. A tree is walked without
+        // coming back to a node within one ray.
+        let c = self.cur;
+        let (low_at, high_at) = (self.bvh_counter(CHECK_LOW), self.bvh_counter(CHECK_HIGH));
+        let tests_at = self.bvh_counter(TESTS);
+        let (check_low, check_high) = (self.s.m.load(c, low_at), self.s.m.load(c, high_at));
+        let high = pointer_high.unwrap_or(zero);
+        let same_low = self.s.m.cmp(c, pred::EQ, pointer, check_low);
+        let same_high = self.s.m.cmp(c, pred::EQ, high, check_high);
+        let again = self.s.m.bin(c, Bin::And, same_low, same_high);
+        let n = self.s.m.load(c, tests_at);
+        let k2 = k(self, 2);
+        let past_first = self.s.m.cmp(c, pred::IUGE, n, k2);
+        let again = self.s.m.bin(c, Bin::And, again, past_first);
+        self.bvh_count_if(REPEATS, again);
+        let c = self.cur;
+        let again_box = self.s.m.bin(c, Bin::And, again, is_box);
+        self.bvh_count_if(REPEAT_BOX, again_box);
+        let c = self.cur;
+        let again_other = self.s.m.bin(c, Bin::And, again, other);
+        self.bvh_count_if(REPEAT_OTHER, again_other);
+        if let Some(m) = there {
+            let c = self.cur;
+            let missing = self.s.m.bin(c, Bin::Xor, m, yes);
+            let again_missing = self.s.m.bin(c, Bin::And, again, missing);
+            self.bvh_count_if(REPEAT_NO_COPY, again_missing);
+        }
+        let c = self.cur;
+        let one = k(self, 1);
+        let before = self.s.m.bin(c, Bin::Sub, n, one);
+        let bits = self.s.m.bin(c, Bin::And, n, before);
+        let power = self.s.m.cmp(c, pred::EQ, bits, zero);
+        let new_low = self.s.m.select(c, power, pointer, check_low);
+        let new_high = self.s.m.select(c, power, high, check_high);
+        self.s.m.store(c, low_at, new_low);
+        self.s.m.store(c, high_at, new_high);
         // The 32-bit form over title memory: the structure's header at the
         // descriptor's base, and the node's place against the size it gives.
         if let (Some((word0, word1)), false) = (descriptor, wide) {
@@ -809,7 +861,7 @@ impl Lower<'_> {
         let i32t = self.s.t.i32;
         let (zero, one) = (self.s.m.i32(0), self.s.m.i32(1));
         if let Some(abort) = self.abort {
-            let g = self.bvh_counter(COUNT_NAMES.len());
+            let g = self.bvh_counter(ABORTED);
             self.s.m.store(abort, g, one);
         }
         let slot = super::super::bvh_count_slot_of(&self.x.native.code);
@@ -847,6 +899,10 @@ impl Lower<'_> {
             })
             .collect();
         let tests = loaded[TESTS];
+        let aborted = loaded[ABORTED];
+        let c = self.cur;
+        let (limited, repeated) = (self.s.m.cmp(c, pred::NE, aborted, zero), self.s.m.cmp(c, pred::NE, loaded[REPEATS], zero));
+        let both = self.s.m.bin(c, Bin::And, limited, repeated);
         for (k, &v) in loaded.iter().enumerate().take(COUNT_NAMES.len()) {
             let c = self.cur;
             // Atomic add (0), or unsigned maximum (7).
@@ -855,7 +911,11 @@ impl Lower<'_> {
                     let ran = self.s.m.cmp(c, pred::NE, tests, zero);
                     (0, self.s.m.cast(c, Cast::ZExt, ran, i32t))
                 }
-                LOOP_LIMIT => (0, loaded[COUNT_NAMES.len()]),
+                LOOP_LIMIT => (0, aborted),
+                REPEAT_LANES => (0, self.s.m.cast(c, Cast::ZExt, repeated, i32t)),
+                LIMIT_REPEAT_LANES => (0, self.s.m.cast(c, Cast::ZExt, both, i32t)),
+                LIMIT_REPEATS => (0, self.s.m.select(c, limited, loaded[REPEATS], zero)),
+                LIMIT_TESTS => (0, self.s.m.select(c, limited, tests, zero)),
                 THREADS => (0, one),
                 MOST => (7, tests),
                 _ => (0, v),

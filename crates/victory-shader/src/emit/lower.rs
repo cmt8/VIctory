@@ -13687,6 +13687,14 @@ impl<'a> Lower<'a> {
         let limit = match super::loop_limit() {
             LOOP_LIMIT if self.s.pixel => 1 << 7,
             LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
+            // Diagnostics: the loops of a program that walks ray-tracing
+            // structures (`VICTORY_BVH_LOOP_LIMIT`).
+            LOOP_LIMIT
+                if let Some(n) = super::bvh_loop_limit()
+                    && super::compute_wave::walks(&self.x.native.code) =>
+            {
+                n
+            }
             LOOP_LIMIT => 1 << 12,
             named => named,
         };

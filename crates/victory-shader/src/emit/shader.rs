@@ -91,10 +91,15 @@ pub const COUNT_DWORDS: u32 = 64;
 /// header at the descriptor's base that is not a version 6 one, a node past
 /// the size the header gives, a base of 0; lanes that tested a node; lanes
 /// that left at the translation's loop limit; lanes that ended; the most
-/// nodes a lane tested (a maximum); children box tests returned.
-pub const COUNT_NAMES: [&str; 19] = [
+/// nodes a lane tested (a maximum); children box tests returned; tests of the
+/// node the lane tested at its last test numbered a power of two (a walk
+/// round a cycle comes back to it); lanes with such a test; lanes at the loop
+/// limit with one; their such tests; such tests of box nodes, of other nodes,
+/// of pages with no copy; tests of lanes at the loop limit.
+pub const COUNT_NAMES: [&str; 27] = [
     "tests", "wide", "box16", "box32", "triangle", "other", "no-copy", "wild", "box-none", "tri-hit", "zero-box",
-    "bad-header", "past-size", "base-0", "lanes", "loop-limit", "threads", "most", "children",
+    "bad-header", "past-size", "base-0", "lanes", "loop-limit", "threads", "most", "children", "repeats",
+    "repeat-lanes", "limit-repeat-lanes", "limit-repeats", "repeat-box", "repeat-other", "repeat-no-copy", "limit-tests",
 ];
 /// From this dword of a [`SLOT_COUNTS`] run: lanes by the nodes they tested,
 /// `n` at `COUNT_HISTOGRAM + k` for `2^(k-1) <= n < 2^k` (k 1..=31).

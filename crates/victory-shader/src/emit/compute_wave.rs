@@ -322,6 +322,26 @@ const BVH_MISS: &str = "VICTORY_BVH_MISS=1: every ray-tracing node test a miss";
 /// counts what its walks do ([`super::bvh_count`]).
 const BVH_COUNT: &str = "VICTORY_BVH_COUNT=1: ray-tracing node tests counted into u252";
 
+/// [`keyed_apart`]'s mark of a compute program with a ray-tracing node test
+/// whose loops are left at [`super::bvh_loop_limit`]'s count, with the count.
+fn bvh_loop_mark() -> Option<&'static str> {
+    static MARK: OnceLock<Option<&'static str>> = OnceLock::new();
+    #[cfg(test)]
+    if let Some(n) = super::BVH_LOOP_LIMIT_TEST.get() {
+        return Some(Box::leak(format!("VICTORY_BVH_LOOP_LIMIT={n}: loops of programs with a node test").into_boxed_str()));
+    }
+    *MARK.get_or_init(|| {
+        super::bvh_loop_limit()
+            .map(|n| &*Box::leak(format!("VICTORY_BVH_LOOP_LIMIT={n}: loops of programs with a node test").into_boxed_str()))
+    })
+}
+
+/// Whether `code` (a compute program's) has a node test: its loops take
+/// [`super::bvh_loop_limit`].
+pub(super) fn walks(code: &[u8]) -> bool {
+    has_bvh(code)
+}
+
 /// Diagnostics: the run of `SLOT_COUNTS` the program of `container` counts
 /// into ([`super::bvh_count`]), for a compute program with a node test.
 pub fn bvh_count_slot(container: &[u8]) -> Option<u32> {
@@ -387,6 +407,11 @@ pub fn keyed_apart(container: &[u8], kept: bool) -> Vec<&'static str> {
     if super::bvh_count() && bvh_count_slot(container).is_some() {
         marks.push(BVH_COUNT);
     }
+    if let Some(mark) = bvh_loop_mark()
+        && bvh_count_slot(container).is_some()
+    {
+        marks.push(mark);
+    }
     if !console && !halves && !even {
         return marks;
     }
@@ -434,6 +459,9 @@ pub fn keyed_apart_any() -> Vec<&'static str> {
     }
     if super::bvh_count() {
         marks.push(BVH_COUNT);
+    }
+    if let Some(mark) = bvh_loop_mark() {
+        marks.push(mark);
     }
     marks
 }

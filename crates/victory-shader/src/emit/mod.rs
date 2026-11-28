@@ -393,6 +393,32 @@ pub fn bvh_count() -> bool {
     *ON.get_or_init(|| cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_BVH_COUNT").is_some_and(|v| v == "1"))
 }
 
+/// Diagnostics: the iterations after which a loop of a compute program with a
+/// ray-tracing node test is left (`VICTORY_BVH_LOOP_LIMIT=<n>`, 16 to 4096;
+/// diagnostics builds only; unset: the compute limit of `lower.rs`
+/// `count_iteration`, 4096, as for every compute program). A lane stopped
+/// there leaves the program as one stopped at 4096 does. To tell how much of
+/// the walking programs' time the lanes that walk to the limit take. Part of
+/// the translation of those programs only: the shader cache keys them apart
+/// ([`keyed_apart`]).
+pub fn bvh_loop_limit() -> Option<u32> {
+    #[cfg(test)]
+    if let Some(n) = BVH_LOOP_LIMIT_TEST.get() {
+        return Some(n);
+    }
+    static N: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        let n = std::env::var("VICTORY_BVH_LOOP_LIMIT").ok()?.trim().parse::<u32>().ok()?;
+        (cfg!(feature = "diagnostics") && (16..=4096).contains(&n)).then_some(n)
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`bvh_loop_limit`] on its thread (`None`: the switch's).
+    pub(crate) static BVH_LOOP_LIMIT_TEST: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
 /// The run of [`SLOT_COUNTS`] a program with code `code` counts into: a hash
 /// of its code. Two programs may share one (the host says which share).
 pub(crate) fn bvh_count_slot_of(code: &[u8]) -> u32 {
