@@ -356,7 +356,9 @@ pub fn typed_rw() -> bool {
 /// Whether every ray-tracing node test (`image_bvh_intersect_ray`,
 /// `image_bvh64_intersect_ray`) is a miss without reading its node
 /// (`lower::intersect`): while the structure builder is off the structures
-/// are never built. `VICTORY_BVH_MISS`: off, `=1` on. Part of the
+/// are never built. `VICTORY_BVH_MISS`: `=1` on, any other value off;
+/// unset, what the runtime said with [`set_bvh_miss_default`] before the
+/// first translation (off if it said nothing). Part of the
 /// translation of the programs with a node test only: the shader cache keys
 /// them apart ([`keyed_apart`]); every other program keeps its key.
 pub fn bvh_miss() -> bool {
@@ -365,7 +367,23 @@ pub fn bvh_miss() -> bool {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_MISS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| match std::env::var_os("VICTORY_BVH_MISS") {
+        Some(v) => v == "1",
+        None => BVH_MISS_DEFAULT.load(std::sync::atomic::Ordering::Relaxed),
+    })
+}
+
+/// What an unset `VICTORY_BVH_MISS` is taken as ([`set_bvh_miss_default`]).
+static BVH_MISS_DEFAULT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Sets what an unset `VICTORY_BVH_MISS` means ([`bvh_miss`]); to take
+/// effect, before the first program is translated. The runtime says on
+/// while the ray-tracing structure builder is off: the title's node tests
+/// then walk memory no build wrote, and with such walks the faces of the
+/// interior cutscene came out pale and glossy (waxy) in 5 of 9 runs, with
+/// the walks ended at the root in none of 4 (runs rg1-rg14, 2026-11-28).
+pub fn set_bvh_miss_default(on: bool) {
+    BVH_MISS_DEFAULT.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[cfg(test)]
