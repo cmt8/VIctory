@@ -178,8 +178,22 @@ fork's constant.
 | `VICTORY_AMBIENT=constant:<level>` | the same light everywhere |
 | `VICTORY_AMBIENT_SHADE=<strength>,<metres>` | the creases (1,0.6) |
 | `VICTORY_AMBIENT_AIR=<multiple>` | what the air scatters is bounded by a multiple of the light around (off: the brown veil in the day room stays with it, light-14) |
+| `VICTORY_AMBIENT_SPECULAR=<share>[,<sky>]` | the stand-in for reflections (below); unset: on, as `1` (share 1, none of the sky); `0`: off, the title's sky |
+| `VICTORY_AMBIENT_SPECULAR_ALPHA=1` | the stand-in for reflections on the alpha layer too (unset: opaque surfaces only; on water the estimate is dark) |
 
-It is off while the builder runs.
+Reflections are traced too, at half the picture's size. Rays the title's
+screen-space march does not resolve find nothing, and `CS_RayMiss` gives them
+the sky's light from the sky's cube maps, 100 or more times what the room
+holds: eyes and floors glow in interiors. `VICTORY_AMBIENT_SPECULAR` puts the
+same estimate, taken along the reflected direction, in right after that
+program; the screen-space resolve that comes next still writes what it found
+over it. It is on by default (measured: the boat 57.8 against 57.5 ms a frame;
+the eyes in the interior cutscene no longer glow; outdoor frames unchanged).
+With it on every pass of the stand-in takes 19 root constants instead of 17,
+and the light visible surfaces send out is kept every frame, whatever
+`VICTORY_AMBIENT` says. `VICTORY_AMBIENT_SPECULAR=0` leaves all of that out.
+
+Both stand-ins are off while the builder runs.
 
 ## Where to look
 

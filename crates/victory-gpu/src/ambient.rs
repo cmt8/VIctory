@@ -39,10 +39,10 @@
 //! light seen on screen; the others go to the structures, find nothing, and
 //! `CS_RayMiss` gives each the sky's light from the sky's cube maps (in a
 //! cutscene frame, capture haze2: 10 to 30 against 0.01 to 0.1 for the room
-//! the eyes and floors are in, and blue). `VICTORY_AMBIENT_SPECULAR` puts in,
-//! right after that program, the same estimate taken along the reflected
-//! direction ([`Role::Miss`]); the screen-space resolve that comes next
-//! still writes what it found over it. (readmet3xt-lab/foxhound 2db59d4,
+//! the eyes and floors are in, and blue). `VICTORY_AMBIENT_SPECULAR` (on by
+//! default, as `1`; `0` turns it off) puts in, right after that program, the
+//! same estimate taken along the reflected direction ([`Role::Miss`]); the
+//! screen-space resolve that comes next still writes what it found over it. (readmet3xt-lab/foxhound 2db59d4,
 //! f89b79d, d226814, bda6e59, 9b91d27, 9f6fb77, beside this tree's diffuse
 //! stand-in: its own switch, its own gate, its own pass.)
 
@@ -66,7 +66,8 @@ pub(crate) enum Role {
     Air,
     /// Gives the reflection rays that found nothing the sky's light
     /// (`CS_RayMiss`, not `CS_RayMiss_Volumetrics` nor the screen probes').
-    /// Named only with `VICTORY_AMBIENT_SPECULAR` set.
+    /// Named only with the stand-in for reflections on
+    /// (`VICTORY_AMBIENT_SPECULAR`, unless `=0`).
     Miss,
 }
 
@@ -176,8 +177,10 @@ pub(crate) fn on() -> bool {
 /// `VICTORY_AMBIENT_SPECULAR=<share>[,<sky>]`: reflections whose rays found
 /// nothing take `share` of the estimate along the reflected direction
 /// instead of the sky's light; `sky` (0 to 1, 0 if not given) of them stays
-/// the title's sky, made no brighter than the estimate. Unset or 0: the
-/// title's sky.
+/// the title's sky, made no brighter than the estimate. Unset (or empty): as
+/// `1` ([`SPECULAR_DEFAULT`]). `0` (or `off`, or what is no number): the
+/// title's sky, and none of the stand-in's parts for reflections (no
+/// [`Role::Miss`], 17 constants, no pass of its own).
 #[derive(Clone, Copy, PartialEq, Debug)]
 struct Specular {
     share: f32,
@@ -191,14 +194,35 @@ fn parse_specular(set: &str) -> Option<Specular> {
     Some(Specular { share, sky })
 }
 
-fn specular() -> Option<Specular> {
-    static SET: OnceLock<Option<Specular>> = OnceLock::new();
-    *SET.get_or_init(|| parse_specular(&std::env::var("VICTORY_AMBIENT_SPECULAR").unwrap_or_default()))
+/// What an unset `VICTORY_AMBIENT_SPECULAR` is taken as: a share of 1 and
+/// none of the title's sky, the setting of the runs that made it the default
+/// (the boat 57.8 against 57.5 ms a frame; the eyes in the interior
+/// cutscene no longer glow; outdoor frames as they were).
+const SPECULAR_DEFAULT: &str = "1";
+
+/// What `VICTORY_AMBIENT_SPECULAR` says ([`parse_specular`]), unset or
+/// empty being [`SPECULAR_DEFAULT`].
+fn specular_said(value: Option<&str>) -> Option<Specular> {
+    parse_specular(value.filter(|v| !v.trim().is_empty()).unwrap_or(SPECULAR_DEFAULT))
 }
 
-/// Whether the stand-in for reflections is on: set, and the title's rays
-/// find nothing. Whatever `VICTORY_AMBIENT` says ([`on`] is the diffuse
-/// stand-in's).
+fn specular() -> Option<Specular> {
+    static SET: OnceLock<Option<Specular>> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let set = specular_said(std::env::var("VICTORY_AMBIENT_SPECULAR").ok().as_deref());
+        match set {
+            Some(Specular { share, sky }) => tracing::info!(
+                "a stand-in for reflections whose rays found nothing, while the ray-tracing builder does not run (VICTORY_AMBIENT_SPECULAR: on, {share},{sky}; =0 turns it off)"
+            ),
+            None => tracing::info!("no stand-in for reflections: the title's sky (VICTORY_AMBIENT_SPECULAR=0)"),
+        }
+        set
+    })
+}
+
+/// Whether the stand-in for reflections is on: not turned off, and the
+/// title's rays find nothing (the builder does not run). Whatever
+/// `VICTORY_AMBIENT` says ([`on`] is the diffuse stand-in's).
 pub(crate) fn specular_on() -> bool {
     specular().is_some() && !crate::pipeline::builder_runs()
 }
@@ -696,7 +720,8 @@ struct Pass {
     gather: ID3D12PipelineState,
     raise: ID3D12PipelineState,
     air: ID3D12PipelineState,
-    /// The reflections' pass, made only with `VICTORY_AMBIENT_SPECULAR` set.
+    /// The reflections' pass, made only with the stand-in for reflections on
+    /// (`VICTORY_AMBIENT_SPECULAR`, unless `=0`).
     reflect: Option<ID3D12PipelineState>,
     cells: ID3D12Resource,
     points: ID3D12Resource,
@@ -829,12 +854,14 @@ pub(crate) struct Views {
 /// For the line every ten seconds: what the stand-in for reflections did.
 struct Said {
     /// Dispatches of the miss program it followed, frames they were in,
-    /// and those it left as they were: of water or the alpha layer, and
-    /// before a frame's light was kept (or no tables).
+    /// and those it left as they were: of water or the alpha layer, before
+    /// a frame's light was kept, and those whose rays' image or picture's
+    /// depth was not found (or not of the format and size it takes).
     ran: AtomicU64,
     frames: AtomicU64,
     water: AtomicU64,
     not_ready: AtomicU64,
+    not_found: AtomicU64,
     last_frame: AtomicU64,
     /// Bit 0 opaque surfaces, 1 alpha, 2 water, 3 others.
     layers: AtomicU64,
@@ -845,6 +872,7 @@ static SAID_MISS: Said = Said {
     frames: AtomicU64::new(0),
     water: AtomicU64::new(0),
     not_ready: AtomicU64::new(0),
+    not_found: AtomicU64::new(0),
     last_frame: AtomicU64::new(u64::MAX),
     layers: AtomicU64::new(0),
 };
@@ -854,7 +882,11 @@ static SAID_MISS: Said = Said {
 pub(crate) enum MissNote {
     Ran(u32),
     Water,
+    /// Before a frame's light was kept: the estimate has nothing yet.
     NotReady,
+    /// The rays' image or the picture's depth not found, or not of the
+    /// format and size the pass takes.
+    NotFound,
 }
 
 /// Counts what came of a dispatch of the miss program; every ten seconds an
@@ -880,6 +912,9 @@ pub(crate) fn note_miss(note: MissNote) {
         MissNote::NotReady => {
             s.not_ready.fetch_add(1, Relaxed);
         }
+        MissNote::NotFound => {
+            s.not_found.fetch_add(1, Relaxed);
+        }
     }
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
@@ -902,14 +937,16 @@ pub(crate) fn note_miss(note: MissNote) {
     tracing::info!(
         "a stand-in for reflections (VICTORY_AMBIENT_SPECULAR={share},{sky}) in the last {:.0} s: \
          {} frames, {} dispatches of CS_RayMiss followed (surfaces: {}), each by an estimate along \
-         the reflected direction put in right after it (before CS_ResolveScreenSpace); {} of water or the alpha layer \
-         and {} before a frame's light was kept left as the title had them",
+         the reflected direction put in right after it (before CS_ResolveScreenSpace); left as the title had them: \
+         {} of water or the alpha layer, {} before a frame's light was kept, {} whose rays' image or picture's \
+         depth was not found",
         now.duration_since(since).as_secs_f32(),
         s.frames.swap(0, Relaxed),
         s.ran.swap(0, Relaxed),
         if named.is_empty() { "none".to_owned() } else { named.join(", ") },
         s.water.swap(0, Relaxed),
         s.not_ready.swap(0, Relaxed),
+        s.not_found.swap(0, Relaxed),
     );
 }
 
@@ -1062,6 +1099,23 @@ mod tests {
         assert_eq!(parse_band("x,1"), None);
     }
 
+    /// Unset, the stand-in for reflections is on with the setting of the
+    /// runs that were judged (as `1`: a share of 1, none of the sky); `0`
+    /// turns it off (no share of 0 that is on).
+    #[test]
+    fn the_stand_in_for_reflections_is_on_unless_told_0() {
+        let judged = Some(Specular { share: 1.0, sky: 0.0 });
+        assert_eq!(specular_said(None), judged);
+        assert_eq!(specular_said(None), parse_specular("1"));
+        assert_eq!(specular_said(Some("")), judged);
+        assert_eq!(specular_said(Some("1")), judged);
+        assert_eq!(specular_said(Some("0")), None);
+        assert_eq!(specular_said(Some(" 0 ")), None);
+        assert_eq!(specular_said(Some("0,0.5")), None);
+        assert_eq!(specular_said(Some("off")), None);
+        assert_eq!(specular_said(Some("0.6,0.25")), Some(Specular { share: 0.6, sky: 0.25 }));
+    }
+
     #[test]
     fn specular_settings() {
         assert_eq!(parse_specular(""), None);
@@ -1074,15 +1128,18 @@ mod tests {
     }
 
     /// The miss program by its name (foxhound 2db59d4's cases; there they
-    /// are of `role`, which here names the miss program only with
-    /// `VICTORY_AMBIENT_SPECULAR` set).
+    /// are of `role`, which here names the miss program only with the
+    /// stand-in for reflections on: `VICTORY_AMBIENT_SPECULAR` not `0`).
     #[test]
     fn the_miss_program_by_name() {
         assert!(is_miss(b"..CS_RayMiss_de6b91a6_Wrapped.."));
         assert!(!is_miss(b"..CS_RayMiss_Volumetrics_3c5d8c00_Wrapped.."));
         assert!(!is_miss(b"..CS_ScreenProbe_RayMiss_80a88544_Wrapped.."));
         if specular().is_none() {
-            assert_eq!(role(b"..CS_RayMiss_de6b91a6_Wrapped.."), None, "not named with the switch unset");
+            assert_eq!(role(b"..CS_RayMiss_de6b91a6_Wrapped.."), None, "not named with the switch at 0");
+        } else {
+            assert_eq!(role(b"..CS_RayMiss_de6b91a6_Wrapped.."), Some(Role::Miss), "named with the switch on");
+            assert_eq!(role(b"..CS_RayMiss_Volumetrics_3c5d8c00_Wrapped.."), None);
         }
     }
 

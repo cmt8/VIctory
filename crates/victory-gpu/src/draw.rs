@@ -3282,7 +3282,37 @@ impl State {
             d.Width.abs_diff(w * 2) <= 1 && u64::from(d.Height).abs_diff(u64::from(h) * 2) <= 1
         };
         let half = image.as_ref().map(|(d, _)| (d.Width, d.Height));
-        let depth = usual_depth(MISS_DEPTH)
+        // What the program's tables hold, place by place, with each place's
+        // record as the title wrote it where the place gives no texture.
+        let held = || {
+            let record = |(slot, offset): (u8, u32)| match self.roots_ref(true).get(usize::from(slot)) {
+                Some(Root::Table(table)) => describe_view(crate::descriptor::view(table + u64::from(offset) * 4)),
+                _ => "no table".to_owned(),
+            };
+            let held: Vec<String> = t
+                .used
+                .iter()
+                .filter(|u| u.root == RootType::Table && matches!(u.kind, ResourceType::Uav | ResourceType::Srv))
+                .map(|u| {
+                    let at = (u.slot, u.table_offset_dwords);
+                    match entry(u.kind, at) {
+                        Some((d, _)) => format!(
+                            "{:?}{:?} {}x{} f{} dim{}{}",
+                            u.kind,
+                            at,
+                            d.Width,
+                            d.Height,
+                            d.Format.0,
+                            d.Dimension.0,
+                            if stencil_at(at) { " stencil" } else { "" }
+                        ),
+                        None => format!("{:?}{:?} - ({})", u.kind, at, record(at)),
+                    }
+                })
+                .collect();
+            held.join("; ")
+        };
+        let own = usual_depth(MISS_DEPTH)
             .filter(|(d, _)| half.is_some_and(|half| twice(d, half)))
             .or_else(|| {
                 scan(ResourceType::Srv, &|d| {
@@ -3297,37 +3327,50 @@ impl State {
                         && half.is_some_and(|half| twice(d, half))
                 })
             });
+        let own_found = own.is_some();
+        let depth = own.or_else(|| half.and_then(|half| self.frame_depth(list, half)));
+        if !own_found && depth.is_some() {
+            // Once: what the program's own places held when the picture's
+            // depth came from the frame's table.
+            static SAID: AtomicU64 = AtomicU64::new(0);
+            if SAID.fetch_add(1, Ordering::Relaxed) == 0 {
+                tracing::info!(program = %p.name, tables = %held(), "reflections stand-in: the miss program's own places hold no picture's depth (counted once)");
+            }
+        }
+        let found = (of_size(&image), of_size(&depth));
         let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
             once!(?role, "no stand-in for the indirect light: other tables");
-            crate::ambient::note_miss(MissNote::NotReady);
-            // Once per program: what its tables hold, so one run names the
-            // place of the rays' image and of the depth (d226814).
-            static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+            crate::ambient::note_miss(MissNote::NotFound);
+            // Now and then per program (at most every 20 s, 24 lines in all):
+            // what its tables hold, so one run names the place of the rays'
+            // image and of the depth (d226814), with each place's record as
+            // the title wrote it where the place gives no texture.
+            static SEEN: std::sync::Mutex<Vec<(String, std::time::Instant)>> = std::sync::Mutex::new(Vec::new());
+            static LINES: AtomicU64 = AtomicU64::new(0);
             let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-            if seen.len() < 16 && !seen.contains(&p.name) {
-                seen.push(p.name.clone());
-                let held: Vec<String> = t
-                    .used
-                    .iter()
-                    .filter(|u| u.root == RootType::Table && matches!(u.kind, ResourceType::Uav | ResourceType::Srv))
-                    .map(|u| {
-                        let at = (u.slot, u.table_offset_dwords);
-                        match entry(u.kind, at) {
-                            Some((d, _)) => format!(
-                                "{:?}{:?} {}x{} f{} dim{}{}",
-                                u.kind,
-                                at,
-                                d.Width,
-                                d.Height,
-                                d.Format.0,
-                                d.Dimension.0,
-                                if stencil_at(at) { " stencil" } else { "" }
-                            ),
-                            None => format!("{:?}{:?} -", u.kind, at),
-                        }
-                    })
-                    .collect();
-                tracing::info!(program = %p.name, tables = %held.join("; "), "reflections stand-in: a miss program whose rays' image or depth was not found");
+            let now = std::time::Instant::now();
+            let room = seen.len() < 16;
+            let due = match seen.iter_mut().find(|(name, _)| *name == p.name) {
+                Some((_, last)) if now.duration_since(*last).as_secs() >= 20 => {
+                    *last = now;
+                    true
+                }
+                Some(_) => false,
+                None if room => {
+                    seen.push((p.name.clone(), now));
+                    true
+                }
+                None => false,
+            };
+            if due && LINES.fetch_add(1, Ordering::Relaxed) < 24 {
+                tracing::info!(
+                    program = %p.name,
+                    image = ?found.0,
+                    depth = ?found.1,
+                    frame_depths = %self.frame_depths(),
+                    tables = %held(),
+                    "reflections stand-in: a miss program whose rays' image or depth was not found"
+                );
             }
             return false;
         };
@@ -3345,7 +3388,7 @@ impl State {
             && seen.Width <= of.Width * 4;
         if of.Format.0 != 26 || !sizes || of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
             once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");
-            crate::ambient::note_miss(MissNote::NotReady);
+            crate::ambient::note_miss(MissNote::NotFound);
             return false;
         }
         let ran = crate::ambient::after(list, role, &Views {
@@ -3373,6 +3416,161 @@ impl State {
         at: (u8, u32),
     ) -> Option<(D3D12_RESOURCE_DESC, D3D12_GPU_DESCRIPTOR_HANDLE)> {
         self.table_view_as(t, compute, kind, at, false)
+    }
+
+    /// The picture's depth where the miss program's own places hold none, for
+    /// a rays' image of `half` (width, height): in the opening's cutscenes
+    /// its usual place is a 1x1 texture, and the depth is still in the
+    /// frame's table (root parameter 0) at a place the program does not read
+    /// (VIctory-NVIDIA 64d4931b3, trustno1-coder: capture haze2, place 752,
+    /// the depth plane of the depth-stencil target). Every slot of that table
+    /// inside the bound view heap, up to 1,600 dwords: the first 2D depth of
+    /// twice `half` each way with a stencil plane beside it (32-bit depth,
+    /// 8-bit stencil), else the first plain 32-bit one. Never a view of a
+    /// stencil plane.
+    ///
+    /// The program does not read that place, so its host slot is made now
+    /// from the title's record as a table entry the draw reads is
+    /// ([`State::table_entry`]: the title's own slot, brought up to date, its
+    /// texture made readable to shaders in `list`), and the slot of the
+    /// title's heap is the one named, not one of a table made afresh for the
+    /// program (those hold only what it reads).
+    fn frame_depth(
+        &self,
+        list: &HostList,
+        (w, h): (u64, u32),
+    ) -> Option<(D3D12_RESOURCE_DESC, D3D12_GPU_DESCRIPTOR_HANDLE)> {
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R32_TYPELESS,
+            DXGI_FORMAT_R32G8X24_TYPELESS,
+        };
+        let mut wide = None;
+        let mut plain = None;
+        for (offset, d, handle) in self.frame_table_textures() {
+            let fits = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                && d.Width.abs_diff(w * 2) <= 1
+                && u64::from(d.Height).abs_diff(u64::from(h) * 2) <= 1;
+            if !fits {
+                continue;
+            }
+            match d.Format {
+                DXGI_FORMAT_R32G8X24_TYPELESS | DXGI_FORMAT_D32_FLOAT_S8X24_UINT => {
+                    wide = Some((offset, d, handle));
+                    break;
+                }
+                DXGI_FORMAT_R32_TYPELESS | DXGI_FORMAT_D32_FLOAT if plain.is_none() => plain = Some((offset, d, handle)),
+                _ => {}
+            }
+        }
+        let with_stencil = wide.is_some();
+        let (offset, d, at) = wide.or(plain)?;
+        let handle = self.frame_slot_ready(list, at, d.Format)?;
+        static SAID: AtomicU64 = AtomicU64::new(0);
+        if SAID.fetch_add(1, Ordering::Relaxed) == 0 {
+            tracing::info!(
+                offset,
+                with_stencil,
+                width = d.Width,
+                height = d.Height,
+                format = d.Format.0,
+                "reflections stand-in: the picture's depth taken from the frame's table, a place the miss program does not read (VIctory-NVIDIA 64d4931b3; counted once)"
+            );
+        }
+        Some((d, handle))
+    }
+
+    /// The host slot of the title's descriptor at `at` (a slot of the
+    /// bound view heap), made now from the title's record and its texture
+    /// made readable to shaders in `list`, as [`State::table_entry`] does
+    /// for a place a shader reads; None unless it still is a shader view of
+    /// a texture of `format`.
+    fn frame_slot_ready(&self, list: &HostList, at: u64, format: DXGI_FORMAT) -> Option<D3D12_GPU_DESCRIPTOR_HANDLE> {
+        let heap = self.heap_of(at)?;
+        let (host, index) = (heap.host()?, heap.index(at)?);
+        let view = host.mirror_required(index, at, true)?;
+        let shown = crate::descriptor::host::placed_texture(&view).unwrap_or_else(|| view.clone());
+        let View::Shader(resource, _) = shown else {
+            return None;
+        };
+        let texture = crate::resource::host_resource(resource as This)?;
+        // SAFETY: a live resource.
+        if unsafe { texture.GetDesc() }.Format != format {
+            return None;
+        }
+        readable(list, ResourceType::Srv, &view);
+        host.remake_written(index, at, true);
+        host.texture_slot_tabled(index, true);
+        Some(host.gpu_handle(index))
+    }
+
+    /// The shader views of 2D textures in the slots of the bound compute
+    /// table at root parameter 0, up to 1,600 dwords and inside the bound
+    /// view heap: (dwords into the table, the texture's description, the
+    /// slot's address in the title's heap). Placed views are taken as their
+    /// host textures; views of a stencil plane are left out. Only read.
+    fn frame_table_textures(&self) -> Vec<(u32, D3D12_RESOURCE_DESC, u64)> {
+        let mut found = Vec::new();
+        let Some(Root::Table(table)) = self.roots_ref(true).first() else {
+            return found;
+        };
+        let Some(heap) = self.heap_of(*table) else {
+            return found;
+        };
+        for offset in (0..1600u32).step_by(8) {
+            let at = table + u64::from(offset) * 4;
+            // (Only slots of the heap are read.)
+            if heap.index(at).is_none() {
+                break;
+            }
+            let Some(view) = crate::descriptor::view(at) else {
+                continue;
+            };
+            // (A placed view as the host texture made for it, if one is:
+            // this looks, it makes nothing.)
+            let view = placed_made(&view).unwrap_or(view);
+            let View::Shader(resource, desc) = view else {
+                continue;
+            };
+            // Not a view of a stencil plane (d226814, bda6e59).
+            if desc.is_some_and(|d| matches!(crate::resource::pc_format(d[0]), 22 | 47) || (d[1] == 4 && d[6] == 1)) {
+                continue;
+            }
+            let Some(texture) = crate::resource::host_resource(resource as This) else {
+                continue;
+            };
+            // SAFETY: a live resource.
+            let d = unsafe { texture.GetDesc() };
+            if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+                continue;
+            }
+            found.push((offset, d, at));
+        }
+        found
+    }
+
+    /// For the stand-in for reflections' line: the 2D textures of 32-bit
+    /// depth formats in the frame's table ([`State::frame_table_textures`]).
+    fn frame_depths(&self) -> String {
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_TYPELESS,
+            DXGI_FORMAT_R32G8X24_TYPELESS,
+        };
+        let depths: Vec<String> = self
+            .frame_table_textures()
+            .into_iter()
+            .filter(|(_, d, _)| {
+                matches!(
+                    d.Format,
+                    DXGI_FORMAT_R32_TYPELESS
+                        | DXGI_FORMAT_R32_FLOAT
+                        | DXGI_FORMAT_D32_FLOAT
+                        | DXGI_FORMAT_R32G8X24_TYPELESS
+                        | DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+                )
+            })
+            .map(|(offset, d, _)| format!("{offset}: {}x{} f{}", d.Width, d.Height, d.Format.0))
+            .collect();
+        if depths.is_empty() { "none".to_owned() } else { depths.join("; ") }
     }
 
     /// [`State::table_view`]; with `placed`, a view of a texture the title
@@ -4862,6 +5060,56 @@ impl State {
         crate::dropwhy::ran(self.pipeline as This);
         true
     }
+}
+
+/// For the stand-in for reflections' line: what a table place's record
+/// names, as the title wrote it.
+fn describe_view(view: Option<View>) -> String {
+    match view {
+        None => "no record".to_owned(),
+        Some(View::Constant(_, size)) => format!("constant buffer of {size} bytes"),
+        Some(View::Shader(r, d)) => match crate::resource::host_resource(r as This) {
+            Some(_) => format!("shader view{}", d.map_or(String::new(), |d| format!(" f{} dim{}", d[0], d[1]))),
+            None => "shader view of no host resource".to_owned(),
+        },
+        Some(View::Unordered(..)) => "unordered view".to_owned(),
+        Some(View::Sampler(_) | View::ConsoleSampler(_)) => "sampler".to_owned(),
+        Some(ref placed @ View::Placed(unordered, resource, desc)) => {
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            let resolved = !unordered && placed_made(placed).is_some();
+            format!(
+                "placed {} dim{} {}x{} f{} view f{} dim{} at {address:#x}{}",
+                if unordered { "unordered" } else { "shader" },
+                resource[0],
+                resource[4],
+                resource[6],
+                resource[8],
+                desc[0],
+                desc[1],
+                if resolved { ", its host texture made" } else { ", no host texture made" }
+            )
+        }
+    }
+}
+
+/// A shader view of a texture the title placed in memory as a view of the
+/// host texture made for it, if one has been made
+/// (`crate::descriptor::host::placed_texture` without the making).
+fn placed_made(view: &View) -> Option<View> {
+    let View::Placed(false, resource, desc) = view else {
+        return None;
+    };
+    if resource[0] == 1 {
+        return None;
+    }
+    let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+    let texture = crate::resource::texture_at_made(address, resource)?;
+    Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+}
+
+/// (Width, height) of a found view, for the line.
+fn of_size(found: &Option<(D3D12_RESOURCE_DESC, D3D12_GPU_DESCRIPTOR_HANDLE)>) -> Option<(u64, u32, i32)> {
+    found.as_ref().map(|(d, _)| (d.Width, d.Height, d.Format.0))
 }
 
 /// `DispatchX`: the counts are threads (the console's dispatch initiator bit
