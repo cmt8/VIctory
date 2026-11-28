@@ -253,8 +253,8 @@ impl Worker {
             self.list.Close()?;
             self.queue.ExecuteCommandLists(&[Some(self.list.cast()?)]);
             self.queue.Signal(&self.fence, value)?;
-            // (Without an event: this waits.)
-            self.fence.SetEventOnCompletion(value, windows::Win32::Foundation::HANDLE::default())?;
+            // (Without an event: this waits. A lost device ends the run.)
+            crate::host::wait_fence(&self.fence, value, windows::Win32::Foundation::HANDLE::default(), "uploads ahead")?;
         }
         Ok(())
     }

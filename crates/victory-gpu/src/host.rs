@@ -387,10 +387,7 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
         a.queue.ExecuteCommandLists(&[Some(a.list.clone())]);
         a.value += 1;
         a.queue.Signal(&a.fence, a.value)?;
-        if a.fence.GetCompletedValue() < a.value {
-            a.fence.SetEventOnCompletion(a.value, a.event)?;
-            WaitForSingleObject(a.event, INFINITE);
-        }
+        wait_fence(&a.fence, a.value, a.event, "new card memory waited for until it is mapped")?;
     }
     let us = started.elapsed().as_micros() as u64;
     MAPPED[0].fetch_add(1, Ordering::Relaxed);
@@ -901,11 +898,13 @@ fn card_clock_watch(clock: &'static CardClock) {
             }
             state.0
         };
+        // A lost device ends the run there; any other failure only stops
+        // the clock (a measurement), said once, rather than taking the
+        // value for reached.
         // SAFETY: the clock's fence and this thread's event.
-        unsafe {
-            if clock.fence.SetEventOnCompletion(target, event).is_ok() {
-                WaitForSingleObject(event, INFINITE);
-            }
+        if let Err(e) = unsafe { wait_fence(&clock.fence, target, event, "the card's clock") } {
+            tracing::warn!(error = %e, target, "the card's clock could not wait for its fence: it stops (its line counts no more idle time)");
+            return;
         }
         seen = target;
         let mut state = clock.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -4016,6 +4015,39 @@ fn host_fence_completion_rejects_removed_device() {
     assert!(fence_reached(8, 7));
 }
 
+/// [`wait_fence`] returns only once the value is there: at once if it is
+/// already, with an event or without one, and not early for a signal left
+/// on the event.
+#[cfg(test)]
+#[test]
+fn a_fence_wait_returns_only_once_the_value_is_there() {
+    let _turn = crate::indirect::tests::warp_turn();
+    let Some(device) = crate::inplace::tests::warp() else { return };
+    struct Sent(ID3D12Fence);
+    // SAFETY: fences are free-threaded.
+    unsafe impl Send for Sent {}
+    // SAFETY: a fence and an event of the test's own, alive for its waits.
+    unsafe {
+        let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+        let event = CreateEventW(None, false, false, None).unwrap();
+        fence.Signal(2).unwrap();
+        wait_fence(&fence, 2, event, "test").unwrap();
+        wait_fence(&fence, 1, HANDLE::default(), "test").unwrap();
+        // A signal left over: the wait goes on until the value is there.
+        windows::Win32::System::Threading::SetEvent(event).unwrap();
+        let sent = Sent(fence.clone());
+        let signaller = std::thread::spawn(move || {
+            let sent = sent;
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            sent.0.Signal(3).unwrap();
+        });
+        wait_fence(&fence, 3, event, "test").unwrap();
+        assert!(fence.GetCompletedValue() >= 3, "the wait ended before the value");
+        signaller.join().unwrap();
+        let _ = windows::Win32::Foundation::CloseHandle(event);
+    }
+}
+
 /// Whether a fence's completed value shows `target` run. `u64::MAX` is not
 /// a value the card reaches: it is what `GetCompletedValue` answers when the
 /// device is gone.
@@ -4023,30 +4055,88 @@ fn fence_reached(completed: u64, target: u64) -> bool {
     completed != u64::MAX && completed >= target
 }
 
-/// Waits for `target` on `fence` and reports what went wrong instead of
-/// carrying on: a failed wait used to fall through to the landing step with
-/// nothing run, settling flights off an unsent fence value, and a lost
-/// device (a completed value of `u64::MAX`) made every wait pass at once.
+/// A fence of ours says the host device is gone, or a wait that has no
+/// other way out failed: the run ends ([`fail`]), and it is said once. A
+/// second thread that finds the same while the first is ending the run says
+/// nothing and goes no further; only if the run has not ended ten seconds
+/// later (the first might wait for something the second holds) does it end
+/// the run itself.
+pub(crate) fn fence_failed(what: std::fmt::Arguments) -> ! {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if SAID.swap(true, Ordering::AcqRel) {
+        std::thread::sleep(std::time::Duration::from_secs(10));
+    }
+    fail(what)
+}
+
+/// Waits until `fence` has reached `target`; a null `event` waits inside
+/// `SetEventOnCompletion`. Err when the call or the wait fails, for the
+/// caller's own way out, as before. It never returns with the device gone:
+/// a completed value of `u64::MAX`, before or after the wait (also when the
+/// wait failed), ends the run, said once ([`fence_failed`]); every wait
+/// used to take that value for reached and go on with nothing run. A wake
+/// before the value (a signal left on the event) waits again.
 ///
 /// # Safety
 ///
-/// `event` is the calling thread's own, never closed while it waits.
+/// `event` is null, or the caller's own and waited on by no one else
+/// meanwhile, and not closed while it waits.
+pub(crate) unsafe fn wait_fence(
+    fence: &ID3D12Fence,
+    target: u64,
+    event: HANDLE,
+    context: &str,
+) -> windows::core::Result<()> {
+    let gone = |completed: u64, why: std::fmt::Arguments| {
+        if completed == u64::MAX {
+            fence_failed(format_args!(
+                "{context}: the fence answers {completed:#x} while value {target} is waited for{why}: \
+                 the host device is gone, and no fence is taken as reached any more"
+            ));
+        }
+    };
+    loop {
+        // SAFETY: the caller's fence.
+        let completed = unsafe { fence.GetCompletedValue() };
+        gone(completed, format_args!(""));
+        if fence_reached(completed, target) {
+            return Ok(());
+        }
+        // SAFETY: the caller's fence and event.
+        let waited = unsafe { fence.SetEventOnCompletion(target, event) }.and_then(|()| {
+            if event.0.is_null() {
+                return Ok(());
+            }
+            // SAFETY: the caller's event.
+            match unsafe { WaitForSingleObject(event, INFINITE) } {
+                WAIT_OBJECT_0 => Ok(()),
+                WAIT_FAILED => Err(windows::core::Error::from_thread()),
+                status => Err(windows::core::Error::new(
+                    windows::Win32::Foundation::E_FAIL,
+                    format!("unexpected fence wait result {:#x}", status.0),
+                )),
+            }
+        });
+        if let Err(e) = waited {
+            // SAFETY: as above.
+            gone(unsafe { fence.GetCompletedValue() }, format_args!(" (the wait failed: {e})"));
+            return Err(e);
+        }
+    }
+}
+
+/// [`wait_fence`] for a wait that has no other way out: a failure ends the
+/// run, said once, instead of going on as if the card had run what was
+/// waited for. (The late helper went on to settle flights off a value the
+/// card never reached; the relay slept a millisecond and asked again.)
+///
+/// # Safety
+///
+/// As [`wait_fence`].
 unsafe fn wait_host_fence(fence: &ID3D12Fence, target: u64, event: HANDLE, context: &str) {
-    // SAFETY: the caller's fence and event, alive for the whole wait.
-    if let Err(e) = unsafe { fence.SetEventOnCompletion(target, event) } {
-        fail(format_args!(
-            "{context}: SetEventOnCompletion({target}) failed: {e}"
-        ));
-    }
-    let status = unsafe { WaitForSingleObject(event, INFINITE) };
-    if status != WAIT_OBJECT_0 {
-        fail(format_args!("{context}: fence wait failed: {status:?}"));
-    }
-    let completed = unsafe { fence.GetCompletedValue() };
-    if !fence_reached(completed, target) {
-        fail(format_args!(
-            "{context}: fence {completed} did not reach {target}"
-        ));
+    // SAFETY: the caller's.
+    if let Err(e) = unsafe { wait_fence(fence, target, event, context) } {
+        fence_failed(format_args!("{context}: waiting for fence value {target} failed: {e}"));
     }
 }
 
@@ -4089,10 +4179,13 @@ fn late_helper() {
         };
         // The card first, without the submission lock: the submitting
         // thread prepares and sends meanwhile.
-        #[cfg(feature = "diagnostics")]
-        let _card = crate::timeline::card_wait(Some(target));
-        // SAFETY: our fence and event.
-        unsafe { wait_host_fence(&host.fence, target, event, "late helper") };
+        {
+            // (The span ends with the wait, as before.)
+            #[cfg(feature = "diagnostics")]
+            let _card = crate::timeline::card_wait(Some(target));
+            // SAFETY: our fence and this thread's event.
+            unsafe { wait_host_fence(&host.fence, target, event, "the thread that settles submissions sent ahead") };
+        }
         {
             let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
             // Something newer went up meanwhile: the card is waited for
@@ -4224,6 +4317,15 @@ fn relay_worker() {
                     .collect();
                 // SAFETY: a plain query.
                 let completed = unsafe { host.fence.GetCompletedValue() };
+                if completed == u64::MAX {
+                    // The device is gone: every flight would count as run,
+                    // and their bytes would be landed with nothing run.
+                    drop(line);
+                    fence_failed(format_args!(
+                        "the thread that lands submissions sent ahead (VICTORY_RELAY=1): the fence answers {completed:#x} \
+                         with flights to land: the host device is gone, and no fence is taken as reached any more"
+                    ));
+                }
                 let n = landable(&fences, completed);
                 if n == 0 {
                     // The first thing is a flight the card has not run.
@@ -4251,7 +4353,7 @@ fn relay_worker() {
                 #[cfg(feature = "diagnostics")]
                 let _card = crate::timeline::card_wait(Some(target));
                 // SAFETY: the host's fence and this thread's event.
-                unsafe { wait_host_fence(&host.fence, target, event, "relay") };
+                unsafe { wait_host_fence(&host.fence, target, event, "the thread that lands submissions sent ahead (VICTORY_RELAY=1)") };
                 RELAY_STATS[2].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
         }
@@ -5614,10 +5716,9 @@ impl Host {
                     #[cfg(feature = "diagnostics")]
                     crate::crumbs::signal(queue, &fence, sent);
                     meanwhile();
-                    fence.SetEventOnCompletion(sent, event)?;
                     #[cfg(feature = "diagnostics")]
                     let _card = crate::timeline::card_wait(None);
-                    WaitForSingleObject(event, INFINITE);
+                    wait_fence(&fence, sent, event, "the relay's fetch of what shaders wrote, on the copy queue")?;
                     #[cfg(feature = "diagnostics")]
                     crate::crumbs::waited(&fence, sent);
                     return Ok(behind);
@@ -5635,10 +5736,9 @@ impl Host {
                 #[cfg(feature = "diagnostics")]
                 crate::crumbs::signal(&self.queue, &fence, sent);
                 meanwhile();
-                fence.SetEventOnCompletion(sent, event)?;
                 #[cfg(feature = "diagnostics")]
                 let _card = crate::timeline::card_wait(None);
-                WaitForSingleObject(event, INFINITE);
+                wait_fence(&fence, sent, event, "the relay's fetch of what shaders wrote")?;
                 #[cfg(feature = "diagnostics")]
                 crate::crumbs::waited(&fence, sent);
                 Ok(after)
@@ -5935,9 +6035,8 @@ impl Host {
                     self.queue.Signal(&self.fence, *submitted)?;
                     #[cfg(feature = "diagnostics")]
                     crate::crumbs::signal(&self.queue, &self.fence, *submitted);
-                    self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
-                    WaitForSingleObject(self.event, INFINITE);
+                    wait_fence(&self.fence, *submitted, self.event, "the fetch of what shaders wrote to the card's memory")?;
                     #[cfg(feature = "diagnostics")]
                     crate::crumbs::waited(&self.fence, *submitted);
                     stood(waiting);
@@ -6153,26 +6252,19 @@ impl Host {
 
     /// Waits for a direct queue fence with the shared event, under the submission lock.
     fn wait_for_submission(&self, target: u64, started: std::time::Instant, context: &str) {
-        // SAFETY: the fence and event are ours, and the submission lock
-        // prevents another wait from using this event.
-        unsafe {
-            if let Err(e) = self.fence.SetEventOnCompletion(target, self.event) {
-                fail(format_args!("could not register a direct fence wait for {context} ({e})"));
-            }
-            working(false);
+        // (A lost device ends the run in `wait_fence`, said once.)
+        working(false);
+        {
             #[cfg(feature = "diagnostics")]
             let _card = crate::timeline::card_wait(Some(target));
-            match WaitForSingleObject(self.event, INFINITE) {
-                WAIT_OBJECT_0 => {}
-                WAIT_FAILED => {
-                    let error = windows::core::Error::from_thread();
-                    fail(format_args!("could not wait for {context} ({error})"));
-                }
-                status => fail(format_args!("unexpected direct fence wait result for {context} ({:#x})", status.0)),
+            // SAFETY: the fence and event are ours, and the submission lock
+            // prevents another wait from using this event.
+            if let Err(e) = unsafe { wait_fence(&self.fence, target, self.event, context) } {
+                fail(format_args!("could not wait for {context} ({e})"));
             }
-            stood(started);
-            working(true);
         }
+        stood(started);
+        working(true);
     }
 
     /// Waits for the card to run every flight in the air ([`late`]) and

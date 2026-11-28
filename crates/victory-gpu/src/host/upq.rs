@@ -196,7 +196,16 @@ pub(super) unsafe fn send(
         // what follows still finds the bytes.
         tracing::warn!(error = %e, "the drawing queue could not wait for the up queue: waited on the CPU");
         // SAFETY: as above; a null event waits until the value is reached.
-        let _ = unsafe { q.fence.SetEventOnCompletion(q.sent, windows::Win32::Foundation::HANDLE::default()) };
+        // A failure ends the run (said once) rather than going on before
+        // the bytes are there; so does a lost device.
+        unsafe {
+            super::wait_host_fence(
+                &q.fence,
+                q.sent,
+                windows::Win32::Foundation::HANDLE::default(),
+                "the CPU's wait for the up queue",
+            )
+        };
     }
     let mut at = 0u64;
     for (i, r) in ranges.iter().enumerate() {

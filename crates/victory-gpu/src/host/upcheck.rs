@@ -500,10 +500,8 @@ fn run(host: &Host, f: impl FnOnce(&ID3D12GraphicsCommandList)) -> Option<()> {
         let fence: ID3D12Fence = host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
         let event = CreateEventW(None, false, false, None).ok()?;
         host.queue.ExecuteCommandLists(&[Some(list.cast().ok()?)]);
-        let done = host.queue.Signal(&fence, 1).and_then(|()| fence.SetEventOnCompletion(1, event));
-        if done.is_ok() {
-            WaitForSingleObject(event, INFINITE);
-        }
+        // (A lost device ends the run.)
+        let done = host.queue.Signal(&fence, 1).and_then(|()| super::wait_fence(&fence, 1, event, "the up check"));
         let _ = CloseHandle(event);
         done.ok()
     }
