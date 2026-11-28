@@ -424,6 +424,11 @@ struct Lower<'a> {
     /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
     /// IR block, and its incoming (value, DXIL block) pairs.
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
+    /// Loop headers whose loops walk ray-tracing structures (a node test
+    /// between the header and its last back edge, in reverse postorder):
+    /// the header's place and its last back edge's in that order (after
+    /// FiveNine/victory-proton f81abde).
+    walks: HashMap<usize, (usize, usize)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
     /// The one block that returns: every end of the program branches to it,
@@ -435,6 +440,10 @@ struct Lower<'a> {
     /// whether it left at the loop limit; added up at the end
     /// (`intersect::bvh_count_flush`).
     pub(super) bvh_counts: Option<Vec<V>>,
+    /// `super::bvh_spin`: each lane's last node pointer (two dwords), a
+    /// digest of its ray, how many tests in a row had them, whether its walk
+    /// is cut and whether its loop is left (`intersect::bvh_cut`).
+    pub(super) bvh_spin: Option<[V; 6]>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -445,6 +454,13 @@ struct Lower<'a> {
 /// program as killed (a pixel discards).
 // shortcut: a genuine loop of more iterations than this is cut short too.
 pub(super) const LOOP_LIMIT: u32 = 1 << 20;
+
+/// The iterations after which a walk through a ray-tracing structure is cut
+/// (its node tests find nothing, [`Lower::walk_over`]) in a loop left at
+/// `limit`: seven eighths of it, so a walk has the rest to empty its stack.
+pub(super) fn walk_cut_at(limit: u32) -> u32 {
+    limit - limit / 8
+}
 
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
@@ -2379,9 +2395,11 @@ impl<'a> Lower<'a> {
             section_out: HashSet::new(),
             code_table: None,
             counters: HashMap::new(),
+            walks: HashMap::new(),
             abort: None,
             ret: None,
             bvh_counts: None,
+            bvh_spin: None,
         }
     }
 
@@ -3041,6 +3059,20 @@ impl<'a> Lower<'a> {
                 let blk = self.block[b].expect("reachable");
                 let phi = self.s.m.phi(blk, self.s.t.i32);
                 self.counters.insert(b, (phi, Vec::new()));
+                let last = p.blocks[b]
+                    .preds
+                    .iter()
+                    .filter(|&&q| self.block[q].is_some() && self.rpo[b] <= self.rpo[q])
+                    .map(|&q| self.rpo[q])
+                    .max()
+                    .unwrap_or(self.rpo[b]);
+                let walks = order.iter().any(|&q| {
+                    (self.rpo[b]..=last).contains(&self.rpo[q])
+                        && p.blocks[q].insts.iter().any(|i| i.name().starts_with("image_bvh"))
+                });
+                if walks {
+                    self.walks.insert(b, (self.rpo[b], last));
+                }
             }
         }
         self.cur = self.s.entry;
@@ -13673,18 +13705,45 @@ impl<'a> Lower<'a> {
         let next = self.s.m.bin(c, Bin::Add, phi, one);
         self.s.m.tag(phi, Tag::Counter);
         self.s.m.tag(next, Tag::Counter);
-        // Per stage unless the switch names one: a loop that never meets its
-        // exit (a count read from a buffer the host has not got yet, say)
-        // runs to the limit in every lane. A million iterations a pixel
-        // hung the GPU for seconds a draw until Windows reset it
-        // (PS_Textured_Eight, 2026-11-24, run 12).
-        // shortcut: a pixel loop past 128 iterations, a vertex or mesh loop
-        // past 256 or a compute loop past 4,096 is cut short. (They were
-        // 1,024, 4,096 and 65,536: the opening cutscene then lost the card
-        // 14-25 frames in, in a minimap or shadow mesh draw; with every
-        // loop cut at 64 it ran 90 frames. Raise them again once shaders
-        // stop reading data that is not there yet.)
-        let limit = match super::loop_limit() {
+        let limit = self.loop_limit_here();
+        let limit = self.s.m.i32(limit);
+        self.counters
+            .get_mut(&to)
+            .expect("header")
+            .1
+            .push((next, c));
+        let over = self.s.m.cmp(c, p, next, limit);
+        self.s.m.tag(over, Tag::Counter);
+        // A walk whose lane went on round one node after its walk was cut
+        // is left too (`VICTORY_BVH_SPIN`, `intersect::bvh_cut`).
+        if self.walks.contains_key(&to) && self.s.threads.is_some() && super::bvh_spin().is_some() {
+            let leave = self.bvh_leaving();
+            let c = self.cur;
+            // (No `xor` of a compare: see `exit`.)
+            return if p == pred::IULT {
+                let off = self.s.m.bool(false);
+                self.s.m.select(c, leave, off, over)
+            } else {
+                self.s.m.bin(c, Bin::Or, over, leave)
+            };
+        }
+        over
+    }
+
+    /// The iteration limit of the loops of this program ([`LOOP_LIMIT`]).
+    /// Per stage unless the switch names one: a loop that never meets its
+    /// exit (a count read from a buffer the host has not got yet, say)
+    /// runs to the limit in every lane. A million iterations a pixel
+    /// hung the GPU for seconds a draw until Windows reset it
+    /// (PS_Textured_Eight, 2026-11-24, run 12).
+    /// shortcut: a pixel loop past 128 iterations, a vertex or mesh loop
+    /// past 256 or a compute loop past 4,096 is cut short. (They were
+    /// 1,024, 4,096 and 65,536: the opening cutscene then lost the card
+    /// 14-25 frames in, in a minimap or shadow mesh draw; with every
+    /// loop cut at 64 it ran 90 frames. Raise them again once shaders
+    /// stop reading data that is not there yet.)
+    fn loop_limit_here(&self) -> u32 {
+        match super::loop_limit() {
             LOOP_LIMIT if self.s.pixel => 1 << 7,
             LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
             // Diagnostics: the loops of a program that walks ray-tracing
@@ -13697,16 +13756,32 @@ impl<'a> Lower<'a> {
             }
             LOOP_LIMIT => 1 << 12,
             named => named,
-        };
-        let limit = self.s.m.i32(limit);
-        self.counters
-            .get_mut(&to)
-            .expect("header")
-            .1
-            .push((next, c));
-        let over = self.s.m.cmp(c, p, next, limit);
+        }
+    }
+
+    /// For a node test in native block `b` of a compute program: whether the
+    /// innermost walk through a ray-tracing structure it is in (`walks`)
+    /// has gone round [`walk_cut_at`] times. From there on its node tests
+    /// are not made and find nothing (`intersect.rs`), so the title's walk
+    /// empties its stack and ends with what it found, before the loop
+    /// limit; a lane stopped by the loop limit leaves the program without
+    /// writing its result. After FiveNine/victory-proton f81abde.
+    pub(super) fn walk_over(&mut self, b: usize) -> Option<V> {
+        if self.s.threads.is_none() {
+            return None;
+        }
+        let at = *self.rpo.get(b)?;
+        let (&header, _) = self
+            .walks
+            .iter()
+            .filter(|&(_, &(lo, hi))| lo <= at && at <= hi)
+            .max_by_key(|&(_, &(lo, _))| lo)?;
+        let count = self.counters.get(&header)?.0;
+        let limit = self.s.m.i32(walk_cut_at(self.loop_limit_here()));
+        let c = self.cur;
+        let over = self.s.m.cmp(c, pred::IUGE, count, limit);
         self.s.m.tag(over, Tag::Counter);
-        over
+        Some(over)
     }
 
     /// The block a lane stopped by [`LOOP_LIMIT`] leaves through.

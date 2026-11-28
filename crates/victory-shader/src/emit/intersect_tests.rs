@@ -115,6 +115,44 @@ fn program(wide: bool, descriptor: Descriptor) -> Vec<u32> {
     w
 }
 
+/// [`program`] (the 64-bit form over all of memory) with the node test in a
+/// loop of `turns` turns, each testing the thread's node again (`vary`: with
+/// the ray's origin moved along x by 1 each turn), counting the turns in
+/// v18; it stores that count and the first dword of the last test's result
+/// at 16 bytes a thread.
+fn looped(turns: u32, vary: bool) -> Vec<u32> {
+    let mut w = program(true, WHOLE);
+    // Up to the lane mask: the program's loads and the descriptor.
+    let at = w.iter().position(|&x| x == 0xBEFE_0314).expect("exec restore") - 5;
+    let test: Vec<u32> = w[at..at + 5].to_vec();
+    w.truncate(at);
+    let mask = w.pop().expect("v_cmpx");
+    let save = w.pop().expect("s_mov exec");
+    w.push(0x7E24_0280); // v_mov_b32 v18, 0
+    w.extend([save, mask]);
+    w.extend([0xBE9E_03FF, turns]); // s_mov_b32 s30, turns
+    let body = w.len();
+    w.extend(&test);
+    w.push(0x4A24_2481); // v_add_nc_u32 v18, 1, v18
+    if vary {
+        w.push(0x0608_08F2); // v_add_f32 v4, 1.0, v4
+    }
+    w.push(0x809E_811E); // s_sub_u32 s30, s30, 1
+    w.push(0xBF07_801E); // s_cmp_lg_u32 s30, 0
+    let back = (body as i32 - (w.len() as i32 + 1)) as u16;
+    w.push(0xBF85_0000 | u32::from(back)); // s_cbranch_scc1 body
+    w.extend([
+        0xBEFE_0314, // s_mov_b32 exec_lo, s20
+        0x342A_0084, // v_lshlrev_b32 v21, 4, v0
+        0xE070_1000,
+        0x8003_1215, // buffer_store_dword v18, v21, s[12:15], 0 offen
+        0xE070_1004,
+        0x8003_0D15, // buffer_store_dword v13, v21, s[12:15], 0 offen offset:4
+        0xBF81_0000, // s_endpgm
+    ]);
+    w
+}
+
 fn native(words: &[u32]) -> NativeProgram {
     let table = |kind, at| UsedResource {
         kind,
@@ -717,6 +755,12 @@ fn counted_node_tests_add_up_on_the_card() {
         for k in count::REPEATS..=count::LIMIT_TESTS {
             assert_eq!(named(k).1, 0, "{}", COUNT_NAMES[k]);
         }
+        // Each lane's run of one node with one ray: the one test.
+        assert_eq!(named(count::RUN_FREE).1, u32::from(n > 0));
+        assert_eq!(named(count::RUN_LIMIT).1, 0);
+        for k in [count::CUT_TESTS, count::SPIN_LANES, count::OVER_LANES] {
+            assert_eq!(named(k).1, 0, "{}", COUNT_NAMES[k]);
+        }
         assert_eq!(named(count::MOST).1, u32::from(n > 0));
         assert_eq!(counts[COUNT_HISTOGRAM as usize + 1], n, "lanes of one test");
         assert_eq!(counts[COUNT_HISTOGRAM as usize + 2..].iter().sum::<u32>(), 0);
@@ -752,6 +796,143 @@ fn node_tests_are_counted_only_with_the_switch() {
         assert_ne!(off.dxil, on.dxil);
         assert_eq!(any_on.len(), any_off.len() + 1);
     }
+}
+
+/// What each running thread of [`looped`] stored, on the card (its case,
+/// the turns it made and the first dword of its last test's result), with
+/// `VICTORY_BVH_SPIN` at `spin` and the walking programs' loop limit at
+/// `limit` (`None`: 4096).
+fn spin_turns(turns: u32, vary: bool, spin: Option<u32>, limit: Option<u32>) -> Option<Vec<(Case, u32, u32)>> {
+    let was = super::BVH_SPIN_TEST.replace(Some(spin));
+    let was_limit = super::BVH_LOOP_LIMIT_TEST.replace(limit);
+    let _memory = Memory::at(BASE);
+    let built = build_compute_shader(&native(&looped(turns, vary)));
+    super::BVH_SPIN_TEST.set(was);
+    super::BVH_LOOP_LIMIT_TEST.set(was_limit);
+    let (shader, _) = built.expect("the looped program lowers");
+    let (scene, batches) = scene();
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return None;
+    };
+    let (root, pso) = host.compute_pipeline(&shader).expect("compute_pipeline");
+    let batch = &batches[0];
+    let data = buffer(&scene, batch, BASE + u64::from(NODES));
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(vec![0; 5]))],
+                views: &[View::Buffer { data: &data, stride: Stride::Raw }, View::RawUav(4 * THREADS)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("dispatch");
+    Some(
+        batch
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.is_some())
+            .map(|(t, c)| (*c, out[0][4 * t], out[0][4 * t + 1]))
+            .collect(),
+    )
+}
+
+/// What a test that is not made returns in the first dword: no child of a
+/// box node, the triangle miss of any other.
+fn nothing(case: &Case) -> u32 {
+    match case {
+        Some((_, 4 | 5, _)) => bvh::NONE,
+        _ => bvh::MISS[0].to_bits(),
+    }
+}
+
+/// The first dword of `case`'s test with its ray's origin moved along x by
+/// `by`, as the reference has it.
+fn real(scene: &Scene, case: &Case, by: f32) -> u32 {
+    let Some((n, kind, ray)) = case else { return BEFORE[0] };
+    let mut ray = *ray;
+    ray.origin[0] += by;
+    bvh::intersect(&scene.node(*n), *kind, &ray, true)[0]
+}
+
+/// `VICTORY_BVH_SPIN`: a lane that tests the same node with the same ray n
+/// times in a row has its walk cut there: from that test on its tests are
+/// not made and find nothing, and its loop goes on (the title's walk would
+/// end of itself), until 64 such tests later it leaves the loop; a lane
+/// that does so n - 1 times is not cut; a lane whose rays all differ (as
+/// when every ray misses the root) is never cut; with the switch at 0
+/// nothing is.
+#[test]
+fn a_lane_going_round_one_node_has_its_walk_cut() {
+    let (scene, _) = scene();
+    let check = |turns, vary, spin, want_turns: u32, cut: bool| {
+        let Some(got) = spin_turns(turns, vary, spin, None) else {
+            return false;
+        };
+        assert!(!got.is_empty());
+        // Some case must tell a test made from one not made.
+        assert!(got.iter().any(|(c, _, _)| real(&scene, c, 0.0) != nothing(c)));
+        for (case, n, first) in got {
+            let by = if vary { (turns - 1) as f32 } else { 0.0 };
+            let want = if cut { nothing(&case) } else { real(&scene, &case, by) };
+            let label = format!("{turns} turns, vary {vary}, spin {spin:?}: {case:x?}");
+            assert_eq!(n, want_turns, "turns, {label}");
+            assert_eq!(first, want, "result, {label}");
+        }
+        true
+    };
+    if !check(12, false, Some(8), 12, true) {
+        return;
+    }
+    // The n-th test in a row is cut; n - 1 are not.
+    check(8, false, Some(8), 8, true);
+    check(7, false, Some(8), 7, false);
+    // 64 tests past the cut the loop is left.
+    check(100, false, Some(8), 8 + 64, true);
+    // Another ray each turn: never cut.
+    check(40, true, Some(4), 40, false);
+    check(40, false, None, 40, false);
+}
+
+/// A walk past seven eighths of its loop's limit makes no more tests and
+/// finds nothing, and its loop is left at the limit (after
+/// FiveNine/victory-proton f81abde): with the limit at 16, the 15th test of
+/// a walk is not made and the loop ends after the 16th turn.
+#[test]
+fn a_walk_past_its_limit_finds_nothing() {
+    let (scene, _) = scene();
+    assert_eq!(super::lower::walk_cut_at(16), 14);
+    assert_eq!(super::lower::walk_cut_at(4096), 3584);
+    for (turns, want_turns, cut) in [(14, 14, false), (15, 15, true), (40, 16, true)] {
+        let Some(got) = spin_turns(turns, false, None, Some(16)) else {
+            return;
+        };
+        for (case, n, first) in got {
+            let want = if cut { nothing(&case) } else { real(&scene, &case, 0.0) };
+            assert_eq!((n, first), (want_turns, want), "{turns} turns: {case:x?}");
+        }
+    }
+}
+
+#[test]
+fn the_spin_switch_is_on_unless_0_and_keys_by_its_count() {
+    assert_eq!(super::spin_said(None), Some(24));
+    assert_eq!(super::spin_said(Some("")), Some(24));
+    assert_eq!(super::spin_said(Some("0")), None);
+    assert_eq!(super::spin_said(Some("2")), Some(4));
+    assert_eq!(super::spin_said(Some("100")), Some(100));
+    assert_eq!(super::spin_said(Some("99999")), Some(4096));
+    let was = super::BVH_SPIN_TEST.replace(Some(None));
+    let off = super::keyed_apart_any();
+    super::BVH_SPIN_TEST.set(Some(Some(24)));
+    let on = super::keyed_apart_any();
+    super::BVH_SPIN_TEST.set(was);
+    assert_eq!(on.len(), off.len() + 1);
+    assert!(on.iter().any(|m| m.contains("VICTORY_BVH_SPIN=24")));
 }
 
 /// `VICTORY_BVH_LOOP_LIMIT` keys apart only with a value, and names it; a

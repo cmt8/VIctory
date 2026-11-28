@@ -15,15 +15,16 @@ use victory_shader::emit::{COUNT_DWORDS, COUNT_HISTOGRAM, COUNT_NAMES, COUNT_SLO
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
 const DWORDS: usize = (COUNT_SLOTS * COUNT_DWORDS) as usize;
-/// The dword of the most nodes a lane tested: a maximum, not a sum.
-const MOST: usize = 17;
+/// The dwords that are maxima, not sums: the most nodes a lane tested, the
+/// longest runs of tests of one node with one ray.
+const MAXIMA: [usize; 3] = [17, 27, 28];
 
 struct Counts {
     _buffer: ID3D12Resource,
     data: *const u32,
     gpu: u64,
     /// What was read last, the frame it was read in, and the sums since the
-    /// last line (the maximum for [`MOST`]).
+    /// last line (the maximum for [`MAXIMA`]).
     last: Vec<u32>,
     frame: u64,
     sums: Vec<u64>,
@@ -70,7 +71,7 @@ impl Counts {
             unsafe { std::ptr::copy_nonoverlapping(self.data.add(first), now.as_mut_ptr(), now.len()) };
             for (k, &v) in now.iter().enumerate() {
                 let i = first + k;
-                if k == MOST {
+                if MAXIMA.contains(&k) {
                     self.sums[i] = self.sums[i].max(u64::from(v));
                 } else {
                     self.sums[i] += u64::from(v.wrapping_sub(self.last[i]));
@@ -120,7 +121,7 @@ pub(crate) fn line(frames: f64) {
             continue;
         }
         for (k, (a, &v)) in all.iter_mut().zip(run.iter()).enumerate() {
-            *a = if k == MOST { (*a).max(v) } else { *a + v };
+            *a = if MAXIMA.contains(&k) { (*a).max(v) } else { *a + v };
         }
         let names = NAMES.lock().unwrap_or_else(|e| e.into_inner()).get(&slot).cloned();
         let names = names.map_or_else(|| "?".to_owned(), |n| n.iter().cloned().collect::<Vec<_>>().join("+"));
@@ -137,7 +138,7 @@ fn say(what: &str, run: &[u64], frames: f64) {
     let counts: Vec<String> = COUNT_NAMES
         .iter()
         .enumerate()
-        .map(|(k, name)| if k == MOST { format!("{name} {}", run[k]) } else { format!("{name} {:.0}", per(run[k])) })
+        .map(|(k, name)| if MAXIMA.contains(&k) { format!("{name} {}", run[k]) } else { format!("{name} {:.0}", per(run[k])) })
         .collect();
     let lanes = run[14].max(1) as f64;
     let histogram: Vec<String> = (1..32)

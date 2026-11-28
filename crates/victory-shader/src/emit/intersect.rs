@@ -143,7 +143,29 @@ impl<'a> Lower<'a> {
             direction: [f[4], f[5], f[6]],
             inverse: [f[7], f[8], f[9]],
         };
+        // A lane whose walk is cut makes no test and finds nothing: no child
+        // of a box node, no triangle hit ([`Self::bvh_none`]).
+        let none = self.bvh_none(b, guard, pointer, pointer_high, &x[1 + usize::from(wide)..]);
         let c = self.cur;
+        let test = match none {
+            Some(none) => {
+                let (off, on) = (self.s.m.bool(false), guard.unwrap_or_else(|| self.s.m.bool(true)));
+                Some(self.s.m.select(c, none, off, on))
+            }
+            None => guard,
+        };
+        let nothing: [V; 4] = match none {
+            Some(_) => {
+                let (k4, k6) = (self.s.m.i32(4), self.s.m.i32(6));
+                let pair = self.s.m.bin(c, Bin::And, pointer, k6);
+                let is_box = self.s.m.cmp(c, pred::EQ, pair, k4);
+                std::array::from_fn(|k| {
+                    let (no_child, miss) = (self.s.m.i32(bvh::NONE), self.s.m.i32(bvh::MISS[k].to_bits()));
+                    self.s.m.select(c, is_box, no_child, miss)
+                })
+            }
+            None => [self.s.m.i32(0); 4],
+        };
         let mut descriptor = None;
         let at = match nodes {
             BvhNodes::Resource => {
@@ -175,7 +197,7 @@ impl<'a> Lower<'a> {
                 // One look for the node's copy, before the branches: a
                 // node is 64 bytes on 64, so its first half lies in one
                 // 64 KiB page whatever its kind.
-                let (handle, byte, mapped) = self.bvh_memory(low, high, guard);
+                let (handle, byte, mapped) = self.bvh_memory(low, high, test);
                 NodeAt::Memory {
                     handle,
                     byte,
@@ -185,8 +207,7 @@ impl<'a> Lower<'a> {
                 }
             }
         };
-        let zero = self.s.m.i32(0);
-        let gate = self.begin_guarded(guard);
+        let gate = self.begin_guarded(test);
         let head = self.cur;
         let (k4, k6, k7) = (self.s.m.i32(4), self.s.m.i32(6), self.s.m.i32(7));
         let kind = self.s.m.bin(head, Bin::And, pointer, k7);
@@ -236,11 +257,11 @@ impl<'a> Lower<'a> {
                     (other[k], leaf_block),
                 ],
             );
-            results.push((phi, zero));
+            results.push((phi, nothing[k]));
         }
         if super::super::bvh_count() && self.s.threads.is_some() {
             let found: [V; 4] = std::array::from_fn(|k| results[k].0);
-            self.bvh_count_test(at, kind, &found, descriptor, (pointer, pointer_high));
+            self.bvh_count_test(at, kind, &found, descriptor, (pointer, pointer_high), &x[1 + usize::from(wide)..]);
         }
         let results = self.end_guarded(gate, &results);
         for (k, &r) in results.iter().enumerate() {
@@ -633,6 +654,11 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+/// Tests of one node with one ray past [`super::super::bvh_spin`]'s count
+/// after which a lane whose walk was cut leaves its loop (`Lower::bvh_cut`):
+/// the title's walk did not end of itself by then.
+pub(in crate::emit) const SPIN_GRACE: u32 = 64;
+
 /// Which of a lane's counts ([`super::super::shader::COUNT_NAMES`]).
 pub(in crate::emit) mod count {
     pub const TESTS: usize = 0;
@@ -662,14 +688,154 @@ pub(in crate::emit) mod count {
     pub const REPEAT_OTHER: usize = 24;
     pub const REPEAT_NO_COPY: usize = 25;
     pub const LIMIT_TESTS: usize = 26;
+    pub const RUN_FREE: usize = 27;
+    pub const RUN_LIMIT: usize = 28;
+    pub const CUT_TESTS: usize = 29;
+    pub const SPIN_LANES: usize = 30;
+    pub const OVER_LANES: usize = 31;
     /// Past the counts: whether the lane left at the loop limit, and the
     /// node pointer of its last test numbered a power of two (two dwords).
     pub const ABORTED: usize = super::super::super::shader::COUNT_NAMES.len();
     pub const CHECK_LOW: usize = ABORTED + 1;
     pub const CHECK_HIGH: usize = ABORTED + 2;
+    /// The lane's run of tests of one node with one ray: its last pointer
+    /// (two dwords), ray digest, run, and longest run.
+    pub const RUN_AT: [usize; 4] = [ABORTED + 3, ABORTED + 4, ABORTED + 5, ABORTED + 6];
+    pub const RUN_MOST: usize = ABORTED + 7;
 }
 
 impl Lower<'_> {
+    /// [`super::super::bvh_spin`]: the lane's private last pointer (low,
+    /// high), ray digest, run, whether its walk is cut and whether its loop
+    /// is left, made the first time. The high dword starts at a value no
+    /// pointer has, so the first test is no repeat.
+    fn bvh_spin_vars(&mut self) -> [V; 6] {
+        if let Some(v) = self.bvh_spin {
+            return v;
+        }
+        let (zero, none) = (self.s.m.i32(0), self.s.m.i32(u32::MAX));
+        let inits = [zero, none, zero, zero, zero, zero];
+        let v: [V; 6] = std::array::from_fn(|k| self.s.m.private_global(&format!("victory.bvh.spin.{k}"), inits[k]));
+        self.bvh_spin = Some(v);
+        v
+    }
+
+    /// Whether this lane's walk is to be left at its loop's next turn: it
+    /// went on round one node [`SPIN_GRACE`] tests after its walk was cut
+    /// ([`Self::bvh_cut`]), so the title's walk does not end of itself. The
+    /// value the walk loop's back edges leave by (`lower.rs`
+    /// `count_iteration`), in the current block.
+    pub(super) fn bvh_leaving(&mut self) -> V {
+        let [.., leave] = self.bvh_spin_vars();
+        let c = self.cur;
+        let f = self.s.m.load(c, leave);
+        let zero = self.s.m.i32(0);
+        self.s.m.cmp(c, pred::NE, f, zero)
+    }
+
+    /// [`super::super::bvh_spin`], for one node test of a lane that runs it
+    /// (in the current block): whether its walk is cut, so that the test is
+    /// not made and finds nothing. The same node pointer with the same ray
+    /// (its extent, origin and direction, as a digest) as the lane's last
+    /// test adds to a run, anything else starts it again; a run of
+    /// `bvh_spin` tests cuts the walk, and it stays cut while the ray stays
+    /// (the title's walk empties its stack and ends with what it found); a
+    /// test with another ray is the next walk's. A run [`SPIN_GRACE`] tests
+    /// longer leaves the loop ([`Self::bvh_leaving`]). A walk of a tree
+    /// tests no node twice in a row for one ray, and a lane whose rays all
+    /// miss the root tests it with another ray each time.
+    fn bvh_cut(&mut self, pointer: V, pointer_high: Option<V>, ray: &[V]) -> V {
+        let n = super::super::bvh_spin().expect("on");
+        let [low_at, high_at, ray_at, run_at, cut_at, leave_at] = self.bvh_spin_vars();
+        let (run, same_ray) = self.bvh_run_step([low_at, high_at, ray_at, run_at], pointer, pointer_high, ray);
+        let c = self.cur;
+        let (limit, past) = (self.s.m.i32(n), self.s.m.i32(n + SPIN_GRACE));
+        let spinning = self.s.m.cmp(c, pred::IUGE, run, limit);
+        let was = self.s.m.load(c, cut_at);
+        let zero = self.s.m.i32(0);
+        let was = self.s.m.cmp(c, pred::NE, was, zero);
+        let kept = self.s.m.bin(c, Bin::And, was, same_ray);
+        let cut = self.s.m.bin(c, Bin::Or, kept, spinning);
+        let leave = self.s.m.cmp(c, pred::IUGE, run, past);
+        let i32t = self.s.t.i32;
+        let (cut_word, leave_word) = (self.s.m.cast(c, Cast::ZExt, cut, i32t), self.s.m.cast(c, Cast::ZExt, leave, i32t));
+        self.s.m.store(c, cut_at, cut_word);
+        self.s.m.store(c, leave_at, leave_word);
+        if super::super::bvh_count() {
+            self.bvh_count_or(count::SPIN_LANES, spinning);
+        }
+        cut
+    }
+
+    /// For a node test in native block `b` with `guard`: whether the lane's
+    /// walk is cut, by the spin stop ([`Self::bvh_cut`]) or because it went
+    /// on past its limit ([`Lower::walk_over`]); `None` where neither can
+    /// cut it (not a compute program, not in a walk with the spin stop
+    /// off). False in lanes outside the guard. Goes on in another block.
+    fn bvh_none(&mut self, b: usize, guard: Option<V>, pointer: V, pointer_high: Option<V>, ray: &[V]) -> Option<V> {
+        let spin = super::super::bvh_spin().is_some() && self.s.threads.is_some();
+        let over = self.walk_over(b);
+        if !spin && over.is_none() {
+            return None;
+        }
+        let at = self.begin_guarded(guard);
+        let mut none = over;
+        if spin {
+            let cut = self.bvh_cut(pointer, pointer_high, ray);
+            none = Some(match none {
+                Some(o) => self.s.m.bin(self.cur, Bin::Or, o, cut),
+                None => cut,
+            });
+        }
+        let none = none.expect("one of them");
+        if super::super::bvh_count() {
+            self.bvh_count_if(count::CUT_TESTS, none);
+            if let Some(o) = over {
+                self.bvh_count_or(count::OVER_LANES, o);
+            }
+        }
+        let off = self.s.m.bool(false);
+        Some(self.end_guarded(at, &[(none, off)])[0])
+    }
+
+    /// One test in a lane's run of tests of the same node pointer with the
+    /// same ray (`vars`: its last pointer's two dwords, the digest of its
+    /// extent, origin and direction, the run): the run after this test, 1 for
+    /// a new pointer or ray, and whether the ray is the last test's. In the
+    /// current block.
+    fn bvh_run_step(&mut self, vars: [V; 4], pointer: V, pointer_high: Option<V>, ray: &[V]) -> (V, V) {
+        let [low_at, high_at, ray_at, run_at] = vars;
+        let c = self.cur;
+        let zero = self.s.m.i32(0);
+        let high = pointer_high.unwrap_or(zero);
+        // Extent, origin, direction: rotated and xored.
+        let mut digest = zero;
+        for (k, &w) in ray.iter().take(7).enumerate() {
+            let r = (5 * k as u32 + 1) % 32;
+            let (left, right) = (self.s.m.i32(r), self.s.m.i32(32 - r));
+            let a = self.s.m.bin(c, Bin::Shl, w, left);
+            let b = self.s.m.bin(c, Bin::LShr, w, right);
+            let rotated = self.s.m.bin(c, Bin::Or, a, b);
+            digest = self.s.m.bin(c, Bin::Xor, digest, rotated);
+        }
+        let (last_low, last_high, last_ray) =
+            (self.s.m.load(c, low_at), self.s.m.load(c, high_at), self.s.m.load(c, ray_at));
+        let same_low = self.s.m.cmp(c, pred::EQ, pointer, last_low);
+        let same_high = self.s.m.cmp(c, pred::EQ, high, last_high);
+        let same_ray = self.s.m.cmp(c, pred::EQ, digest, last_ray);
+        let same = self.s.m.bin(c, Bin::And, same_low, same_high);
+        let same = self.s.m.bin(c, Bin::And, same, same_ray);
+        let run = self.s.m.load(c, run_at);
+        let one = self.s.m.i32(1);
+        let more = self.s.m.bin(c, Bin::Add, run, one);
+        let run = self.s.m.select(c, same, more, one);
+        self.s.m.store(c, low_at, pointer);
+        self.s.m.store(c, high_at, high);
+        self.s.m.store(c, ray_at, digest);
+        self.s.m.store(c, run_at, run);
+        (run, same_ray)
+    }
+
     /// Diagnostics (`VICTORY_BVH_COUNT=1`): this lane's private count `k`
     /// ([`count`]; one past them: whether it left at the loop limit), made
     /// the first time.
@@ -677,7 +843,7 @@ impl Lower<'_> {
         if self.bvh_counts.is_none() {
             let zero = self.s.m.i32(0);
             let names = super::super::shader::COUNT_NAMES;
-            let globals = (0..names.len() + 3)
+            let globals = (0..names.len() + 8)
                 .map(|n| self.s.m.private_global(&format!("victory.bvh.count.{n}"), zero))
                 .collect();
             self.bvh_counts = Some(globals);
@@ -694,6 +860,18 @@ impl Lower<'_> {
         self.s.m.store(c, g, now);
     }
 
+    /// Sets count `k` to 1 where `yes` holds (a lane's flag), in the current
+    /// block.
+    fn bvh_count_or(&mut self, k: usize, yes: V) {
+        let g = self.bvh_counter(k);
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let one = self.s.m.cast(c, Cast::ZExt, yes, i32t);
+        let was = self.s.m.load(c, g);
+        let now = self.s.m.bin(c, Bin::Or, was, one);
+        self.s.m.store(c, g, now);
+    }
+
     /// Adds 1 to count `k` where `yes` holds.
     fn bvh_count_if(&mut self, k: usize, yes: V) {
         let i32t = self.s.t.i32;
@@ -704,9 +882,26 @@ impl Lower<'_> {
     /// Diagnostics: counts one node test of a lane that runs it, from its
     /// node, kind and results (`descriptor`: the descriptor's first two
     /// dwords, over title memory). May go on in another block.
-    fn bvh_count_test(&mut self, at: NodeAt, kind: V, results: &[V; 4], descriptor: Option<(V, V)>, pointers: (V, Option<V>)) {
+    fn bvh_count_test(
+        &mut self,
+        at: NodeAt,
+        kind: V,
+        results: &[V; 4],
+        descriptor: Option<(V, V)>,
+        pointers: (V, Option<V>),
+        ray: &[V],
+    ) {
         use count::*;
         let (pointer, pointer_high) = pointers;
+        // The longest run of tests of one node with one ray.
+        let vars = RUN_AT.map(|k| self.bvh_counter(k));
+        let (run, _) = self.bvh_run_step(vars, pointer, pointer_high, ray);
+        let most_at = self.bvh_counter(RUN_MOST);
+        let c = self.cur;
+        let most = self.s.m.load(c, most_at);
+        let longer = self.s.m.cmp(c, pred::IUGT, run, most);
+        let most = self.s.m.select(c, longer, run, most);
+        self.s.m.store(c, most_at, most);
         let wide = pointer_high.is_some();
         let one = self.s.m.i32(1);
         self.bvh_count_add(TESTS, one);
@@ -899,6 +1094,7 @@ impl Lower<'_> {
             })
             .collect();
         let tests = loaded[TESTS];
+        let run_most = self.s.m.load(self.cur, self.bvh_counts.as_ref().expect("made")[RUN_MOST]);
         let aborted = loaded[ABORTED];
         let c = self.cur;
         let (limited, repeated) = (self.s.m.cmp(c, pred::NE, aborted, zero), self.s.m.cmp(c, pred::NE, loaded[REPEATS], zero));
@@ -916,6 +1112,8 @@ impl Lower<'_> {
                 LIMIT_REPEAT_LANES => (0, self.s.m.cast(c, Cast::ZExt, both, i32t)),
                 LIMIT_REPEATS => (0, self.s.m.select(c, limited, loaded[REPEATS], zero)),
                 LIMIT_TESTS => (0, self.s.m.select(c, limited, tests, zero)),
+                RUN_FREE => (7, self.s.m.select(c, limited, zero, run_most)),
+                RUN_LIMIT => (7, self.s.m.select(c, limited, run_most, zero)),
                 THREADS => (0, one),
                 MOST => (7, tests),
                 _ => (0, v),

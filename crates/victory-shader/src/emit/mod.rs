@@ -396,8 +396,10 @@ pub fn bvh_count() -> bool {
 /// Diagnostics: the iterations after which a loop of a compute program with a
 /// ray-tracing node test is left (`VICTORY_BVH_LOOP_LIMIT=<n>`, 16 to 4096;
 /// diagnostics builds only; unset: the compute limit of `lower.rs`
-/// `count_iteration`, 4096, as for every compute program). A lane stopped
-/// there leaves the program as one stopped at 4096 does. To tell how much of
+/// `count_iteration`, 4096, as for every compute program). A walk cut at
+/// seven eighths of it finds nothing from there on (`lower.rs`
+/// `walk_over`), and a lane still in the loop at the limit leaves the
+/// program as one stopped at 4096 does. To tell how much of
 /// the walking programs' time the lanes that walk to the limit take. Part of
 /// the translation of those programs only: the shader cache keys them apart
 /// ([`keyed_apart`]).
@@ -417,6 +419,42 @@ pub fn bvh_loop_limit() -> Option<u32> {
 thread_local! {
     /// A test's choice for [`bvh_loop_limit`] on its thread (`None`: the switch's).
     pub(crate) static BVH_LOOP_LIMIT_TEST: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// How many times in a row a lane of a compute program with a ray-tracing
+/// node test may test the same node with the same ray before its walk is
+/// cut (`intersect.rs` `bvh_cut`): its node tests then find nothing while
+/// the ray stays, so the title's walk empties its stack and ends with what
+/// it found; one still going round that node 64 tests later leaves its
+/// walk's loop (`lower.rs` `count_iteration`). `VICTORY_BVH_SPIN`, on
+/// unless `=0` (24), `=<n>` sets the count (4 to 4096). A walk of a tree
+/// tests no node twice in a row for one ray; a lane that does is going
+/// round one node until the loop limit (runs rw7, rw9: every lane that
+/// reached it had tested one node some 3,580 times of its 4,096), and holds
+/// its whole wave meanwhile. Part of the translation of those programs
+/// only: the shader cache keys them apart by the count ([`keyed_apart`]).
+pub fn bvh_spin() -> Option<u32> {
+    #[cfg(test)]
+    if let Some(n) = BVH_SPIN_TEST.get() {
+        return n;
+    }
+    static N: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *N.get_or_init(|| spin_said(std::env::var("VICTORY_BVH_SPIN").ok().as_deref()))
+}
+
+/// What `VICTORY_BVH_SPIN` says ([`bvh_spin`]). Pure, for testing.
+fn spin_said(value: Option<&str>) -> Option<u32> {
+    match value.map(str::trim) {
+        Some("0") => None,
+        Some(v) => Some(v.parse::<u32>().map_or(24, |n| n.clamp(4, 4096))),
+        None => Some(24),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`bvh_spin`] on its thread (`None`: the switch's).
+    pub(crate) static BVH_SPIN_TEST: std::cell::Cell<Option<Option<u32>>> = const { std::cell::Cell::new(None) };
 }
 
 /// The run of [`SLOT_COUNTS`] a program with code `code` counts into: a hash
@@ -877,6 +915,17 @@ pub(crate) fn emit_sized(
             );
         }
     };
+    // A program that walks ray-tracing structures in the forms for host waves
+    // of 32 where they are exact (`VICTORY_BVH_WAVE32=1`); else as below.
+    if waves && native.wave64 && compute_wave::walker_wave32() && compute_wave::walks(&native.code) {
+        let sized = emit_forms(c, native, p, st, io, res);
+        if let Ok((_, wave)) = &sized
+            && *wave != Some(64)
+        {
+            say("for host waves of 32 (it walks ray-tracing structures)", &sized);
+            return sized;
+        }
+    }
     if waves && native.wave64 && compute_wave::wave64_as_console() {
         // (the switch unset: a host wave is a console wave, declared)
         let own = compute_wave::in_console_waves(|| emit_forms(c, native, p, st, io, res));

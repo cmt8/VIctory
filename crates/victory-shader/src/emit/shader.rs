@@ -95,11 +95,16 @@ pub const COUNT_DWORDS: u32 = 64;
 /// node the lane tested at its last test numbered a power of two (a walk
 /// round a cycle comes back to it); lanes with such a test; lanes at the loop
 /// limit with one; their such tests; such tests of box nodes, of other nodes,
-/// of pages with no copy; tests of lanes at the loop limit.
-pub const COUNT_NAMES: [&str; 27] = [
+/// of pages with no copy; tests of lanes at the loop limit; the longest run of
+/// tests of one node with one ray of a lane that ended by itself, and of one
+/// at the loop limit (maxima); node tests not made because the lane's walk
+/// was cut (`VICTORY_BVH_SPIN`, a walk past its limit); lanes cut by the
+/// spin stop, by the walk's limit.
+pub const COUNT_NAMES: [&str; 32] = [
     "tests", "wide", "box16", "box32", "triangle", "other", "no-copy", "wild", "box-none", "tri-hit", "zero-box",
     "bad-header", "past-size", "base-0", "lanes", "loop-limit", "threads", "most", "children", "repeats",
     "repeat-lanes", "limit-repeat-lanes", "limit-repeats", "repeat-box", "repeat-other", "repeat-no-copy", "limit-tests",
+    "run-free", "run-limit", "cut-tests", "spin-lanes", "over-lanes",
 ];
 /// From this dword of a [`SLOT_COUNTS`] run: lanes by the nodes they tested,
 /// `n` at `COUNT_HISTOGRAM + k` for `2^(k-1) <= n < 2^k` (k 1..=31).

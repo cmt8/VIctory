@@ -326,7 +326,14 @@ pub(super) const BVH_OTHER_NONE: &str = "node test: instance and procedural node
 /// counts what its walks do ([`super::bvh_count`]). (The translator's version
 /// does not key translations: a change of what is counted changes the mark,
 /// or the cache serves the counting translations made before it.)
-const BVH_COUNT: &str = "VICTORY_BVH_COUNT=1: ray-tracing node tests counted into u252, with the cycle check";
+const BVH_COUNT: &str = "VICTORY_BVH_COUNT=1: ray-tracing node tests counted into u252, with the cycle check, the longest runs and the cut walks";
+
+/// [`keyed_apart`]'s mark of a compute program with a ray-tracing node test:
+/// a walk past seven eighths of its loop's limit finds nothing and ends of
+/// itself (`lower.rs` `walk_over`), where its lane left the program at the
+/// limit before.
+const BVH_WALK_OVER: &str = "walks past 7/8 of their loop limit: node tests find nothing";
+
 
 /// [`keyed_apart`]'s mark of a compute program with a ray-tracing node test
 /// whose loops are left at [`super::bvh_loop_limit`]'s count, with the count.
@@ -341,6 +348,48 @@ fn bvh_loop_mark() -> Option<&'static str> {
             .map(|n| &*Box::leak(format!("VICTORY_BVH_LOOP_LIMIT={n}: loops of programs with a node test").into_boxed_str()))
     })
 }
+
+/// [`keyed_apart`]'s mark of a compute program with a ray-tracing node test
+/// whose walks are cut when a lane goes round one node ([`super::bvh_spin`]),
+/// with the count.
+fn bvh_spin_mark() -> Option<&'static str> {
+    let text = |n: u32| format!("VICTORY_BVH_SPIN={n}: walks of programs with a node test cut by a lane going round one node, the test then finding nothing");
+    #[cfg(test)]
+    if super::BVH_SPIN_TEST.get().is_some() {
+        return super::bvh_spin().map(|n| &*Box::leak(text(n).into_boxed_str()));
+    }
+    static MARK: OnceLock<Option<&'static str>> = OnceLock::new();
+    *MARK.get_or_init(|| super::bvh_spin().map(|n| &*Box::leak(text(n).into_boxed_str())))
+}
+
+/// Whether a console wave64 compute program with a ray-tracing node test
+/// ([`walks`]) takes the forms for host waves of 32 where they are exact,
+/// whatever `VICTORY_COMPUTE_WAVE` says of other programs
+/// (`VICTORY_BVH_WAVE32=1`; off by default until runs have shown the
+/// pictures whole: that form put dark 128x16 blocks into other programs'
+/// pictures before). A walk's lanes part ways; a wave
+/// waits for its slowest, and a wave of 32 holds half as many lanes behind
+/// it (runs rw10, rw11: the walking programs 81 -> 46 ms on the boat with
+/// `VICTORY_COMPUTE_WAVE=forms`). Part of the translation of those programs:
+/// the shader cache keys them apart ([`keyed_apart`]).
+pub fn walker_wave32() -> bool {
+    #[cfg(test)]
+    if let Some(on) = WALKER_WAVE32_TEST.get() {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| compute_wave_32() && std::env::var_os("VICTORY_BVH_WAVE32").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`walker_wave32`] on its thread (`None`: the switch's).
+    pub(super) static WALKER_WAVE32_TEST: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// [`keyed_apart`]'s mark of a console wave64 compute program with a
+/// node test in the forms for host waves of 32 ([`walker_wave32`]).
+const BVH_WAVE32: &str = "VICTORY_BVH_WAVE32: wave64 programs with a node test in host waves of 32";
 
 /// Whether `code` (a compute program's) has a node test: its loops take
 /// [`super::bvh_loop_limit`].
@@ -421,6 +470,17 @@ pub fn keyed_apart(container: &[u8], kept: bool) -> Vec<&'static str> {
     {
         marks.push(mark);
     }
+    if let Some(mark) = bvh_spin_mark()
+        && bvh_count_slot(container).is_some()
+    {
+        marks.push(mark);
+    }
+    if bvh_count_slot(container).is_some() {
+        marks.push(BVH_WALK_OVER);
+    }
+    if walker_wave32() && console_wave64_compute(container).is_some_and(|p| has_bvh(&p.code)) {
+        marks.push(BVH_WAVE32);
+    }
     if !console && !halves && !even {
         return marks;
     }
@@ -472,6 +532,13 @@ pub fn keyed_apart_any() -> Vec<&'static str> {
     }
     if let Some(mark) = bvh_loop_mark() {
         marks.push(mark);
+    }
+    if let Some(mark) = bvh_spin_mark() {
+        marks.push(mark);
+    }
+    marks.push(BVH_WALK_OVER);
+    if walker_wave32() {
+        marks.push(BVH_WAVE32);
     }
     marks
 }
@@ -634,6 +701,28 @@ mod tests {
     /// node test, of any stage: one without keeps its key with the switch
     /// on. Off, no program is keyed apart and no key changes.
     #[test]
+    fn walkers_in_waves_of_32_and_their_node_kinds_key_them_apart() {
+        let was = WALKER_WAVE32_TEST.replace(Some(false));
+        let off = keyed_apart_any();
+        WALKER_WAVE32_TEST.set(Some(true));
+        let on = keyed_apart_any();
+        let no_program = keyed_apart(&[], true);
+        WALKER_WAVE32_TEST.set(was);
+        assert!(!off.contains(&BVH_WAVE32) && on.contains(&BVH_WAVE32));
+        assert_eq!(on.len(), off.len() + 1);
+        assert!(!no_program.contains(&BVH_WAVE32) && !no_program.contains(&BVH_OTHER_NONE));
+        // The node kinds' change is in every set of translations.
+        assert!(off.contains(&BVH_OTHER_NONE));
+        // Only console wave64 compute programs with a node test walk.
+        // image_bvh64_intersect_ray v[13:16], [v1 .. v12], s[8:11]; s_endpgm
+        let wide: Vec<u8> = [0xF19C_9F07u32, 0x0002_0D01, 0x0504_0302, 0x0908_0706, 0x000C_0B0A, 0xBF81_0000]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        assert!(walks(&wide) && !walks(&0xBF81_0000u32.to_le_bytes()));
+    }
+
+    #[test]
     fn a_node_test_that_misses_keys_only_its_programs_apart() {
         use crate::native::{ComputeIo, HwStage, NativeProgram, StageIo};
         let bytes = |words: &[u32]| words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
@@ -674,14 +763,6 @@ mod tests {
         assert!(!off_any.contains(&BVH_MISS));
         assert!(on_any.contains(&BVH_MISS));
         assert_eq!(on_any.iter().filter(|m| **m != BVH_MISS).collect::<Vec<_>>(), off_any.iter().collect::<Vec<_>>());
-    }
-
-    /// The node kinds' change keys apart every set of translations, and no
-    /// container that holds no program.
-    #[test]
-    fn the_node_kinds_change_is_keyed_apart() {
-        assert!(keyed_apart_any().contains(&BVH_OTHER_NONE));
-        assert!(!keyed_apart(&[], false).contains(&BVH_OTHER_NONE));
     }
 
     #[test]
