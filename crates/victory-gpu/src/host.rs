@@ -4433,6 +4433,8 @@ mod torn;
 mod traffic;
 pub(crate) mod upcheck;
 #[cfg(feature = "diagnostics")]
+pub(crate) mod rtcount;
+#[cfg(feature = "diagnostics")]
 pub(crate) mod rtstamps;
 #[cfg(test)]
 mod rtbench;

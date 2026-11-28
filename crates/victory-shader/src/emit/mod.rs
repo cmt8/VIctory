@@ -124,13 +124,14 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use bitcode::census;
 pub use sampler::StaticSampler;
 pub use compute_wave::{
-    GROUP_CU as GROUP_CU_MARK, compute_wave_32, host_min_wave_set, keyed_apart, keyed_apart_any, named,
+    GROUP_CU as GROUP_CU_MARK, bvh_count_slot, compute_wave_32, host_min_wave_set, keyed_apart, keyed_apart_any, named,
     set_host_min_wave, wave64_as_console, wave_kept,
 };
 pub use lower::{host_settings, set_host_max_wave, set_host_rdna, set_thread_max_wave};
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_COPIES, MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
+    COUNT_DWORDS, COUNT_HISTOGRAM, COUNT_NAMES, COUNT_SLOTS, MEMORY_COPIES, MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY,
+    ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_COUNTS, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, VIEW_ADDRESSES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     constants_raw, null_buffer_view, raw_views, set_null_buffer_view, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
@@ -372,6 +373,34 @@ pub fn bvh_miss() -> bool {
 thread_local! {
     /// A test's choice for [`bvh_miss`] on its thread (`None`: the switch's).
     pub(crate) static BVH_MISS_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// A test's choice for [`bvh_count`] on its thread (`None`: the switch's).
+    pub(crate) static BVH_COUNT_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Diagnostics: whether a compute program with a ray-tracing node test counts
+/// what its walks do into the root UAV [`SLOT_COUNTS`] (`shader::COUNT_NAMES`:
+/// node tests by kind, tests of pages with no copy or of wild addresses, how
+/// many nodes each lane tested, lanes stopped at the loop limit).
+/// `VICTORY_BVH_COUNT=1`, diagnostics builds only; off, nothing of the
+/// translation changes. Part of the translation of the programs with a node
+/// test only: the shader cache keys them apart ([`keyed_apart`]).
+pub fn bvh_count() -> bool {
+    #[cfg(test)]
+    if let Some(on) = BVH_COUNT_TEST.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_BVH_COUNT").is_some_and(|v| v == "1"))
+}
+
+/// The run of [`SLOT_COUNTS`] a program with code `code` counts into: a hash
+/// of its code. Two programs may share one (the host says which share).
+pub(crate) fn bvh_count_slot_of(code: &[u8]) -> u32 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in code {
+        h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (h % u64::from(COUNT_SLOTS)) as u32
 }
 
 /// What `VICTORY_TYPED_RW` says: on only when it is `1`.

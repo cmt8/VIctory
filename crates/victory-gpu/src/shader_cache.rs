@@ -283,6 +283,12 @@ fn named(container: &[u8]) -> (String, [u8; 32]) {
     if marks.contains(&victory_shader::emit::GROUP_CU_MARK) {
         group_cu_named(&name);
     }
+    #[cfg(feature = "diagnostics")]
+    if victory_shader::emit::bvh_count()
+        && let Some(slot) = victory_shader::emit::bvh_count_slot(container)
+    {
+        crate::host::rtcount::named(slot, &name);
+    }
     let build = marks.into_iter().fold(build, apart_key);
     (name, build)
 }

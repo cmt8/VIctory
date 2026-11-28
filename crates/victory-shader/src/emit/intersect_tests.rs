@@ -642,6 +642,114 @@ fn the_32_bit_node_test_over_title_memory_matches_the_reference_on_the_card() {
     run(false, descriptor, 0, true);
 }
 
+/// `VICTORY_BVH_COUNT=1` (diagnostics): the program's lanes count their node
+/// tests by kind and by what came back, and the histogram has each lane that
+/// tested a node once at one test; the results stay the reference's.
+#[test]
+fn counted_node_tests_add_up_on_the_card() {
+    use super::lower::intersect::{TEST_COUNTS, count};
+    use super::shader::{COUNT_DWORDS, COUNT_HISTOGRAM, COUNT_NAMES};
+    let was = super::BVH_COUNT_TEST.replace(Some(true));
+    let _memory = Memory::at(BASE);
+    // The run of counts after the results, in the program's own place.
+    TEST_COUNTS.set(Some((1, 16 * THREADS)));
+    let built = build(true, WHOLE);
+    TEST_COUNTS.set(None);
+    super::BVH_COUNT_TEST.set(was);
+    let (shader, _) = built.expect("the counting program lowers");
+    let slot = super::bvh_count_slot_of(&native(&program(true, WHOLE)).code);
+    let (scene, batches) = scene();
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    };
+    let (root, pso) = host.compute_pipeline(&shader).expect("compute_pipeline");
+    let mut ran = 0;
+    for batch in batches.iter().take(4) {
+        let data = buffer(&scene, batch, BASE + u64::from(NODES));
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(vec![0; 5]))],
+                    views: &[
+                        View::Buffer { data: &data, stride: Stride::Raw },
+                        View::RawUav(4 * THREADS + super::COUNT_SLOTS * COUNT_DWORDS),
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("dispatch");
+        let counts = &out[0][(4 * THREADS + slot * COUNT_DWORDS) as usize..][..COUNT_DWORDS as usize];
+        let cases: Vec<&(usize, u32, Ray)> = batch.iter().flatten().collect();
+        let results: Vec<[u32; 4]> = batch.iter().flatten().map(|c| expected(&scene, &Some(*c), true)).collect();
+        let kind = |k: &dyn Fn(u32) -> bool| cases.iter().filter(|c| k(c.1)).count() as u32;
+        let children: u32 = cases
+            .iter()
+            .zip(&results)
+            .filter(|(c, _)| matches!(c.1, 4 | 5))
+            .map(|(_, r)| r.iter().filter(|&&x| x != bvh::NONE).count() as u32)
+            .sum();
+        let hits = cases
+            .iter()
+            .zip(&results)
+            .filter(|(c, r)| c.1 < 4 && r[0] != f32::INFINITY.to_bits())
+            .count() as u32;
+        let n = cases.len() as u32;
+        let named = |k: usize| (COUNT_NAMES[k], counts[k]);
+        assert_eq!(named(count::TESTS), (COUNT_NAMES[count::TESTS], n), "{counts:?}");
+        assert_eq!(named(count::WIDE).1, n);
+        assert_eq!(named(count::BOX16).1, kind(&|k| k == 4));
+        assert_eq!(named(count::BOX32).1, kind(&|k| k == 5));
+        assert_eq!(named(count::TRIANGLE).1, kind(&|k| k < 4));
+        assert_eq!(named(count::OTHER).1, kind(&|k| k >= 6));
+        assert_eq!(named(count::CHILDREN).1, children);
+        assert_eq!(named(count::TRI_HIT).1, hits);
+        assert_eq!(named(count::NO_COPY).1, 0);
+        assert_eq!(named(count::WILD).1, 0);
+        assert_eq!(named(count::LANES).1, n);
+        assert_eq!(named(count::THREADS).1, THREADS);
+        assert_eq!(named(count::LOOP_LIMIT).1, 0);
+        assert_eq!(named(count::MOST).1, u32::from(n > 0));
+        assert_eq!(counts[COUNT_HISTOGRAM as usize + 1], n, "lanes of one test");
+        assert_eq!(counts[COUNT_HISTOGRAM as usize + 2..].iter().sum::<u32>(), 0);
+        // What the program stores is the reference's still.
+        for (t, case) in batch.iter().enumerate() {
+            let want = expected(&scene, case, true);
+            assert_eq!(&out[0][4 * t..4 * t + 4], want, "thread {t}");
+        }
+        ran += u32::from(n > 0);
+    }
+    assert!(ran > 0);
+}
+
+/// The counts are the switch's alone: off, a program with a node test lowers
+/// to the same DXIL as it did and binds no counts; on, it binds them, in both
+/// forms (the 32-bit one reads the structure's header too), and the shader
+/// cache keys such programs apart.
+#[test]
+fn node_tests_are_counted_only_with_the_switch() {
+    for (wide, descriptor) in [(true, WHOLE), (false, Descriptor::Numbers(0x1234_5678, bvh::BOX_SORT))] {
+        let was = super::BVH_COUNT_TEST.replace(Some(false));
+        let off = build(wide, descriptor).expect("lowers").0;
+        let any_off = super::keyed_apart_any();
+        super::BVH_COUNT_TEST.set(None);
+        let unset = build(wide, descriptor).expect("lowers").0;
+        super::BVH_COUNT_TEST.set(Some(true));
+        let on = build(wide, descriptor).expect("lowers with the counts").0;
+        let any_on = super::keyed_apart_any();
+        super::BVH_COUNT_TEST.set(was);
+        assert_eq!(off.dxil, unset.dxil, "the switch off is the switch unset");
+        assert!(!off.root_uavs.contains(&super::SLOT_COUNTS));
+        assert!(on.root_uavs.contains(&super::SLOT_COUNTS));
+        assert_ne!(off.dxil, on.dxil);
+        assert_eq!(any_on.len(), any_off.len() + 1);
+    }
+}
+
 #[test]
 fn a_descriptor_of_numbers_is_title_memory_read_through_the_directory() {
     for wide in [true, false] {

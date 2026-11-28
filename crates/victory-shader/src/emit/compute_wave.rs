@@ -318,6 +318,16 @@ pub const GROUP_CU: &str = "VICTORY_GROUP_CU: a group with a barrier and no LDS 
 /// [`keyed_apart`]'s mark of a program with a ray-tracing node test whose
 /// tests all miss ([`super::bvh_miss`]).
 const BVH_MISS: &str = "VICTORY_BVH_MISS=1: every ray-tracing node test a miss";
+/// [`keyed_apart`]'s mark of a program with a ray-tracing node test that
+/// counts what its walks do ([`super::bvh_count`]).
+const BVH_COUNT: &str = "VICTORY_BVH_COUNT=1: ray-tracing node tests counted into u252";
+
+/// Diagnostics: the run of `SLOT_COUNTS` the program of `container` counts
+/// into ([`super::bvh_count`]), for a compute program with a node test.
+pub fn bvh_count_slot(container: &[u8]) -> Option<u32> {
+    let p = console_program(container)?;
+    (p.stage == crate::native::HwStage::Cs && has_bvh(&p.code)).then(|| super::bvh_count_slot_of(&p.code))
+}
 
 /// Whether `p` is a compute program with an `s_barrier` that declares no LDS:
 /// the programs [`super::group_cu`] reaches, as far as the program's header
@@ -374,6 +384,9 @@ pub fn keyed_apart(container: &[u8], kept: bool) -> Vec<&'static str> {
     if console_program(container).is_some_and(|p| bvh_marked(&p)) {
         marks.push(BVH_MISS);
     }
+    if super::bvh_count() && bvh_count_slot(container).is_some() {
+        marks.push(BVH_COUNT);
+    }
     if !console && !halves && !even {
         return marks;
     }
@@ -418,6 +431,9 @@ pub fn keyed_apart_any() -> Vec<&'static str> {
     }
     if super::bvh_miss() {
         marks.push(BVH_MISS);
+    }
+    if super::bvh_count() {
+        marks.push(BVH_COUNT);
     }
     marks
 }

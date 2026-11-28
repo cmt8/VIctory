@@ -430,6 +430,11 @@ struct Lower<'a> {
     /// so the function has a single exit as DXC emits it (dxil-spirv, under
     /// Proton, cannot structure a loop left by both a break and a return).
     ret: Option<usize>,
+    /// Diagnostics (`super::bvh_count`): each lane's counts of what its
+    /// node tests did, one private global a `shader::COUNT_NAMES` entry, and
+    /// whether it left at the loop limit; added up at the end
+    /// (`intersect::bvh_count_flush`).
+    pub(super) bvh_counts: Option<Vec<V>>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -2376,6 +2381,7 @@ impl<'a> Lower<'a> {
             counters: HashMap::new(),
             abort: None,
             ret: None,
+            bvh_counts: None,
         }
     }
 
@@ -3094,6 +3100,7 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        self.bvh_count_flush();
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();

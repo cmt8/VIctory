@@ -72,6 +72,33 @@ pub const MEMORY_PAGES: u32 = 1 << 21;
 pub const MEMORY_READ_ONLY: u32 = 1 << 31;
 /// Dwords of the [`SLOT_FAULTS`] buffer.
 pub const MEMORY_FAULTS: u32 = 4096;
+/// Diagnostics (`VICTORY_BVH_COUNT=1`, `super::bvh_count`): the root UAV
+/// `u<SLOT_COUNTS>` of a program with a ray-tracing node test takes what its
+/// walks did, [`COUNT_SLOTS`] runs of [`COUNT_DWORDS`] dwords (one run per
+/// program, by `super::bvh_count_slot`), added to atomically and never
+/// cleared: the host reads them as they grow (`COUNT_*` for the dwords).
+pub const SLOT_COUNTS: u8 = 252;
+/// See [`SLOT_COUNTS`].
+pub const COUNT_SLOTS: u32 = 64;
+/// See [`SLOT_COUNTS`].
+pub const COUNT_DWORDS: u32 = 64;
+/// Dwords of a [`SLOT_COUNTS`] run, summed over the lanes of a program's
+/// dispatches: node tests; of them in the 64-bit form; on 16-bit box, 32-bit
+/// box, triangle and other nodes (kinds 6, 7); of a page with no copy; at an
+/// address outside title memory (below 4 GiB, past 128 GiB); box tests of a
+/// page there that returned no child; triangle tests that hit; box nodes of a
+/// page there whose four child pointers are all 0; 32-bit form only: with a
+/// header at the descriptor's base that is not a version 6 one, a node past
+/// the size the header gives, a base of 0; lanes that tested a node; lanes
+/// that left at the translation's loop limit; lanes that ended; the most
+/// nodes a lane tested (a maximum); children box tests returned.
+pub const COUNT_NAMES: [&str; 19] = [
+    "tests", "wide", "box16", "box32", "triangle", "other", "no-copy", "wild", "box-none", "tri-hit", "zero-box",
+    "bad-header", "past-size", "base-0", "lanes", "loop-limit", "threads", "most", "children",
+];
+/// From this dword of a [`SLOT_COUNTS`] run: lanes by the nodes they tested,
+/// `n` at `COUNT_HISTOGRAM + k` for `2^(k-1) <= n < 2^k` (k 1..=31).
+pub const COUNT_HISTOGRAM: u32 = 32;
 /// Host copies a [`SLOT_MEMORY`] directory entry can number. The run of
 /// view-heap slots from `base` is one longer, and the host fills every slot
 /// of it with a raw view (the null one where no copy is yet). A translated

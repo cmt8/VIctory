@@ -713,7 +713,9 @@ impl Module {
                     _ => *p,
                 };
                 match base {
-                    V::Global(g) if self.globals[g as usize].init.is_some() => Effect::Pure,
+                    V::Global(g) if self.globals[g as usize].init.is_some() && self.globals[g as usize].constant => {
+                        Effect::Pure
+                    }
                     _ => Effect::Reads,
                 }
             }

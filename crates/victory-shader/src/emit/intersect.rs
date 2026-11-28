@@ -25,7 +25,7 @@
 //! Each lane reads only the dwords its node's kind needs: 28 for a 32-bit
 //! box node, 16 for a 16-bit one, 10 for a triangle.
 
-use super::{Attr, Bin, Fields, Inst, Lower, Operand, Reg, Term, V, Why, flags, pred};
+use super::{Attr, Bin, Cast, Fields, Inst, Lower, Operand, Reg, Term, V, Why, flags, pred};
 use crate::bvh;
 use crate::resource::BvhNodes;
 
@@ -144,6 +144,7 @@ impl<'a> Lower<'a> {
             inverse: [f[7], f[8], f[9]],
         };
         let c = self.cur;
+        let mut descriptor = None;
         let at = match nodes {
             BvhNodes::Resource => {
                 let src = self
@@ -169,6 +170,7 @@ impl<'a> Lower<'a> {
                         .ok_or("an unread operand")?;
                     *w = self.i32_of(v)?;
                 }
+                descriptor = Some((words[0], words[1]));
                 let (low, high) = self.bvh_address(words[0], words[1], pointer, pointer_high);
                 // One look for the node's copy, before the branches: a
                 // node is 64 bytes on 64, so its first half lies in one
@@ -235,6 +237,10 @@ impl<'a> Lower<'a> {
                 ],
             );
             results.push((phi, zero));
+        }
+        if super::super::bvh_count() && self.s.threads.is_some() {
+            let found: [V; 4] = std::array::from_fn(|k| results[k].0);
+            self.bvh_count_test(at, kind, &found, descriptor, pointer, wide);
         }
         let results = self.end_guarded(gate, &results);
         for (k, &r) in results.iter().enumerate() {
@@ -615,5 +621,263 @@ impl<'a> Lower<'a> {
             let f = self.s.m.select(c, hit, out[n], miss[n]);
             self.as_int(f)
         })
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The tests' stand-in for the root UAV of the counts
+    /// ([`super::super::shader::SLOT_COUNTS`]): a heap slot holding a raw UAV,
+    /// and the byte in it where the runs of counts start.
+    pub(in crate::emit) static TEST_COUNTS: std::cell::Cell<Option<(u32, u32)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Which of a lane's counts ([`super::super::shader::COUNT_NAMES`]).
+pub(in crate::emit) mod count {
+    pub const TESTS: usize = 0;
+    pub const WIDE: usize = 1;
+    pub const BOX16: usize = 2;
+    pub const BOX32: usize = 3;
+    pub const TRIANGLE: usize = 4;
+    pub const OTHER: usize = 5;
+    pub const NO_COPY: usize = 6;
+    pub const WILD: usize = 7;
+    pub const BOX_NONE: usize = 8;
+    pub const TRI_HIT: usize = 9;
+    pub const ZERO_BOX: usize = 10;
+    pub const BAD_HEADER: usize = 11;
+    pub const PAST_SIZE: usize = 12;
+    pub const BASE_0: usize = 13;
+    pub const LANES: usize = 14;
+    pub const LOOP_LIMIT: usize = 15;
+    pub const THREADS: usize = 16;
+    pub const MOST: usize = 17;
+    pub const CHILDREN: usize = 18;
+}
+
+impl Lower<'_> {
+    /// Diagnostics (`VICTORY_BVH_COUNT=1`): this lane's private count `k`
+    /// ([`count`]; one past them: whether it left at the loop limit), made
+    /// the first time.
+    fn bvh_counter(&mut self, k: usize) -> V {
+        if self.bvh_counts.is_none() {
+            let zero = self.s.m.i32(0);
+            let names = super::super::shader::COUNT_NAMES;
+            let globals = (0..=names.len())
+                .map(|n| self.s.m.private_global(&format!("victory.bvh.count.{n}"), zero))
+                .collect();
+            self.bvh_counts = Some(globals);
+        }
+        self.bvh_counts.as_ref().expect("made")[k]
+    }
+
+    /// Adds `by` to this lane's count `k`, in the current block.
+    fn bvh_count_add(&mut self, k: usize, by: V) {
+        let g = self.bvh_counter(k);
+        let c = self.cur;
+        let was = self.s.m.load(c, g);
+        let now = self.s.m.bin(c, Bin::Add, was, by);
+        self.s.m.store(c, g, now);
+    }
+
+    /// Adds 1 to count `k` where `yes` holds.
+    fn bvh_count_if(&mut self, k: usize, yes: V) {
+        let i32t = self.s.t.i32;
+        let one = self.s.m.cast(self.cur, Cast::ZExt, yes, i32t);
+        self.bvh_count_add(k, one);
+    }
+
+    /// Diagnostics: counts one node test of a lane that runs it, from its
+    /// node, kind and results (`descriptor`: the descriptor's first two
+    /// dwords, over title memory). May go on in another block.
+    fn bvh_count_test(&mut self, at: NodeAt, kind: V, results: &[V; 4], descriptor: Option<(V, V)>, pointer: V, wide: bool) {
+        use count::*;
+        let one = self.s.m.i32(1);
+        self.bvh_count_add(TESTS, one);
+        if wide {
+            self.bvh_count_add(WIDE, one);
+        }
+        let c = self.cur;
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let (k4, k5, k6, none, zero) = (k(self, 4), k(self, 5), k(self, 6), k(self, bvh::NONE), k(self, 0));
+        let yes = self.s.m.bool(true);
+        let box16 = self.s.m.cmp(c, pred::EQ, kind, k4);
+        let box32 = self.s.m.cmp(c, pred::EQ, kind, k5);
+        let triangle = self.s.m.cmp(c, pred::IULT, kind, k4);
+        let other = self.s.m.cmp(c, pred::IUGE, kind, k6);
+        let is_box = self.s.m.bin(c, Bin::Or, box16, box32);
+        self.bvh_count_if(BOX16, box16);
+        self.bvh_count_if(BOX32, box32);
+        self.bvh_count_if(TRIANGLE, triangle);
+        self.bvh_count_if(OTHER, other);
+        // Children returned, and whether none was.
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let mut hits = zero;
+        for &r in results {
+            let hit = self.s.m.cmp(c, pred::NE, r, none);
+            let hit = self.s.m.bin(c, Bin::And, hit, is_box);
+            let n = self.s.m.cast(c, Cast::ZExt, hit, i32t);
+            hits = self.s.m.bin(c, Bin::Add, hits, n);
+        }
+        self.bvh_count_add(CHILDREN, hits);
+        let c = self.cur;
+        let no_child = self.s.m.cmp(c, pred::EQ, hits, zero);
+        let miss = k(self, bvh::MISS[0].to_bits());
+        let tri_hit = self.s.m.cmp(c, pred::NE, results[0], miss);
+        let tri_hit = self.s.m.bin(c, Bin::And, tri_hit, triangle);
+        self.bvh_count_if(TRI_HIT, tri_hit);
+        let there = match at {
+            NodeAt::Memory { mapped, high, .. } => {
+                let c = self.cur;
+                let missing = self.s.m.bin(c, Bin::Xor, mapped, yes);
+                self.bvh_count_if(NO_COPY, missing);
+                // Below 4 GiB or past 128 GiB (bits 32 to 39 of the address
+                // 0, or 0x20 and up): not the title's memory.
+                let c = self.cur;
+                let (kff, k20) = (k(self, 0xff), k(self, 0x20));
+                let top = self.s.m.bin(c, Bin::And, high, kff);
+                let below = self.s.m.cmp(c, pred::EQ, top, zero);
+                let past = self.s.m.cmp(c, pred::IUGE, top, k20);
+                let wild = self.s.m.bin(c, Bin::Or, below, past);
+                self.bvh_count_if(WILD, wild);
+                Some(mapped)
+            }
+            NodeAt::Buffer { .. } => None,
+        };
+        let c = self.cur;
+        let box_there = match there {
+            Some(m) => self.s.m.bin(c, Bin::And, is_box, m),
+            None => is_box,
+        };
+        let box_none = self.s.m.bin(c, Bin::And, box_there, no_child);
+        self.bvh_count_if(BOX_NONE, box_none);
+        // A box node whose four child pointers read as 0.
+        let children = self.bvh_node_words(at, None, 0, 4);
+        let c = self.cur;
+        let mut any = zero;
+        for w in children {
+            any = self.s.m.bin(c, Bin::Or, any, w);
+        }
+        let blank = self.s.m.cmp(c, pred::EQ, any, zero);
+        let zero_box = self.s.m.bin(c, Bin::And, blank, box_there);
+        self.bvh_count_if(ZERO_BOX, zero_box);
+        // The 32-bit form over title memory: the structure's header at the
+        // descriptor's base, and the node's place against the size it gives.
+        if let (Some((word0, word1)), false) = (descriptor, wide) {
+            let c = self.cur;
+            let (k8, k24, kff) = (k(self, 8), k(self, 24), k(self, 0xff));
+            let base_low = self.s.m.bin(c, Bin::Shl, word0, k8);
+            let top = self.s.m.bin(c, Bin::LShr, word0, k24);
+            let upper = self.s.m.bin(c, Bin::And, word1, kff);
+            let upper = self.s.m.bin(c, Bin::Shl, upper, k8);
+            let base_high = self.s.m.bin(c, Bin::Or, top, upper);
+            let either = self.s.m.bin(c, Bin::Or, base_low, base_high);
+            let base0 = self.s.m.cmp(c, pred::EQ, either, zero);
+            self.bvh_count_if(BASE_0, base0);
+            let (handle, byte, header_there) = self.bvh_memory(base_low, base_high, None);
+            let words = self.bvh_node_words(NodeAt::Buffer { handle, byte }, None, 0, 2);
+            let c = self.cur;
+            let kffff = k(self, 0xffff);
+            let version = self.s.m.bin(c, Bin::And, words[0], kffff);
+            let six = self.s.m.cmp(c, pred::EQ, version, k6);
+            let bad = self.s.m.bin(c, Bin::Xor, six, yes);
+            let bad = self.s.m.bin(c, Bin::And, bad, header_there);
+            self.bvh_count_if(BAD_HEADER, bad);
+            let c = self.cur;
+            let k3 = k(self, 3);
+            let index = self.s.m.bin(c, Bin::LShr, pointer, k3);
+            let past = self.s.m.cmp(c, pred::IUGE, index, words[1]);
+            let good = self.s.m.bin(c, Bin::And, six, header_there);
+            let past = self.s.m.bin(c, Bin::And, past, good);
+            self.bvh_count_if(PAST_SIZE, past);
+        }
+    }
+
+    /// Diagnostics: at the end of a compute program that counted its node
+    /// tests, each lane adds its counts to its program's run of the root UAV
+    /// `SLOT_COUNTS` (atomically, and only counts that are not 0), and itself
+    /// to the histogram of lanes by the nodes they tested. A lane that leaves
+    /// at the loop limit notes it on its way out.
+    pub(super) fn bvh_count_flush(&mut self) {
+        use super::super::shader::{COUNT_DWORDS, COUNT_HISTOGRAM, COUNT_NAMES, SLOT_COUNTS};
+        use count::*;
+        let (Some(_), Some(ret)) = (&self.bvh_counts, self.ret) else {
+            return;
+        };
+        let i32t = self.s.t.i32;
+        let (zero, one) = (self.s.m.i32(0), self.s.m.i32(1));
+        if let Some(abort) = self.abort {
+            let g = self.bvh_counter(COUNT_NAMES.len());
+            self.s.m.store(abort, g, one);
+        }
+        let slot = super::super::bvh_count_slot_of(&self.x.native.code);
+        #[allow(unused_mut)]
+        let mut first = slot * COUNT_DWORDS * 4;
+        #[cfg(test)]
+        let test = TEST_COUNTS.get();
+        #[cfg(not(test))]
+        let test: Option<(u32, u32)> = None;
+        let handle = match test {
+            Some((heap, byte)) => {
+                first += byte;
+                let e = self.s.entry;
+                let heap = self.s.m.i32(heap);
+                self.s.heap_handle(e, heap, false, false, (11 | 0x1000, 0))
+            }
+            None => self.s.root_uav_handle(SLOT_COUNTS),
+        };
+        self.cur = ret;
+        let iu = self.s.m.undef(i32t);
+        let atomic = |l: &mut Self, op: u32, dword: V, value: V| {
+            let yes = l.s.m.cmp(l.cur, pred::NE, value, zero);
+            let gate = l.begin_guarded(Some(yes));
+            let c = l.cur;
+            let (k4, start, code) = (l.s.m.i32(4), l.s.m.i32(first), l.s.m.i32(op));
+            let byte = l.s.m.bin(c, Bin::Mul, dword, k4);
+            let byte = l.s.m.bin(c, Bin::Add, byte, start);
+            l.s.op(c, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[handle, code, byte, iu, iu, value]);
+            l.end_guarded(gate, &[]);
+        };
+        let loaded: Vec<V> = (0..=COUNT_NAMES.len())
+            .map(|k| {
+                let g = self.bvh_counter(k);
+                self.s.m.load(ret, g)
+            })
+            .collect();
+        let tests = loaded[TESTS];
+        for (k, &v) in loaded.iter().enumerate().take(COUNT_NAMES.len()) {
+            let c = self.cur;
+            // Atomic add (0), or unsigned maximum (7).
+            let (op, v) = match k {
+                LANES => {
+                    let ran = self.s.m.cmp(c, pred::NE, tests, zero);
+                    (0, self.s.m.cast(c, Cast::ZExt, ran, i32t))
+                }
+                LOOP_LIMIT => (0, loaded[COUNT_NAMES.len()]),
+                THREADS => (0, one),
+                MOST => (7, tests),
+                _ => (0, v),
+            };
+            let dword = self.s.m.i32(k as u32);
+            atomic(self, op, dword, v);
+        }
+        // The histogram: a lane of n tests at bucket floor(log2 n) + 1.
+        let c = self.cur;
+        let mut bucket = zero;
+        for b in 0..31 {
+            let at_least = self.s.m.i32(1 << b);
+            let over = self.s.m.cmp(c, pred::IUGE, tests, at_least);
+            let n = self.s.m.cast(c, Cast::ZExt, over, i32t);
+            bucket = self.s.m.bin(c, Bin::Add, bucket, n);
+        }
+        let hist = self.s.m.i32(COUNT_HISTOGRAM);
+        let dword = self.s.m.bin(c, Bin::Add, bucket, hist);
+        let ran = self.s.m.cmp(c, pred::NE, tests, zero);
+        let mark = self.s.m.cast(c, Cast::ZExt, ran, i32t);
+        atomic(self, 0, dword, mark);
+        let end = self.cur;
+        self.s.m.terminate(end, Term::Ret);
     }
 }

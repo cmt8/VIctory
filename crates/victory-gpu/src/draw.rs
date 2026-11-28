@@ -1959,6 +1959,28 @@ impl State {
                 }
             }
             for &(slot, param) in &stage.root_uavs {
+                if slot == victory_shader::emit::SLOT_COUNTS {
+                    // Ours (diagnostics, `VICTORY_BVH_COUNT=1`): where programs
+                    // that walk structures count what their walks did.
+                    #[cfg(feature = "diagnostics")]
+                    let counts = crate::host::rtcount::address();
+                    #[cfg(not(feature = "diagnostics"))]
+                    let counts: Option<u64> = None;
+                    let Some(counts) = counts else {
+                        unbound_root("the counts of node tests without their buffer");
+                        return false;
+                    };
+                    // SAFETY: an open list; the buffer lives as long as the
+                    // process and covers every program's run of counts.
+                    unsafe {
+                        if compute {
+                            l.SetComputeRootUnorderedAccessView(param, counts);
+                        } else {
+                            l.SetGraphicsRootUnorderedAccessView(param, counts);
+                        }
+                    }
+                    continue;
+                }
                 if slot == victory_shader::emit::SLOT_FAULTS {
                     // Ours: where shaders note the pages they found empty.
                     let Some(m) = &memory else {
