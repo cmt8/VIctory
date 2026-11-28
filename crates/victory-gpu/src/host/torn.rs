@@ -1,5 +1,6 @@
 //! Pieces of card copies that came down while a later flight was writing
-//! them (`VICTORY_FETCH_CHECK`, with `VICTORY_RELAY_COPY`).
+//! them (`VICTORY_FETCH_CHECK`, with `VICTORY_RELAY_COPY`: both on unless
+//! `=0`).
 //!
 //! On the copy queue a fetch runs beside later submissions (`relay_copy`),
 //! so what comes down of a piece may be what it held in the middle of one:
@@ -51,12 +52,37 @@ use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64};
 
 use super::*;
 
-/// `VICTORY_FETCH_CHECK=1`; off by default until a run has shown how often a
-/// piece is caught (the frame-rate line says so) and what the hashes cost
-/// (3-4 ms for 96 MB beside the merge, spread over the threads that land).
+/// Whether fetches over the copy queue are checked: with
+/// `VICTORY_RELAY_COPY` (on unless `=0`), on unless `VICTORY_FETCH_CHECK=0`.
+/// Not only a count: a suspect is fetched again by the next flight that may
+/// write it, whatever its compare says ([`Suspects::wanted`]), and without
+/// that title memory may keep bytes from the middle of a flight (see above).
+/// The hashes cost 3-4 ms for 96 MB beside the merge, spread over the
+/// threads that land; the runs that made the copy queue the default all had
+/// the check on.
 pub(super) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_FETCH_CHECK").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        if !relay_copy() {
+            return false;
+        }
+        let on = said(std::env::var("VICTORY_FETCH_CHECK").ok().as_deref());
+        if on {
+            tracing::info!(
+                "what comes down over the copy queue is hashed, and a piece caught while a later flight was at it is fetched again (VICTORY_FETCH_CHECK: on; =0 leaves it unchecked)"
+            );
+        } else {
+            tracing::warn!(
+                "what comes down over the copy queue is not checked (VICTORY_FETCH_CHECK=0): a piece caught while a later flight was at it may keep the bytes from in between"
+            );
+        }
+        on
+    })
+}
+
+/// What `VICTORY_FETCH_CHECK` says: on unless it is `0`.
+fn said(value: Option<&str>) -> bool {
+    value.is_none_or(|v| v.trim() != "0")
 }
 
 /// A piece: its copy's number, and the piece.
@@ -443,6 +469,16 @@ fn hash_avx2(bytes: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The check is the default with the copy queue: unset is on, only `0`
+    /// turns it off.
+    #[test]
+    fn the_check_is_on_unless_told_0() {
+        assert!(said(None));
+        assert!(said(Some("1")));
+        assert!(!said(Some("0")));
+        assert!(!said(Some(" 0")));
+    }
 
     #[test]
     fn the_wide_hash_is_the_plain_one() {

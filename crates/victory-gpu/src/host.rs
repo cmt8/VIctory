@@ -3160,8 +3160,12 @@ fn relay_exact() -> bool {
 }
 
 /// Whether the pieces the relay fetches from the card's memory come over the
-/// card's copy queue (`VICTORY_RELAY_COPY=1`) and not over the queue that
-/// draws.
+/// card's copy queue and not over the queue that draws: on unless
+/// `VICTORY_RELAY_COPY=0` (that is the drawing queue, as before), and with
+/// it the check of what comes down (`torn`, `VICTORY_FETCH_CHECK`, on unless
+/// `=0`). The default since three runs of 400 s had the boat scene 5 to 7
+/// ms a frame faster and the wait for fetches 26 to 11 ms, and two
+/// comparisons of pictures found them the same.
 ///
 /// On the drawing queue a fetch runs behind whatever was sent meanwhile,
 /// and with the relay that is most of a frame: the thread that lands flights
@@ -3177,7 +3181,22 @@ fn relay_exact() -> bool {
 /// may be in what is fetched, as before.
 fn relay_copy() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_RELAY_COPY").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        let on = relay_copy_said(std::env::var("VICTORY_RELAY_COPY").ok().as_deref());
+        if on {
+            tracing::info!(
+                "the relay fetches what shaders wrote to the card's memory over the card's copy queue (VICTORY_RELAY_COPY: on; =0 fetches on the drawing queue)"
+            );
+        } else {
+            tracing::info!("the relay fetches what shaders wrote to the card's memory on the drawing queue (VICTORY_RELAY_COPY=0)");
+        }
+        on
+    })
+}
+
+/// What `VICTORY_RELAY_COPY` says: on unless it is `0`.
+fn relay_copy_said(value: Option<&str>) -> bool {
+    value.is_none_or(|v| v.trim() != "0")
 }
 
 /// Told when something joins [`LINE`], for the thread that lands flights
@@ -3230,7 +3249,17 @@ fn flagged_pieces(flags: &[(usize, u32, bool)]) -> Vec<(usize, u32)> {
 
 #[cfg(test)]
 mod relay_tests {
-    use super::{flagged_pieces, landable};
+    use super::{flagged_pieces, landable, relay_copy_said};
+
+    /// The copy queue is the default: unset is on, only `0` turns it off.
+    #[test]
+    fn the_copy_queue_is_on_unless_told_0() {
+        assert!(relay_copy_said(None));
+        assert!(relay_copy_said(Some("1")));
+        assert!(relay_copy_said(Some("")));
+        assert!(!relay_copy_said(Some("0")));
+        assert!(!relay_copy_said(Some(" 0 ")));
+    }
 
     /// Two flights and what follows each: nothing of the second lands
     /// before the card has run it, and nothing behind a flight lands

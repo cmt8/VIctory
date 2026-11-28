@@ -749,7 +749,7 @@ mod tests {
 
     /// (e) of the list in `Host::relay_card_back`'s fetch: a flight's result
     /// is fetched while the next flight is at the same bytes, which ends with
-    /// what it found. Without `VICTORY_FETCH_CHECK` title memory keeps what
+    /// what it found. With `VICTORY_FETCH_CHECK=0` title memory keeps what
     /// was in between, and the next refresh of the 64 KiB sends it up.
     #[test]
     #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 VICTORY_FETCH_CHECK=1 and a process of its own"]
@@ -797,7 +797,7 @@ mod tests {
             super::torn::STATS[..3].iter().map(|s| s.load(Ordering::Relaxed)).collect::<Vec<_>>()
         );
         assert_eq!(look(host), Some(0));
-        assert_eq!((wrong, undone), (0, 0), "without VICTORY_FETCH_CHECK=1 most are wrong");
+        assert_eq!((wrong, undone), (0, 0), "with VICTORY_FETCH_CHECK=0 most are wrong");
     }
 
     /// What nobody declared: a shader writes a piece through a view that was
