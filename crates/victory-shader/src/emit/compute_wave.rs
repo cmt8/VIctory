@@ -334,6 +334,21 @@ const BVH_COUNT: &str = "VICTORY_BVH_COUNT=1: ray-tracing node tests counted int
 /// limit before.
 const BVH_WALK_OVER: &str = "walks past 7/8 of their loop limit: node tests find nothing";
 
+/// [`keyed_apart`]'s mark of a program [`super::root_index_checked`] can
+/// reach ([`root_by_index`]).
+const ROOT_RANGE: &str = "VICTORY_ROOT_RANGE: root views by index check it against their records";
+
+/// Whether `p` may access a buffer by index through a descriptor built
+/// around a root view: a root descriptor in its layout and some dword of its
+/// code a MUBUF or MTBUF instruction's first with `idxen` (bit 13), as far
+/// as the code tells without lowering it.
+fn root_by_index(p: &crate::native::NativeProgram) -> bool {
+    p.layout.iter().any(|r| r.root == crate::native::RootType::Descriptor)
+        && p.code.chunks_exact(4).any(|w| {
+            let w = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+            matches!(w >> 26, 0x38 | 0x3A) && w & 1 << 13 != 0
+        })
+}
 
 /// [`keyed_apart`]'s mark of a compute program with a ray-tracing node test
 /// whose loops are left at [`super::bvh_loop_limit`]'s count, with the count.
@@ -478,6 +493,9 @@ pub fn keyed_apart(container: &[u8], kept: bool) -> Vec<&'static str> {
     if bvh_count_slot(container).is_some() {
         marks.push(BVH_WALK_OVER);
     }
+    if super::root_index_checked() && console_program(container).is_some_and(|p| root_by_index(&p)) {
+        marks.push(ROOT_RANGE);
+    }
     if walker_wave32() && console_wave64_compute(container).is_some_and(|p| has_bvh(&p.code)) {
         marks.push(BVH_WAVE32);
     }
@@ -537,6 +555,9 @@ pub fn keyed_apart_any() -> Vec<&'static str> {
         marks.push(mark);
     }
     marks.push(BVH_WALK_OVER);
+    if super::root_index_checked() {
+        marks.push(ROOT_RANGE);
+    }
     if walker_wave32() {
         marks.push(BVH_WAVE32);
     }
@@ -763,6 +784,48 @@ mod tests {
         assert!(!off_any.contains(&BVH_MISS));
         assert!(on_any.contains(&BVH_MISS));
         assert_eq!(on_any.iter().filter(|m| **m != BVH_MISS).collect::<Vec<_>>(), off_any.iter().collect::<Vec<_>>());
+    }
+
+    /// `VICTORY_ROOT_RANGE` keys apart a program with a root descriptor and
+    /// a buffer access by index, and only with the switch on.
+    #[test]
+    fn root_views_by_index_are_keyed_apart() {
+        use crate::native::{ComputeIo, HwStage, NativeProgram, RootParam, RootType, StageIo};
+        let program = |root: RootType, code: &[u32]| NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![RootParam { root, table_offset_dwords: 0, sgprs: 2, base_register: 0, user_data: 0, slot: 0 }],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo { rsrc2: 0, threads: [32, 1, 1] }),
+            code: code.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        // buffer_store_dword v2, v1, s[12:15], 0 idxen; s_endpgm
+        let indexed = [0xE070_2000, 0x8003_0201, 0xBF81_0000];
+        // ... offen
+        let offset = [0xE070_1000, 0x8003_0201, 0xBF81_0000];
+        assert!(root_by_index(&program(RootType::Descriptor, &indexed)));
+        assert!(!root_by_index(&program(RootType::Descriptor, &offset)));
+        assert!(!root_by_index(&program(RootType::Table, &indexed)));
+        let was = crate::emit::ROOT_RANGE_TEST.replace(Some(false));
+        let off = keyed_apart_any();
+        crate::emit::ROOT_RANGE_TEST.set(Some(true));
+        let on = keyed_apart_any();
+        crate::emit::ROOT_RANGE_TEST.set(was);
+        assert!(on.contains(&ROOT_RANGE) && !off.contains(&ROOT_RANGE));
+        assert_eq!(on.len(), off.len() + 1);
+        // The check: OOB_SELECT 0 and 1 against the records (the builder's
+        // descriptors: -1 records, OOB_SELECT 1), not 2 and 3, and not for a
+        // constant index below the records.
+        use super::super::index_records;
+        let builder = [u32::MAX, 0x1101_4FAC];
+        assert_eq!(index_records(builder, None), Some(u32::MAX));
+        assert_eq!(index_records(builder, Some(-1)), Some(u32::MAX));
+        assert_eq!(index_records(builder, Some(5)), None);
+        assert_eq!(index_records([u32::MAX, 0x0101_4FAC], None), Some(u32::MAX));
+        assert_eq!(index_records([u32::MAX, 0x2101_4FAC], None), None);
+        assert_eq!(index_records([u32::MAX, 0x3101_4FAC], None), None);
+        assert_eq!(index_records([8, 0x1101_4FAC], Some(8)), Some(8));
     }
 
     #[test]

@@ -229,6 +229,40 @@ pub fn builder_bounds() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_BOUNDS").is_none_or(|v| v != "0"))
 }
 
+/// Whether a buffer access by index through a descriptor built around a root
+/// view checks the index against the descriptor's record count where the
+/// console does (`lower.rs` `index_records`): a lane out of range (the
+/// structure builder's index -1) accesses nothing and reads 0.
+/// `VICTORY_ROOT_RANGE=0`: it is not checked, as before. Part of the
+/// translation of the programs it can reach: the shader cache keys them
+/// apart ([`keyed_apart`]).
+pub fn root_index_checked() -> bool {
+    #[cfg(test)]
+    if let Some(on) = ROOT_RANGE_TEST.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ROOT_RANGE").is_none_or(|v| v != "0"))
+}
+
+/// For an access by index through a buffer descriptor built around a root
+/// view (dwords 2 and 3 `words`), whose index is the constant `constant` if
+/// it is one: the record count the console checks the index against, where
+/// it does (OOB_SELECT 0 or 1, dword 3 bits 28-29) and the index may not be
+/// below it. With 0 or 1 the console checks the index against the record
+/// count before it adds index times stride; mode 0's other check (offset
+/// at least the stride) is left out. Pure, for testing.
+pub(crate) fn index_records(words: [u32; 2], constant: Option<i64>) -> Option<u32> {
+    let [records, word3] = words;
+    (word3 >> 28 & 3 <= 1 && constant.is_none_or(|x| x as u32 >= records)).then_some(records)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`root_index_checked`] on its thread (`None`: the switch's).
+    pub(crate) static ROOT_RANGE_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// Whether a compute program that uses the host's wave operations declares
 /// the console's wave size (`lower::wave_pin`): on RADV such a program
 /// otherwise runs in waves of 64 whatever the console's are.

@@ -12730,6 +12730,33 @@ impl<'a> Lower<'a> {
             .copied()
             .ok_or("an untracked buffer")?;
         let used = self.used_kind(src);
+        // A root view's descriptor has no record limit and its index is
+        // folded into the offset below; the console checks it first
+        // ([`super::index_records`]): a lane out of range (-1, the builder's)
+        // reads 0, stores nothing, its atomic returns 0. After
+        // Marvisak/VIctory PR #3670 by ZeOs360.
+        let inside = match (src, index) {
+            (Source::Built { words, .. }, Some(ix)) if !typed && super::root_index_checked() => {
+                super::index_records(*words, self.s.m.int_value(ix)).map(|records| {
+                    let records = self.s.m.i32(records);
+                    self.s.m.cmp(c, pred::IULT, ix, records)
+                })
+            }
+            _ => None,
+        };
+        // The guard's lanes in range.
+        let access = match (guard, inside) {
+            (Some(g), Some(k)) => Some(self.s.m.bin(c, Bin::And, g, k)),
+            (g, k) => g.or(k),
+        };
+        // A loaded dword: 0 in lanes out of range.
+        let ranged = |l: &mut Self, x: V| match inside {
+            Some(k) => {
+                let zero = l.s.m.i32(0);
+                l.s.m.select(l.cur, k, x, zero)
+            }
+            None => x,
+        };
         let halves = self.moves_halves(inst, src, typed, d16);
         let (base, extra) = self.built_offset(src)?;
         if base != 0 {
@@ -12796,6 +12823,7 @@ impl<'a> Lower<'a> {
                     Some(_) => self.raw_dwords(h, a, 1)[0],
                     None => self.cbuffer_dword(h, a),
                 };
+                let x = ranged(self, x);
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
@@ -12809,7 +12837,7 @@ impl<'a> Lower<'a> {
                 off = self.s.m.bin(c, Bin::Add, element, off);
                 index = None;
             }
-            if let Some((_, byte)) = self.root_memory(src, off, guard, store || atomic.is_some()) {
+            if let Some((_, byte)) = self.root_memory(src, off, access, store || atomic.is_some()) {
                 off = byte;
             }
         }
@@ -12877,6 +12905,7 @@ impl<'a> Lower<'a> {
                 let Some(Operand::Vector { reg, .. }) = *data else {
                     return Err("a buffer result");
                 };
+                let x = ranged(self, x);
                 self.write(inst, Reg::V(reg), x, guard);
                 return Ok(());
             }
@@ -12891,7 +12920,7 @@ impl<'a> Lower<'a> {
             let set_next = self.s.m.bin(c, Bin::LShr, v, k8);
             let (and, or) = (self.s.m.i32(1), self.s.m.i32(2));
             let i32t = self.s.t.i32;
-            let at = self.begin_guarded(guard);
+            let at = self.begin_guarded(access);
             for (op, x) in [(and, keep), (or, set)] {
                 let args = [h, op, aligned, iu, iu, x];
                 self.s
@@ -12936,7 +12965,16 @@ impl<'a> Lower<'a> {
                 Some(v) if returns => self.i32_of(v)?,
                 _ => self.s.m.i32(0),
             };
-            let at = self.begin_guarded(guard);
+            // Lanes out of range return 0; lanes outside the guard keep it.
+            let old = match (inside, guard) {
+                (Some(_), None) => self.s.m.i32(0),
+                (Some(_), Some(g)) if returns => {
+                    let zero = self.s.m.i32(0);
+                    self.s.m.select(self.cur, g, zero, old)
+                }
+                _ => old,
+            };
+            let at = self.begin_guarded(access);
             let i32t = self.s.t.i32;
             let r = if op == u32::MAX {
                 // cmpswap: data is (new, compare).
@@ -13059,7 +13097,7 @@ impl<'a> Lower<'a> {
             if !typed {
                 args.push(self.s.m.i32(4));
             }
-            let at = self.begin_guarded(guard);
+            let at = self.begin_guarded(access);
             let void = self.s.t.void;
             self.s.op(self.cur, name, Attr::NoUnwind, void, op, &args);
             self.end_guarded(at, &[]);
@@ -13081,6 +13119,7 @@ impl<'a> Lower<'a> {
                 xs = self.d16_channels(f, xs)?;
             }
             for (k, x) in xs.into_iter().enumerate() {
+                let x = ranged(self, x);
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
@@ -13203,7 +13242,8 @@ impl<'a> Lower<'a> {
                         None => h,
                     });
                 }
-                self.write(inst, Reg::V(reg + k as u8), x.expect("a channel"), guard);
+                let x = ranged(self, x.expect("a channel"));
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             self.read_and_written(read_through);
             return Ok(());
@@ -13212,6 +13252,7 @@ impl<'a> Lower<'a> {
             let x = self.s.m.extract(c, r, k);
             // (Integers already where the load moved halves.)
             let x = if halves { x } else { self.as_int(x) };
+            let x = ranged(self, x);
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         self.read_and_written(read_through);
