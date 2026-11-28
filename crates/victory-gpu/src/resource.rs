@@ -3210,8 +3210,9 @@ pub(crate) fn placed_bytes(desc: &[u32; 14]) -> Option<u64> {
 
 /// The resource [`texture_at`] made for a texture placed at `address` with
 /// the description `desc`, if it has made one: never made here (for the
-/// frame listing, which must not count as a use).
-#[cfg(all(windows, feature = "diagnostics"))]
+/// frame listing, which must not count as a use; and the stand-in for
+/// reflections' look through the frame's table, `draw::placed_made`).
+#[cfg(windows)]
 pub(crate) fn texture_at_made(address: u64, desc: &[u32; 14]) -> Option<This> {
     let mut key = *desc;
     key[1] = 0;

@@ -829,12 +829,14 @@ pub(crate) struct Views {
 /// For the line every ten seconds: what the stand-in for reflections did.
 struct Said {
     /// Dispatches of the miss program it followed, frames they were in,
-    /// and those it left as they were: of water or the alpha layer, and
-    /// before a frame's light was kept (or no tables).
+    /// and those it left as they were: of water or the alpha layer, before
+    /// a frame's light was kept, and those whose rays' image or picture's
+    /// depth was not found (or not of the format and size it takes).
     ran: AtomicU64,
     frames: AtomicU64,
     water: AtomicU64,
     not_ready: AtomicU64,
+    not_found: AtomicU64,
     last_frame: AtomicU64,
     /// Bit 0 opaque surfaces, 1 alpha, 2 water, 3 others.
     layers: AtomicU64,
@@ -845,6 +847,7 @@ static SAID_MISS: Said = Said {
     frames: AtomicU64::new(0),
     water: AtomicU64::new(0),
     not_ready: AtomicU64::new(0),
+    not_found: AtomicU64::new(0),
     last_frame: AtomicU64::new(u64::MAX),
     layers: AtomicU64::new(0),
 };
@@ -854,7 +857,11 @@ static SAID_MISS: Said = Said {
 pub(crate) enum MissNote {
     Ran(u32),
     Water,
+    /// Before a frame's light was kept: the estimate has nothing yet.
     NotReady,
+    /// The rays' image or the picture's depth not found, or not of the
+    /// format and size the pass takes.
+    NotFound,
 }
 
 /// Counts what came of a dispatch of the miss program; every ten seconds an
@@ -880,6 +887,9 @@ pub(crate) fn note_miss(note: MissNote) {
         MissNote::NotReady => {
             s.not_ready.fetch_add(1, Relaxed);
         }
+        MissNote::NotFound => {
+            s.not_found.fetch_add(1, Relaxed);
+        }
     }
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
@@ -902,14 +912,16 @@ pub(crate) fn note_miss(note: MissNote) {
     tracing::info!(
         "a stand-in for reflections (VICTORY_AMBIENT_SPECULAR={share},{sky}) in the last {:.0} s: \
          {} frames, {} dispatches of CS_RayMiss followed (surfaces: {}), each by an estimate along \
-         the reflected direction put in right after it (before CS_ResolveScreenSpace); {} of water or the alpha layer \
-         and {} before a frame's light was kept left as the title had them",
+         the reflected direction put in right after it (before CS_ResolveScreenSpace); left as the title had them: \
+         {} of water or the alpha layer, {} before a frame's light was kept, {} whose rays' image or picture's \
+         depth was not found",
         now.duration_since(since).as_secs_f32(),
         s.frames.swap(0, Relaxed),
         s.ran.swap(0, Relaxed),
         if named.is_empty() { "none".to_owned() } else { named.join(", ") },
         s.water.swap(0, Relaxed),
         s.not_ready.swap(0, Relaxed),
+        s.not_found.swap(0, Relaxed),
     );
 }
 
