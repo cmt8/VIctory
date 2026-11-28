@@ -619,6 +619,75 @@ pub(crate) fn host_wrote(resource: usize) -> bool {
         .is_some_and(|set| set.contains(&resource))
 }
 
+/// Textures a copy on the card wrote in a list that has been submitted
+/// ([`copies_submitted`]).
+static COPY_SUBMITTED: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+
+/// Uploads left out by [`upload_after_copy`], since the start.
+pub(crate) static AFTER_COPY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A list that recorded copies on the card into `resources` (title
+/// textures) is submitted: from here on they hold what the card wrote.
+/// (Not one the title released since: [`forget`].)
+pub(crate) fn copies_submitted(resources: &[usize]) {
+    if resources.is_empty() {
+        return;
+    }
+    let written = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(written) = written.as_ref() else {
+        return;
+    };
+    let mut set = COPY_SUBMITTED.lock().unwrap_or_else(|e| e.into_inner());
+    set.get_or_insert_with(Default::default)
+        .extend(resources.iter().copied().filter(|resource| written.contains(resource)));
+}
+
+/// Whether an upload of title memory into `resource`, claimed by a list
+/// that is being submitted now, must be left out: a copy on the card wrote
+/// the texture in a list submitted before this one
+/// (`VICTORY_UPLOAD_AFTER_COPY=1`: never, as before).
+///
+/// [`upload_from`] refuses a texture the card wrote, but it asks when the
+/// upload is recorded, and the upload is made when its list is submitted.
+/// The title bakes a character's skin into a texture of its own and copies
+/// the result in, level by level; the texture's slot is new in that frame,
+/// so a pass over the textures picked by index, on any thread, takes it and
+/// records an upload of what title memory holds there (what lay at that
+/// address: the bake never reaches title memory). If the list with the
+/// copies is submitted first, the title's bytes land over the baked texels,
+/// and stay: the texture is not uploaded again. One character's face was
+/// one flat colour or coarse blocks of every colour for a whole shot,
+/// another character's in the next run (runs fr1 to fr5). A list's own
+/// upload stays: its prelude runs before the copies it records.
+///
+/// To be asked only about an upload that would be made
+/// ([`PreludeUpload::due`]): each one asked about is counted and the first
+/// ones are said.
+pub(crate) fn upload_after_copy(resource: usize) -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let after = COPY_SUBMITTED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|set| set.contains(&resource));
+    // (Not one released and made anew since, whose list with the copies
+    // was submitted after the release.)
+    if !after || !host_wrote(resource) {
+        return false;
+    }
+    let n = AFTER_COPY.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let off = *OFF.get_or_init(|| std::env::var_os("VICTORY_UPLOAD_AFTER_COPY").is_some_and(|v| v == "1"));
+    if n <= 32 || n.is_power_of_two() {
+        tracing::info!(
+            uploads = n,
+            frame = crate::frame::current(),
+            left_out = !off,
+            "an upload of title memory into a texture that a copy on the card wrote in a list submitted before: left out (VICTORY_UPLOAD_AFTER_COPY=1: made, as before)"
+        );
+    }
+    !off
+}
+
 /// The title released a resource.
 pub(crate) fn forget(resource: usize) {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
@@ -627,6 +696,11 @@ pub(crate) fn forget(resource: usize) {
     }
     let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(set) = set.as_mut() {
+        set.remove(&resource);
+    }
+    drop(set);
+    // (A texture made anew at this address is the title's again.)
+    if let Some(set) = COPY_SUBMITTED.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         set.remove(&resource);
     }
     // Its memory may be given to other textures now (run 177: most of the
@@ -840,6 +914,18 @@ impl PreludeUpload {
     /// The title memory the texture is read from: address and bytes.
     pub(crate) fn memory(&self) -> (usize, usize) {
         self.staging.memory()
+    }
+
+    /// The title texture.
+    pub(crate) fn resource(&self) -> usize {
+        self.resource
+    }
+
+    /// Whether [`Self::finish_refresh`] would have the prelude upload: the
+    /// host texture was never uploaded, or its memory was read anew since.
+    pub(crate) fn due(&self) -> bool {
+        use std::sync::atomic::Ordering::Acquire;
+        !self.staging.uploaded.load(Acquire) || self.staging.dirty.load(Acquire)
     }
 
     /// Called on the submitting thread after `self.staging.refresh()` has
@@ -1981,6 +2067,57 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod after_copy_tests {
+    use super::{COPY_SUBMITTED, HOST_WRITTEN, copies_submitted, forget, host_wrote, upload_after_copy};
+
+    /// As [`super::host_written`] notes it, without the resource behind it.
+    fn card_wrote(resource: usize) {
+        HOST_WRITTEN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(Default::default)
+            .insert(resource);
+    }
+
+    /// An upload of title memory is left out once a list that copied into
+    /// the texture on the card has been submitted, and not before; a texture
+    /// released and made anew at the same place is the title's again, also
+    /// when the list with the copies into the old one is submitted late.
+    #[test]
+    fn no_upload_over_a_submitted_copy() {
+        // (Made-up, in nothing's address space: only keys here.)
+        let (baked, other, late) = (0xffff_fa5e_0000_1000usize, 0xffff_fa5e_0000_2000usize, 0xffff_fa5e_0000_3000usize);
+        // A copy is recorded: its list is not submitted yet, and a list
+        // submitted before it uploads as before (its upload runs first).
+        card_wrote(baked);
+        assert!(!upload_after_copy(baked));
+        // The list with the copies is submitted: no upload after it.
+        copies_submitted(&[baked]);
+        assert!(upload_after_copy(baked));
+        assert!(upload_after_copy(baked), "nor any later one");
+        assert!(!upload_after_copy(other), "another texture's is made");
+        // Released: what is made there next is filled from title memory.
+        forget(baked);
+        assert!(!host_wrote(baked));
+        assert!(!upload_after_copy(baked));
+        // A list with copies into a texture the title released before the
+        // list was submitted marks nothing: the next texture there gets its
+        // upload, and its own copies count from their list's submission.
+        card_wrote(late);
+        forget(late);
+        copies_submitted(&[late]);
+        assert!(!COPY_SUBMITTED.lock().unwrap().as_ref().is_some_and(|set| set.contains(&late)));
+        assert!(!upload_after_copy(late));
+        card_wrote(late);
+        assert!(!upload_after_copy(late));
+        copies_submitted(&[late]);
+        assert!(upload_after_copy(late));
+        forget(late);
+        assert!(!upload_after_copy(late));
+    }
 }
 
 #[cfg(test)]

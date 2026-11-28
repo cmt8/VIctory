@@ -280,9 +280,19 @@ const EVEN_BARRIERS: &str = "VICTORY_WAVE_EVEN_BARRIERS: a form's barriers where
 /// unordered buffer views that it only reads are shown to the host as written
 /// too ([`super::typed_rw`]).
 const TYPED_RW: &str = "VICTORY_TYPED_RW: typed unordered buffer views read behind a barrier are not read-only";
-/// [`keyed_apart`]'s mark of a compute program with an `s_barrier` that may
-/// get a dword of group-shared memory it does not need ([`super::group_cu`]).
-const GROUP_CU: &str = "VICTORY_GROUP_CU: a group with a barrier and no LDS adds to a dword of it";
+/// [`keyed_apart`]'s mark of a compute program with an `s_barrier` and no LDS
+/// declared, which gets a dword of group-shared memory it does not need
+/// ([`super::group_cu`]).
+pub const GROUP_CU: &str = "VICTORY_GROUP_CU: a group with a barrier and no LDS adds to a dword of it";
+
+/// Whether `p` is a compute program with an `s_barrier` that declares no LDS:
+/// the programs [`super::group_cu`] reaches, as far as the program's header
+/// and code tell without lowering it. (Lowering also asks for a store to a
+/// UAV, which every program of the title with a barrier has, and for no LDS
+/// of a form's.)
+fn barrier_without_lds(p: &crate::native::NativeProgram) -> bool {
+    matches!(&p.io, crate::native::StageIo::Cs(cs) if cs.lds_bytes() == 0) && has_barrier(&p.code)
+}
 
 /// What of the translation of `container` whoever caches translations keys
 /// apart, beside what it keys every program by: a mark for each change of
@@ -300,6 +310,10 @@ const GROUP_CU: &str = "VICTORY_GROUP_CU: a group with a barrier and no LDS adds
 /// * A compute program with an `s_barrier` where [`super::typed_rw`] holds
 ///   (`VICTORY_TYPED_RW=1`): its typed unordered buffer views used to be
 ///   read-only to the host where it only read through them.
+/// * A compute program with an `s_barrier` that declares no LDS, where
+///   [`super::group_cu`] holds: it used to have no LDS on the host either
+///   (as with `VICTORY_GROUP_CU=0`, whose translations so keep the key they
+///   had).
 /// * A console wave64 compute program with an `s_barrier` in a group over
 ///   64 threads, where such programs take the forms for host waves of 32
 ///   (`VICTORY_COMPUTE_WAVE=32` or `=forms`) and [`super::even_barriers`]
@@ -316,8 +330,9 @@ pub fn keyed_apart(container: &[u8], kept: bool) -> Vec<&'static str> {
     if super::typed_rw() && console_compute(container).is_some_and(|p| has_barrier(&p.code)) {
         marks.push(TYPED_RW);
     }
-    // (The same programs: with UAV writes and without LDS is what lowering finds out.)
-    if super::group_cu() && console_compute(container).is_some_and(|p| has_barrier(&p.code)) {
+    // (Only those of them that declare no LDS: the others are translated as without the
+    // switch, and keep the key and the cached translation they had.)
+    if super::group_cu() && console_compute(container).is_some_and(|p| barrier_without_lds(&p)) {
         marks.push(GROUP_CU);
     }
     if !console && !halves && !even {
@@ -468,14 +483,15 @@ mod tests {
         assert!(!no_program.contains(&TYPED_RW));
     }
 
-    /// `VICTORY_GROUP_CU` is off unless it is `1`; on, it is one of the marks
+    /// `VICTORY_GROUP_CU` is on unless it is `0`; on, it is one of the marks
     /// some program is keyed apart by, and no mark of what is no compute
     /// program with a barrier. Off, no key changes.
     #[test]
-    fn a_group_in_one_unit_keys_its_programs_apart_only_when_asked() {
-        assert!(!crate::emit::group_cu_said(None), "off with the switch not set");
-        assert!(!crate::emit::group_cu_said(Some("")));
+    fn a_group_in_one_unit_keys_its_programs_apart_unless_turned_off() {
+        assert!(crate::emit::group_cu_said(None), "on with the switch not set");
+        assert!(crate::emit::group_cu_said(Some("")));
         assert!(!crate::emit::group_cu_said(Some("0")));
+        assert!(!crate::emit::group_cu_said(Some(" 0 ")));
         assert!(crate::emit::group_cu_said(Some("1")));
         assert!(crate::emit::group_cu_said(Some(" 1 ")));
         let was = crate::emit::GROUP_CU_TEST.replace(Some(false));
@@ -488,6 +504,34 @@ mod tests {
         assert!(on.contains(&GROUP_CU));
         assert_eq!(on.iter().filter(|m| **m != GROUP_CU).collect::<Vec<_>>(), off.iter().collect::<Vec<_>>());
         assert!(!no_program.contains(&GROUP_CU));
+    }
+
+    /// What `VICTORY_GROUP_CU` keys apart: a compute program with a barrier
+    /// that declares no LDS. One with LDS, one without a barrier and one of
+    /// another stage keep their keys, and so their cached translations.
+    #[test]
+    fn only_a_group_with_a_barrier_and_no_lds_is_keyed_apart_for_its_dword() {
+        use crate::native::{ComputeIo, HwStage, NativeProgram, StageIo};
+        let bytes = |words: &[u32]| words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
+        let program = |stage: HwStage, lds_granules: u32, barrier: bool| NativeProgram {
+            stage,
+            wave64: true,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: lds_granules << 15,
+                threads: [1024, 1, 1],
+            }),
+            // s_waitcnt, s_barrier or s_nop, s_endpgm
+            code: bytes(&[0xBF8C_C07F, if barrier { 0xBF8A_0000 } else { 0xBF80_0000 }, 0xBF81_0000]),
+        };
+        assert!(barrier_without_lds(&program(HwStage::Cs, 0, true)));
+        assert!(!barrier_without_lds(&program(HwStage::Cs, 1, true)), "LDS of its own");
+        assert!(!barrier_without_lds(&program(HwStage::Cs, 0, false)), "no barrier");
+        let mut vertex = program(HwStage::Vs, 0, true);
+        vertex.io = StageIo::None;
+        assert!(!barrier_without_lds(&vertex), "no compute program");
     }
 
     #[test]

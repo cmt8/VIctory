@@ -124,8 +124,8 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use bitcode::census;
 pub use sampler::StaticSampler;
 pub use compute_wave::{
-    compute_wave_32, host_min_wave_set, keyed_apart, keyed_apart_any, named, set_host_min_wave, wave64_as_console,
-    wave_kept,
+    GROUP_CU as GROUP_CU_MARK, compute_wave_32, host_min_wave_set, keyed_apart, keyed_apart_any, named,
+    set_host_min_wave, wave64_as_console, wave_kept,
 };
 pub use lower::{host_settings, set_host_max_wave, set_host_rdna, set_thread_max_wave};
 pub use rect::rect_list_gs;
@@ -392,7 +392,12 @@ thread_local! {
 /// The face network's first stage (0aa7934094794dbf: 1,024 threads in one
 /// group, no LDS, 14 typed stores and 16 typed loads around one barrier in a
 /// loop, loads before the barrier too) gave different results from the same
-/// memory on that card. Not shown yet: that this switch ends it.
+/// memory on that card, and the title's faces came out with the lower face
+/// displaced and another shape every frame. With the dword, replays of a
+/// captured frame gave one result (as they did with the loads made volatile
+/// in the module, and did not with its views declared aliased), and the
+/// faces were in place and moved smoothly in two runs of the opening scene,
+/// against a run of the same build without it.
 ///
 /// The dword is added to atomically, once by every thread, and what it holds
 /// is used by nothing. A plain store to it does not keep it: Mesa drops a
@@ -400,8 +405,14 @@ thread_local! {
 /// `deref_used_for_not_store`), seen in RADV's dump of the face program with
 /// such a store added (no shared store left, the divergence as before).
 ///
-/// `VICTORY_GROUP_CU`: off, `=1` on. Part of the translation: the shader
-/// cache keys the programs it can change apart ([`keyed_apart`]).
+/// It is given on every host: a dword of LDS and one atomic add a thread are
+/// nothing a host cannot run, and of the title's 220 compute programs with a
+/// barrier 212 use LDS already (by their instructions), so 8 are changed.
+///
+/// `VICTORY_GROUP_CU`: on, `=0` leaves the programs as they are, for A/B
+/// runs. Part of the translation: the shader cache keys the programs it can
+/// change apart ([`keyed_apart`]), and those translated without it keep the
+/// key they had.
 pub fn group_cu() -> bool {
     #[cfg(test)]
     if let Some(on) = GROUP_CU_TEST.get() {
@@ -411,9 +422,9 @@ pub fn group_cu() -> bool {
     *ON.get_or_init(|| group_cu_said(std::env::var("VICTORY_GROUP_CU").ok().as_deref()))
 }
 
-/// What `VICTORY_GROUP_CU` says: on only when it is `1`.
+/// What `VICTORY_GROUP_CU` says: on unless it is `0`.
 fn group_cu_said(value: Option<&str>) -> bool {
-    value.is_some_and(|v| v.trim() == "1")
+    value.is_none_or(|v| v.trim() != "0")
 }
 
 #[cfg(test)]

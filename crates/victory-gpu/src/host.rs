@@ -1127,6 +1127,19 @@ fn create() -> windows::core::Result<Host> {
             );
             tracing::info!(ok = set.is_ok(), "the host's background shader work is switched off (VICTORY_D3D12_BACKGROUND=0)");
         }
+        // `VICTORY_GROUP_CU` (on; `=0`: off): a compute program with a group barrier and no
+        // LDS adds to a dword of LDS, and RADV then runs its group in one compute unit
+        // (`victory_shader::emit::group_cu`; the programs are named as they are first
+        // asked for, `shader_cache`).
+        if victory_shader::emit::group_cu() {
+            tracing::info!(
+                "compute programs with a group barrier and no LDS add to a dword of LDS, so that the host runs each of their groups in one compute unit (VICTORY_GROUP_CU: on; =0 leaves them as they are)"
+            );
+        } else {
+            tracing::info!(
+                "compute programs with a group barrier and no LDS are left without LDS (VICTORY_GROUP_CU=0): on RADV their typed loads behind the barrier may be stale"
+            );
+        }
         // the widest wave the GPU runs: 32 (NVIDIA) gets console wave64 compute programs whose
         // cross-lane code stays in 32-lane halves translated for waves of 32
         let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
@@ -2928,6 +2941,9 @@ struct Deferred {
     filled: std::collections::HashMap<(usize, usize), u64, std::hash::BuildHasherDefault<AddressHash>>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// Title textures the list records copies on the card into
+    /// ([`HostList::copies_into`]).
+    copied: Vec<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -8152,6 +8168,16 @@ impl HostList {
         self.deferred().textures.contains(&key)
     }
 
+    /// The list records a copy on the card into title texture `resource`:
+    /// once the list is submitted no upload of title memory may follow into
+    /// that texture (`crate::texture::upload_after_copy`).
+    pub(crate) fn copies_into(&self, resource: usize) {
+        let mut deferred = self.deferred();
+        if deferred.copied.last() != Some(&resource) {
+            deferred.copied.push(resource);
+        }
+    }
+
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
@@ -8345,10 +8371,18 @@ impl HostList {
         batch.refresh_textures();
         let mut uploads = Vec::new();
         for upload in textures {
+            // Not over what a copy on the card wrote in a list submitted
+            // before this one: the upload was recorded before that copy was.
+            if upload.due() && crate::texture::upload_after_copy(upload.resource()) {
+                continue;
+            }
             if let Some(first_upload) = upload.finish_refresh() {
                 uploads.push((upload, first_upload));
             }
         }
+        // This list's own copies run after its prelude: from the next list
+        // on, the textures they write hold the card's.
+        crate::texture::copies_submitted(&self.deferred().copied);
         uploads
     }
 }

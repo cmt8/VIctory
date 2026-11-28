@@ -945,6 +945,11 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             // ahead of this list (`crate::tiles`).
             crate::texture::card_writes(list, dst, to, None);
             crate::texture::host_written(dst);
+            // (No upload of the title's bytes over it once this list is
+            // submitted: `crate::texture::upload_after_copy`.)
+            if !same && crate::texture::title_written(to) {
+                list.copies_into(dst as usize);
+            }
             if same {
                 SELF_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1148,6 +1153,13 @@ extern "system" fn copy_texture_region(
         // a copy into a level without memory is dropped.
         crate::texture::card_writes(list, dst.resource, to, Some(dst.footprint.offset as u32));
         crate::texture::host_written(dst.resource);
+        // No upload of the title's bytes may land over this copy: one
+        // recorded before it (by a pass over the textures picked by index,
+        // on any thread) and submitted after this list is left out
+        // (`crate::texture::upload_after_copy`).
+        if !same && crate::texture::title_written(to) {
+            list.copies_into(dst.resource as usize);
+        }
         if same {
             SELF_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return;
@@ -1309,6 +1321,9 @@ extern "system" fn resolve(
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
         crate::texture::host_written(dst);
+        if crate::texture::title_written(to) {
+            list.copies_into(dst as usize);
+        }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
         // SAFETY: an open list and live textures; the region is inside both.
