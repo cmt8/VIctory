@@ -1,5 +1,10 @@
 # Ray tracing in this fork: what the title does and what has been built
 
+Status, 2026-11-28: with the builder on, the walking programs' card time
+on the boat is about 39 ms a frame (83-92 before) and the boat 126-137 ms a
+frame in the release build (runs rx7, rx9, rx10; "Why the walking programs
+were slow" below). Still off by default.
+
 Status, 2026-11-25, midday: **with `VICTORY_BVH_BUILDER=1` rooms get their
 indirect light** (runs light-10, light-11, n19), for some 40 ms more of the
 card's time a frame (the dorm: 75 of 90 ms busy against 34 of 64). Off by
@@ -100,8 +105,11 @@ after it was given them as an unordered access view.
 | `VICTORY_BVH_FAULTS_ALL=<n>` | pages taken from faults in all (2048). Do not raise it: run rtf-2 (no bound) gave every committed page a copy, still had 110-730 faulted pages a frame of memory that is not the title's, and filled the 3 GiB of pages in 4 minutes (reports/RT-FLICKER.md) |
 | `VICTORY_MEMORY_CARD_MB` | the most of it on the card (4096) |
 | `VICTORY_MEMORY_DUMP=<folder>` | a file `go` there writes the arenas out (diagnostics) |
-| `VICTORY_BVH_COUNT=1` | the walking programs count their node tests: by kind, pages with no copy, lanes by nodes tested, lanes at the loop limit, walks that come back to a node (diagnostics; a line per program with the frame lines) |
-| `VICTORY_BVH_LOOP_LIMIT=<n>` | the loops of the walking programs are left after n iterations (16 to 4096) instead of 4096 (diagnostics) |
+| `VICTORY_BVH_COUNT=1` | the walking programs count their node tests: by kind, pages with no copy, lanes by nodes tested, lanes at the loop limit, walks that come back to a node, the longest runs of one node with one ray, tests not made in cut walks, lanes cut by the spin stop and by the walk limit (diagnostics; a line per program with the frame lines) |
+| `VICTORY_BVH_LOOP_LIMIT=<n>` | the loops of the walking programs are left after n iterations (16 to 4096) instead of 4096; their walks are cut at seven eighths of it (diagnostics) |
+| `VICTORY_BVH_SPIN=<n>` | a lane that tests one node with one ray n times in a row has its walk cut (4 to 4096; unset: 24; `=0`: off) |
+| `VICTORY_BVH_WAVE32=1` | the walking programs written for waves of 64 take the forms for host waves of 32 where those are exact (off) |
+| `VICTORY_ROOT_RANGE=0` | a root view read by index does not check the index against its records, as before |
 | `VICTORY_UPLOAD_LOW=0`, `VICTORY_LENT_HEAP=0` | lists' upload memory above 2^40, no view heap for lists without one, as before |
 
 Every ten seconds the log has a line "title memory by address: ..." with pages,
@@ -109,21 +117,58 @@ dispatches, faults and what came.
 
 ## Known gaps
 
-- **Why the walking programs are slow** (runs rw1-rw11, 2026-11-27,
+- **Why the walking programs were slow** (runs rw1-rw11, 2026-11-27,
   `VICTORY_BVH_COUNT=1`): on the boat 210-320 million node tests a frame,
-  300-500 a lane that walks, and 2,000-36,000 lanes a frame that run their
-  loop into the translation's compute loop limit (4,096 iterations). Every
-  one of those lanes tests the same node again and again (from test 512 at
-  the latest, about 3,580 of its 4,096 tests), mostly a leaf; on a page with
-  no copy (reads zeros) in some runs, on a page that has one in others. A
-  wave of 64 waits for its slowest lane, so those 1-6 % of the lanes set
-  most of the waves' time: with the walking programs' loops left at 2,048
-  (`VICTORY_BVH_LOOP_LIMIT`) their time on the boat went from 81-98 ms to
-  33 ms a frame, with the console's waves of 64 taken in two of 32
-  (`VICTORY_COMPUTE_WAVE=forms`) to 46 ms, with both to 25 ms (frame 119
-  against 192 ms). More pages (`VICTORY_BVH_FAULTS_ALL`)
-  did not help: the lanes then spin on pages that have a copy. Where the
-  nodes they spin on come from is open.
+  and 2,000-36,000 lanes a frame that ran their loop into the translation's
+  compute loop limit (4,096 iterations), testing the same node again and
+  again. A wave of 64 waits for its slowest lane, so those 1-6 % of the
+  lanes set most of the waves' time (walkers 81-98 ms a frame on the boat;
+  loops left at 2,048: 33 ms).
+
+  What was done about it (runs rx1-rx6, 2026-11-28; counts per frame,
+  boat 260-400 s and interior 60-240 s, spin stop off unless said):
+  - **A root view read by index checks the index** (`VICTORY_ROOT_RANGE`,
+    after Marvisak/VIctory PR #3670): every builder program reaches title
+    memory through descriptors built around root views (OOB_SELECT 1,
+    records -1), and a lane at index -1 wrote the record one stride before
+    the root, where the console drops it. Lanes at the loop limit: boat
+    149,702 -> 18,363, interior 18,793 -> 4,148 (rx2 -> rx4).
+  - Kinds 6 and 7 stay a triangle miss: with all ones (GPURT's answer)
+    the boat had 18,363 lanes at the limit against 6,994 (rx4, rx5).
+  - **A cut walk ends with what it found**: past seven eighths of the
+    loop limit a walk's tests find nothing (after FiveNine/victory-proton
+    f81abde), and the spin stop (`VICTORY_BVH_SPIN`, 24 tests of one node
+    with one ray in a row) cuts it the same way. Most cut walks do not end
+    of themselves (rx1: the lanes then turn the loop without a test until
+    the limit), so a lane still in its walk's loops 64 turns after the cut
+    leaves them. With all of it (rx6): node tests on the boat 117 million
+    a frame (282 million in rx5), lanes at the limit or left after a cut
+    2,098 (0.35 %); interior 1,448.
+  - What the title's builder reads back of its own stores (upstream PR
+    #3584, `glc` loads stale on an RTX 2080) was already coherent here:
+    all 52 builder programs have a spilled user-data table, and their
+    title memory goes through the page's UAV with a globally coherent
+    handle, which RADV loads with GLC (device scope on RDNA 3) whether the
+    workgroup runs in WGP mode or not.
+  - Of the remaining repeated tests most are of pages with no copy (reads
+    zeros; rx5 boat: 13.0 of 19.6 million). A likely source:
+    FiveNine/victory-proton f7ace5b8e found that the builder's stage that
+    unpacks streamed structures' leaves (1,024 threads, 48-byte geometry
+    records) reads the title's index and vertex buffers that no view names,
+    in its first frames mostly from pages with no copy, and makes them
+    ready from the records before the stage runs; `memory.rs` `ready` here
+    has the same arguments to do so (not ported yet). Their bound of the
+    builder's clone (09f7836a2) is here already (`VICTORY_BVH_BOUNDS`: a
+    header size of 2^20 nodes or more reads as none, accesses stay within
+    -16..+64 MiB of a root view), and the waterfall fault it fixed there
+    does not arise (title memory's views are indexed non-uniformly).
+  - The walking programs' card time (`VICTORY_RT_STAMPS=1`, medians):
+    boat 39.0 ms (rw1, rw2 the day before: 92.2, 83.4), interior 20.0 ms
+    (59.1, 37.0); the boat in the release build 126.2 and 137.1 ms a frame
+    in two runs alike (rx9, rx10), interior 107.0 and 120.0.
+  - `VICTORY_BVH_WAVE32=1` (walkers only in host waves of 32) no longer
+    pays now that stuck lanes are cut: boat 41.2 ms against 39.0, interior
+    19.9 against 20.0 (rx11 against rx7; pictures alike); off by default.
 
 - Dynamic structures overlap each other (8 of 65 good in run light-10, 48 of
   275 in light-15). Part of the cause, run light-11's trace (`VICTORY_BVH_TRACE=1`): the title asks for a new
