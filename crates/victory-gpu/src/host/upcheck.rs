@@ -794,7 +794,7 @@ mod tests {
         }
         eprintln!(
             "{wrong} of {ROUNDS} results wrong in title memory, {undone} undone on the card; pieces checked, suspect, put right: {:?}",
-            super::torn::STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect::<Vec<_>>()
+            super::torn::STATS[..3].iter().map(|s| s.load(Ordering::Relaxed)).collect::<Vec<_>>()
         );
         assert_eq!(look(host), Some(0));
         assert_eq!((wrong, undone), (0, 0), "without VICTORY_FETCH_CHECK=1 most are wrong");

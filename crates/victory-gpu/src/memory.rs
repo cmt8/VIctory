@@ -76,8 +76,9 @@ use crate::descriptor::host::HostHeap;
 use crate::host::{HostList, host};
 use crate::shadow::Shadow;
 
-/// Copies that can be numbered (the run of heap slots is one longer).
-const COPIES: u32 = (1 << 12) - 1;
+/// Copies that can be numbered (the run of heap slots is one longer):
+/// what translated programs bound an entry's number by.
+const COPIES: u32 = victory_shader::emit::MEMORY_COPIES;
 /// A directory page.
 const PAGE: u64 = 1 << 16;
 /// An arena's bytes.
@@ -182,9 +183,9 @@ struct Memory {
     open: std::collections::HashSet<usize>,
     /// Pages taken from faults.
     faulted: usize,
-    /// Per host view heap (by address): the first slot of its run, and how
+    /// Per host view heap ([`run_key`]): the first slot of its run, and how
     /// many copies have their view there.
-    heaps: HashMap<usize, (u32, u32)>,
+    heaps: HashMap<u64, (u32, u32)>,
     /// The frame the faults were last read in.
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
@@ -908,6 +909,18 @@ pub(crate) fn asked_sizes<'a>(lists: impl Iterator<Item = &'a HostList>) -> bool
     asked
 }
 
+/// What a host view heap's run of slots is kept under: the heap's identity
+/// ([`HostHeap::id`]), not its address. A heap the title makes where one it
+/// released stood is at the same address and has no run: its slots of those
+/// numbers were never made views of the copies and were never taken from
+/// its dynamic slots, so they are other lists' tables, and a shader that
+/// goes to title memory by address would read and store through whatever
+/// view of whatever kind stands there (as with the slots a list gives back,
+/// fxceless/victory-fork#1324).
+fn run_key(heap: &HostHeap) -> u64 {
+    heap.id()
+}
+
 /// [`fill`] of a page stores by address do not reach.
 fn close(entry: *mut u32, n: usize, offset: u64) {
     fill(entry, n | MEMORY_READ_ONLY as usize, offset);
@@ -1091,7 +1104,7 @@ pub(crate) fn ready(
     for (sum, n) in m.stats.came.iter_mut().zip(came) {
         *sum += n;
     }
-    let key = std::ptr::from_ref(heap) as usize;
+    let key = run_key(heap);
     let (base, made) = match m.heaps.get(&key) {
         Some(&run) => run,
         None => {
@@ -1366,5 +1379,24 @@ mod tests {
         assert_eq!(packed_len(header(0x8102_0007, 5)), None);
         assert_eq!(packed_len(header(0x8102_0006, 0)), None);
         assert_eq!(packed_len(header(0x8102_0006, 1 << 21)), None);
+    }
+
+    /// A view heap the title makes where a released one stood is at the same
+    /// address: it has no run of the copies' views, and must not be taken
+    /// for the one that had.
+    #[test]
+    fn a_view_heap_made_where_another_stood_has_no_run() {
+        let (Some(first), Some(second)) = (HostHeap::new(false, 4), HostHeap::new(false, 4)) else {
+            return; // no host GPU
+        };
+        let mut place = Box::new(first);
+        let (at, key) = (std::ptr::from_ref::<HostHeap>(&place) as usize, run_key(&place));
+        let mut runs: HashMap<u64, (u32, u32)> = HashMap::new();
+        runs.insert(key, (4, 1));
+        // The first is released and the second stands where it stood.
+        *place = second;
+        assert_eq!(std::ptr::from_ref::<HostHeap>(&place) as usize, at);
+        assert_ne!(run_key(&place), key);
+        assert_eq!(runs.get(&run_key(&place)), None, "the new heap was given the old one's run");
     }
 }

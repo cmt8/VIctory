@@ -207,7 +207,7 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
     let (name, build) = named(container);
     let translate = |c: &[u8]| translate_named(&name, c);
     match CACHE.get() {
-        Some(cache) => cached(cache, &build, container, translate, true)?,
+        Some(cache) => bounded(cache, &build, container, translate, true)?,
         None => translate(container)?,
     };
     // (Counts other threads' misses too: the caller only adds them up.)
@@ -220,9 +220,39 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let (name, build) = named(container);
     let translate = |c: &[u8]| translate_named(&name, c);
     match CACHE.get() {
-        Some(cache) => cached(cache, &build, container, translate, refresh_in_runs()),
+        Some(cache) => bounded(cache, &build, container, translate, refresh_in_runs()),
         None => translate(container),
     }
+}
+
+/// What keys the translation of a program that reads title memory by address
+/// ([`victory_shader::emit::SLOT_MEMORY`]) apart from the one made before
+/// such a program bounded the number of the host copy it reads through
+/// ([`victory_shader::emit::MEMORY_COPIES`]).
+const COPIES_BOUNDED: &str = "by-address copies bounded";
+
+/// [`cached`], and for a program that reads title memory by address its
+/// translation under a key of its own ([`COPIES_BOUNDED`]): the one under
+/// `build` may be of a translator that did not bound the copy's number, and
+/// nothing in the entry says. Whether a program reads by address is known
+/// from its translation alone (no scan of the container tells), so the entry
+/// under `build` is looked up first and says it; such a program is looked
+/// up twice from then on, and one never seen is translated twice, once. Every
+/// other program keeps its key and its entry: the translator's version is
+/// left as it is. (With `VICTORY_SHADER_KEY=source` the entry under `build`
+/// is this translator's already.)
+fn bounded(
+    cache: &Cache,
+    build: &[u8; 32],
+    container: &[u8],
+    translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
+    refresh: bool,
+) -> Result<HostShader, String> {
+    let shader = cached(cache, build, container, &translate, refresh)?;
+    if keyed_by_source() || !shader.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
+        return Ok(shader);
+    }
+    cached(cache, &apart_key(*build, COPIES_BOUNDED), container, &translate, refresh)
 }
 
 /// The name the log gives `container` (the `hash=` of `pipeline.rs`'s lines),
@@ -689,6 +719,64 @@ mod tests {
         // Failures are not stored.
         let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
         assert!(cached(&cache, &build, b"other", fail, false).is_err());
+    }
+
+    /// A program that reads title memory by address is served the
+    /// translation under its own key, made once, and not the one an earlier
+    /// translator left under the build's; any other program is served the
+    /// one it has, and nothing is translated for it.
+    #[test]
+    fn a_by_address_program_is_translated_again_once_and_no_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let build = [7u8; 32];
+        let runs = AtomicU64::new(0);
+        let by_address = |dxil: &[u8]| {
+            let mut s = shader();
+            s.dxil = dxil.to_vec();
+            s.root_srvs.push(victory_shader::emit::SLOT_MEMORY);
+            s
+        };
+        let (reads, plain) = (b"a program that reads by address".as_slice(), b"another program".as_slice());
+        // What an earlier translator left under the build's key.
+        let earlier = |c: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(if c == reads { by_address(b"unbounded") } else { shader() })
+        };
+        assert_eq!(cached_by(&cache, &build, "build a", reads, earlier, false), Ok(by_address(b"unbounded")));
+        assert_eq!(cached_by(&cache, &build, "build a", plain, earlier, false), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 2);
+        let entries = walk(dir.path()).len();
+
+        let now = |c: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(if c == reads { by_address(b"bounded") } else { shader() })
+        };
+        // The other program: its entry, nothing translated, nothing stored.
+        assert_eq!(bounded(&cache, &build, plain, now, false), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 2);
+        assert_eq!(walk(dir.path()).len(), entries);
+        // The one that reads by address: translated by this translator,
+        // kept beside the earlier entry, and served from there afterwards.
+        assert_eq!(bounded(&cache, &build, reads, now, false), Ok(by_address(b"bounded")));
+        assert_eq!(runs.load(Ordering::Relaxed), 3);
+        assert_eq!(walk(dir.path()).len(), entries + 1);
+        assert_eq!(bounded(&cache, &build, reads, now, false), Ok(by_address(b"bounded")));
+        assert_eq!(runs.load(Ordering::Relaxed), 3);
+        // The earlier entry is as it was, for the translator that made it.
+        assert_eq!(cached_by(&cache, &build, "build a", reads, now, false), Ok(by_address(b"unbounded")));
+        assert_eq!(runs.load(Ordering::Relaxed), 3);
+
+        // One no translator has seen: translated under both keys, once.
+        let new = b"a new program that reads by address".as_slice();
+        let fresh = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(by_address(b"bounded"))
+        };
+        assert_eq!(bounded(&cache, &build, new, fresh, false), Ok(by_address(b"bounded")));
+        assert_eq!(runs.load(Ordering::Relaxed), 5);
+        assert_eq!(bounded(&cache, &build, new, fresh, false), Ok(by_address(b"bounded")));
+        assert_eq!(runs.load(Ordering::Relaxed), 5);
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {

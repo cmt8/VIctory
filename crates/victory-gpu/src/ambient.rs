@@ -689,6 +689,12 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
         l.SetComputeRoot32BitConstants(0, 17, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
+        #[cfg(feature = "diagnostics")]
+        if crate::crumbs::on() {
+            for buffer in [&pass.cells, &pass.points, &pass.stats] {
+                crate::crumbs::view(l, crate::crumbs::views::OTHER, true, buffer);
+            }
+        }
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
         l.SetComputeRootUnorderedAccessView(4, pass.points.GetGPUVirtualAddress());
         l.SetComputeRootUnorderedAccessView(5, pass.stats.GetGPUVirtualAddress());

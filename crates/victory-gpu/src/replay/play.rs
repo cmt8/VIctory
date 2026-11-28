@@ -2171,7 +2171,7 @@ impl Player {
             let (scratch, _) = gpu::buffer(
                 &self.device,
                 D3D12_HEAP_TYPE_DEFAULT,
-                bytes.next_multiple_of(64 << 10),
+                edit::scratch_bytes(bytes),
                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
             )?;
             all.push((id, scratch));

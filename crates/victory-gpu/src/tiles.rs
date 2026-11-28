@@ -920,8 +920,13 @@ void look() {
             // only after the card finished everything recorded from it.
             unsafe {
                 self.list.Close().unwrap();
-                let run: ID3D12CommandList = self.list.cast().unwrap();
-                self.queue.ExecuteCommandLists(&[Some(run)]);
+                let run = [Some(self.list.cast::<ID3D12CommandList>().unwrap())];
+                #[cfg(feature = "diagnostics")]
+                {
+                    crate::crumbs::exec(&self.queue, crate::crumbs::sent::OTHER, 0, &run);
+                    crate::crumbs::signal(&self.queue, &self.fence, self.submitted);
+                }
+                self.queue.ExecuteCommandLists(&run);
                 self.queue.Signal(&self.fence, self.submitted).unwrap();
                 self.fence.SetEventOnCompletion(self.submitted, self.event).unwrap();
                 // Never without end: a step is a few copies of a few
@@ -930,6 +935,10 @@ void look() {
                 // shader on first use and resets nothing, gets longer.
                 let limit = if self.card { 1500 } else { 20_000 };
                 let waited = WaitForSingleObject(self.event, limit);
+                #[cfg(feature = "diagnostics")]
+                if waited == WAIT_OBJECT_0 {
+                    crate::crumbs::waited(&self.fence, self.submitted);
+                }
                 self.check("a submission");
                 assert!(
                     waited == WAIT_OBJECT_0,
@@ -1344,6 +1353,8 @@ void look() {
                 list.SetComputeRootSignature(&root);
                 list.SetPipelineState(&pipeline);
                 list.SetComputeRootDescriptorTable(0, views.GetGPUDescriptorHandleForHeapStart());
+                #[cfg(feature = "diagnostics")]
+                crate::crumbs::view(list, crate::crumbs::views::OTHER, true, &words);
                 list.SetComputeRootUnorderedAccessView(1, words.GetGPUVirtualAddress());
                 list.Dispatch(1, 1, 1);
                 list.ResourceBarrier(&[transition(&words, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);

@@ -11,6 +11,7 @@ publish.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 walkdir.workspace = true
+victory-core.workspace = true
 
 [lints]
 workspace = true

@@ -75,9 +75,24 @@ pub fn take(dxil: &[u8]) -> Option<Census> {
         .map(|w| w.2)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// [`Module::minimums`] of the module this thread wrote last.
+    static MINIMUMS: RefCell<Vec<(u32, Option<u32>)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The unsigned minimums with a constant limit in the module this thread
+/// wrote last ([`Module::minimums`]).
+#[cfg(test)]
+pub(crate) fn minimums() -> Vec<(u32, Option<u32>)> {
+    MINIMUMS.with(|l| l.borrow().clone())
+}
+
 /// Counts `m`, whose written form is `bitcode`, and keeps the result for
 /// [`take`].
 pub(crate) fn note(m: &Module, bitcode: &[u8]) {
+    #[cfg(test)]
+    MINIMUMS.with(|l| *l.borrow_mut() = m.minimums());
     if !enabled() {
         return;
     }
@@ -113,6 +128,44 @@ fn kind(name: &str) -> usize {
 }
 
 impl Module {
+    /// The unsigned minimums (`dx.op.binary.i32`, 40) of a value and a
+    /// constant: the constant, and where the value is the AND of something
+    /// with a constant, that one.
+    #[cfg(test)]
+    fn minimums(&self) -> Vec<(u32, Option<u32>)> {
+        let constant = |v: V| match v {
+            V::Const(c) => match self.consts[c as usize].1 {
+                super::Const::Int(x) => Some(x as u32),
+                _ => None,
+            },
+            _ => None,
+        };
+        let mut found = Vec::new();
+        for blk in &self.blocks {
+            for &i in &blk.body {
+                let Op::Call(f, args) = &self.insts[i as usize].op else {
+                    continue;
+                };
+                if self.funcs[*f as usize].name != "dx.op.binary.i32" || args.len() != 3 || constant(args[0]) != Some(40)
+                {
+                    continue;
+                }
+                let Some(limit) = constant(args[2]) else {
+                    continue;
+                };
+                let masked = match args[1] {
+                    V::Inst(v) => match self.insts[v as usize].op {
+                        Op::Bin(super::Bin::And, _, mask) => constant(mask),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                found.push((limit, masked));
+            }
+        }
+        found
+    }
+
     /// The instructions [`Module::write`] writes, by kind.
     pub(crate) fn census(&self) -> Census {
         let k = |s: &str| KINDS.iter().position(|k| *k == s).expect("kind");

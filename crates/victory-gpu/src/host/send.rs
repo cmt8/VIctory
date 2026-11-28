@@ -60,16 +60,32 @@ pub(crate) fn words_under() -> bool {
     *ON.get_or_init(|| own() && std::env::var_os("VICTORY_UNDER_WORDS").is_none_or(|v| v != "0"))
 }
 
+/// The card's copy is bound by its address alone (a root view), so nothing
+/// but the pass itself keeps a store inside it: an offset past the copy's
+/// end would be written wherever it points, and where no memory is mapped
+/// the card stops with a page fault and the device is lost. So the pass is
+/// told the copy's bytes and stores only inside them; a pair outside is left
+/// out and counted ([`refused`]). The offsets are made by us from ranges of
+/// the copy, so none should be: the bound costs each thread a subtraction
+/// and two compares, and nothing else unless it holds.
 const SCATTER: &str = r#"
-#define RS "RootConstants(num32BitConstants=2, b0), SRV(t0), UAV(u0)"
-cbuffer Part : register(b0) { uint at; uint count; };
+#define RS "RootConstants(num32BitConstants=3, b0), SRV(t0), UAV(u0), UAV(u1)"
+cbuffer Part : register(b0) { uint at; uint count; uint bytes; };
 ByteAddressBuffer pairs : register(t0);
 RWByteAddressBuffer card : register(u0);
+// In words (Wine's compiler has Interlocked* only as functions, not as
+// methods of a byte address buffer): 0 the pairs left out.
+RWStructuredBuffer<uint> notes : register(u1);
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= count) return;
     uint2 p = pairs.Load2(at + id.x * 8u);
+    if (p.x >= bytes || bytes - p.x < 4u) {
+        uint was;
+        InterlockedAdd(notes[0], 1u, was);
+        return;
+    }
     card.Store(p.x, p.y);
 }
 "#;
@@ -77,21 +93,49 @@ void main(uint3 id : SV_DispatchThreadID) {
 struct Pass {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
+    /// The pass's notes (word 0: the pairs it left out, since the start),
+    /// and where the CPU reads them.
+    notes: ID3D12Resource,
+    noted: usize,
 }
 
+/// The bytes of a copy the pass may store in: its buffer's, as far as a
+/// pair's offset reaches.
+fn bound(width: u64) -> u32 {
+    u32::try_from(width).unwrap_or(u32::MAX)
+}
+
+/// The pairs the pass left out since the start, for want of a place inside
+/// their copy ([`SCATTER`]); 0 while the pass is not made.
+pub(super) fn refused() -> u64 {
+    let Some(pass) = PASS.get().and_then(Option::as_ref) else {
+        return 0;
+    };
+    // SAFETY: the notes' mapping, which lives as long as the pass (for
+    // good); the card adds to the word, which is read whole.
+    u64::from(unsafe { (pass.noted as *const u32).read_volatile() })
+}
+
+static PASS: OnceLock<Option<Pass>> = OnceLock::new();
+
 fn pass(host: &Host) -> Option<&'static Pass> {
-    static PASS: OnceLock<Option<Pass>> = OnceLock::new();
     PASS.get_or_init(|| {
         let code = compile(SCATTER, windows::core::s!("main"), windows::core::s!("cs_5_1")).ok()?;
         // The root signature of `RS`, made in code (Wine's compiler,
         // `D3DCompile` under Wine, ignores `[RootSignature]`): the part's two
-        // constants, the pairs as a root SRV, the card's copy as a root UAV.
+        // constants and the copy's bytes, the pairs as a root SRV, the card's
+        // copy and the notes as root UAVs.
         let params = [
-            super::root_constants(0, 2),
+            super::root_constants(0, 3),
             super::root_view(D3D12_ROOT_PARAMETER_TYPE_SRV, 0),
             super::root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 0),
+            super::root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 1),
         ];
         let root = super::root_of(&host.device, &code, &params, "changed words sent to the card").ok()?;
+        let (notes, noted) = host.shared_buffer(256)?;
+        name(&notes, || "notes of the changed words sent to the card".into());
+        // SAFETY: the buffer's own mapping, before anything reads it.
+        unsafe { std::ptr::write_bytes(noted, 0, 256) };
         // SAFETY: the code lives through the calls.
         unsafe {
             let pso: ID3D12PipelineState = host
@@ -106,7 +150,12 @@ fn pass(host: &Host) -> Option<&'static Pass> {
                 })
                 .ok()?;
             name(&pso, || "victory: changed words sent to the card".into());
-            Some(Pass { root, pso })
+            Some(Pass {
+                root,
+                pso,
+                notes,
+                noted: noted as usize,
+            })
         }
     })
     .as_ref()
@@ -314,15 +363,24 @@ impl Own {
                 list.SetComputeRootSignature(&pass.root);
                 list.SetPipelineState(&pass.pso);
                 list.SetComputeRootShaderResourceView(1, source.GetGPUVirtualAddress());
-                for ((shadow, _), copy) in dirty.iter().zip(&self.copies).filter(|(_, c)| c.pairs.1 > 0) {
+                list.SetComputeRootUnorderedAccessView(3, pass.notes.GetGPUVirtualAddress());
+                for ((shadow, _ranges), copy) in dirty.iter().zip(&self.copies).filter(|(_, c)| c.pairs.1 > 0) {
                     list.SetComputeRootUnorderedAccessView(2, shadow.buffer.GetGPUVirtualAddress());
                     const MOST: u32 = 64 * D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION;
                     let (at, words) = copy.pairs;
+                    let bytes = bound(shadow.width());
+                    #[cfg(feature = "diagnostics")]
+                    if crate::crumbs::on() {
+                        // (Where the last of the copy's changed words ends.)
+                        let end = _ranges.iter().filter(|r| short(r.0, r.1 - r.0)).map(|r| r.1 as u64).max().unwrap_or(0);
+                        let pairs = source.GetGPUVirtualAddress() + at;
+                        crate::crumbs::scatter(list, pairs, u64::from(words), shadow.buffer.GetGPUVirtualAddress(), shadow.width(), end);
+                    }
                     let mut done = 0;
                     while done < words {
                         let n = (words - done).min(MOST);
-                        let constants = [at as u32 + done * 8, n];
-                        list.SetComputeRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
+                        let constants = [at as u32 + done * 8, n, bytes];
+                        list.SetComputeRoot32BitConstants(0, 3, constants.as_ptr().cast(), 0);
                         list.Dispatch(n.div_ceil(64), 1, 1);
                         done += n;
                     }
@@ -376,9 +434,10 @@ mod tests {
             let l = &list.list;
             l.SetComputeRootSignature(&pass.root);
             l.SetPipelineState(&pass.pso);
-            l.SetComputeRoot32BitConstants(0, 2, [16u32, 3].as_ptr().cast(), 0);
+            l.SetComputeRoot32BitConstants(0, 3, [16u32, 3, 256].as_ptr().cast(), 0);
             l.SetComputeRootShaderResourceView(1, pairs.GetGPUVirtualAddress());
             l.SetComputeRootUnorderedAccessView(2, card.GetGPUVirtualAddress());
+            l.SetComputeRootUnorderedAccessView(3, pass.notes.GetGPUVirtualAddress());
             l.Dispatch(1, 1, 1);
         }
         list.close();
@@ -386,5 +445,74 @@ mod tests {
         // SAFETY: the mapping; the list has run.
         let read = |at: usize| unsafe { card_ptr.add(at).cast::<u32>().read_volatile() };
         assert_eq!([read(0), read(4), read(12), read(200), read(204)], [0x1111_1111, 0, 0x2222_2222, 0x3333_3333, 0]);
+    }
+
+    /// A pair whose word would not lie whole inside the copy's bytes is not
+    /// stored, and is counted: bound by its address alone, the copy would
+    /// take the store wherever it points, in mapped memory or not. (The
+    /// test's buffer is wider than the bytes it says the copy has, so that a
+    /// store the pass let through would show, and harm nothing.)
+    #[test]
+    fn the_scatter_stores_nothing_outside_the_copy() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let pass = pass(host).expect("the scatter must build");
+        let (pairs, pairs_ptr) = host.shared_buffer(256).expect("pairs");
+        let (card, card_ptr) = host.shared_buffer(4096).expect("card copy");
+        // The copy is said to be 128 bytes: its last word, the first past
+        // it, one that begins inside it and ends past it, two far past it,
+        // and its first word. (None past the test's buffer: a pass that let
+        // one through must not write where nothing is mapped.)
+        let all = [
+            (124u32, 0x1111_1111u32),
+            (128, 0x2222_2222),
+            (126, 0x3333_3333),
+            (2048, 0x4444_4444),
+            (4092, 0x5555_5555),
+            (0, 0x6666_6666),
+        ];
+        // SAFETY: inside the mappings.
+        unsafe {
+            std::ptr::write_bytes(card_ptr, 0, 4096);
+            let words = pairs_ptr.cast::<u32>();
+            for (k, (at, word)) in all.into_iter().enumerate() {
+                words.add(2 * k).write_volatile(at);
+                words.add(2 * k + 1).write_volatile(word);
+            }
+        }
+        // (Other tests' passes run beside this one: none of theirs is
+        // refused, so the count moves by this one's alone.)
+        let before = refused();
+        let list = host.new_list().expect("a list");
+        // SAFETY: an open list, live buffers in the common state (promoted).
+        unsafe {
+            let l = &list.list;
+            l.SetComputeRootSignature(&pass.root);
+            l.SetPipelineState(&pass.pso);
+            l.SetComputeRoot32BitConstants(0, 3, [0u32, all.len() as u32, 128].as_ptr().cast(), 0);
+            l.SetComputeRootShaderResourceView(1, pairs.GetGPUVirtualAddress());
+            l.SetComputeRootUnorderedAccessView(2, card.GetGPUVirtualAddress());
+            l.SetComputeRootUnorderedAccessView(3, pass.notes.GetGPUVirtualAddress());
+            l.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: the mapping; the list has run.
+        let held: Vec<u32> = (0..1024).map(|i| unsafe { card_ptr.cast::<u32>().add(i).read_volatile() }).collect();
+        let mut wanted = vec![0u32; 1024];
+        (wanted[0], wanted[31]) = (0x6666_6666, 0x1111_1111);
+        assert_eq!(held, wanted, "only the pairs inside the 128 bytes are stored");
+        assert_eq!(refused() - before, 4, "the four pairs outside are counted");
+    }
+
+    /// The bytes the pass is told are the buffer's, and all a pair's offset
+    /// can reach of a buffer wider than that.
+    #[test]
+    fn the_bound_is_the_buffers_width() {
+        assert_eq!(bound(0), 0);
+        assert_eq!(bound(4096), 4096);
+        assert_eq!(bound(u64::from(u32::MAX)), u32::MAX);
+        assert_eq!(bound(1 << 32), u32::MAX);
     }
 }

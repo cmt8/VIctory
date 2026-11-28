@@ -1029,7 +1029,11 @@ pub(crate) fn made_host() -> Option<&'static Host> {
 /// behaves as before: nothing executes).
 pub(crate) fn host() -> Option<&'static Host> {
     HOST.get_or_init(|| match create() {
-        Ok(host) => Some(host),
+        Ok(host) => {
+            #[cfg(feature = "diagnostics")]
+            crate::crumbs::watch(&host.queue, &host.fence, &host.device);
+            Some(host)
+        }
         Err(e) => {
             tracing::warn!(error = %e, "no host D3D12 device; command lists will not run");
             None
@@ -2351,6 +2355,33 @@ static MESH_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atom
 /// largest cost of one (told from 2^22 on), likewise.
 static BUDGET_NOTES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Stores of ours that were left out because they did not lie inside the
+/// buffer they were for, since the start: clamped records of a batch
+/// (`crate::indirect::batch`, from the lists' budget buffers, a run late).
+/// The changed words sent to copies in the card's memory count their own
+/// ([`send::refused`]). None is expected: [`outside_line`] says so if one is.
+static STORES_OUTSIDE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Once a second: a warning if a pass of ours left a store out since the
+/// last one, because it would have landed outside its buffer (in memory
+/// that is another buffer's, or not mapped at all: then the card stops and
+/// the device is lost). The store is lost instead; what made its place is
+/// wrong and has to be found.
+fn outside_line() {
+    static WAS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+    let now = [send::refused(), STORES_OUTSIDE.load(Ordering::Relaxed)];
+    let [words, records] = [0, 1].map(|i| now[i].saturating_sub(WAS[i].swap(now[i], Ordering::Relaxed)));
+    if words + records > 0 {
+        tracing::warn!(
+            "stores of ours left out because they lay outside their buffer: {words} changed words sent to copies in the card's \
+             memory, {records} clamped records of indirect executions ({} and {} since the start); each would have been written \
+             where its offset pointed, mapped or not",
+            now[0],
+            now[1],
+        );
+    }
+}
+
 /// Whether a list's indirect-work budget lives in the card's own memory
 /// (`VICTORY_INDIRECT_CARD_BUDGET=0` keeps it in memory the CPU maps, as
 /// before). The clamp charges it with atomics, at least two in a row for
@@ -2957,6 +2988,10 @@ impl Deferred {
 
 impl Drop for Deferred {
     fn drop(&mut self) {
+        #[cfg(feature = "diagnostics")]
+        if crate::crumbs::on() {
+            self.uploads.iter().for_each(crate::crumbs::upload_gone);
+        }
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
     }
@@ -4330,15 +4365,7 @@ fn late_line(frames: f64) {
                 t[3] / 1000.0,
             );
         }
-        let t: Vec<f64> = torn::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
-        if t[0] > 0.0 {
-            tracing::info!(
-                "fetched pieces checked per frame (VICTORY_FETCH_CHECK): {:.1}, of which {:.2} were not what their flight ended                  with (caught while a later flight was at them, or title bytes went up meanwhile); {:.2} were found whole when                  fetched again",
-                t[0],
-                t[1],
-                t[2],
-            );
-        }
+        torn::line(frames);
     }
     crate::land::log(frames);
     if place::on() {
@@ -5103,6 +5130,8 @@ impl Host {
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                    #[cfg(feature = "diagnostics")]
+                    crate::crumbs::view(list, crate::crumbs::views::HASH_DIFFERS, true, &work.differs.0);
                     for (shadow, ranges) in &dirty {
                         let (Some((_, Some(before), _)), size) = (shadow.card_sides(), shadow.card_hash_size()) else {
                             continue;
@@ -5115,6 +5144,11 @@ impl Host {
                         // pieces and flags those whose hash is another.
                         list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+                        #[cfg(feature = "diagnostics")]
+                        if crate::crumbs::on() {
+                            crate::crumbs::view(list, crate::crumbs::views::HASH_NOW, false, &shadow.buffer);
+                            crate::crumbs::view(list, crate::crumbs::views::HASH_BEFORE, true, &before);
+                        }
                         let joins = rehash_runs() || own.is_some();
                         let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
                             vec![shadow.card_run(0, usize::MAX)]
@@ -5139,7 +5173,10 @@ impl Host {
                         }
                     }
                     list.Close()?;
-                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                    let lists = [Some(list.cast::<ID3D12CommandList>()?)];
+                    #[cfg(feature = "diagnostics")]
+                    crate::crumbs::exec(&self.queue, crate::crumbs::sent::CARD_SYNC, 0, &lists);
+                    self.queue.ExecuteCommandLists(&lists);
                     Ok(())
                 })()
             };
@@ -5234,12 +5271,19 @@ impl Host {
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                    #[cfg(feature = "diagnostics")]
+                    crate::crumbs::view(list, crate::crumbs::views::HASH_DIFFERS, true, &work.differs.0);
                     for r in plan.ranges.iter().filter(|r| r.compared) {
                         let (Some((_, Some(before), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) else {
                             continue;
                         };
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+                        #[cfg(feature = "diagnostics")]
+                        if crate::crumbs::on() {
+                            crate::crumbs::view(list, crate::crumbs::views::HASH_NOW, false, &r.shadow.buffer);
+                            crate::crumbs::view(list, crate::crumbs::views::HASH_BEFORE, true, &before);
+                        }
                         // (What is only looked at keeps its hashes: what
                         // changed there is the next declared range's to land.)
                         card_pass(list, &r.span, size as u32, r.at, if flown && !r.picked { 2 } else { 1 });
@@ -5441,8 +5485,12 @@ impl Host {
         }
         // On the copy queue a later flight may be at a piece while it is
         // fetched: the pieces come down whole, to be hashed.
-        let check = (torn::on() && fetch.as_ref().is_some_and(|f| f.queue.is_some()))
-            .then(|| torn::Check::new(plans.iter().map(|p| p.0), differs.unwrap_or_default(), &mut pieces));
+        let check = match fetch.as_mut() {
+            Some(f) if torn::on() && f.queue.is_some() => {
+                Some(torn::Check::new(plans.iter().map(|p| p.0), differs.unwrap_or_default(), &mut pieces, &mut f.suspects))
+            }
+            _ => None,
+        };
         if let Some(check) = &check {
             total = check.total;
         }
@@ -5497,28 +5545,40 @@ impl Host {
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
                 let _fetching = crate::timeline::span("landing: fetching pieces");
                 if let Some(queue) = &copy_queue {
+                    #[cfg(feature = "diagnostics")]
+                    crate::crumbs::exec(queue, crate::crumbs::sent::FETCH, 0, &lists);
                     queue.ExecuteCommandLists(&lists);
                     queue.Signal(&fence, sent)?;
+                    #[cfg(feature = "diagnostics")]
+                    crate::crumbs::signal(queue, &fence, sent);
                     meanwhile();
                     fence.SetEventOnCompletion(sent, event)?;
                     #[cfg(feature = "diagnostics")]
                     let _card = crate::timeline::card_wait(None);
                     WaitForSingleObject(event, INFINITE);
+                    #[cfg(feature = "diagnostics")]
+                    crate::crumbs::waited(&fence, sent);
                     return Ok(behind);
                 }
                 // In the order of the queue: the sends of title bytes so
                 // far are ahead of this fetch, every later one behind it.
                 let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+                #[cfg(feature = "diagnostics")]
+                crate::crumbs::exec(&self.queue, crate::crumbs::sent::FETCH, 0, &lists);
                 self.queue.ExecuteCommandLists(&lists);
                 let after = *order;
                 drop(order);
                 self.card_sent();
                 self.queue.Signal(&fence, sent)?;
+                #[cfg(feature = "diagnostics")]
+                crate::crumbs::signal(&self.queue, &fence, sent);
                 meanwhile();
                 fence.SetEventOnCompletion(sent, event)?;
                 #[cfg(feature = "diagnostics")]
                 let _card = crate::timeline::card_wait(None);
                 WaitForSingleObject(event, INFINITE);
+                #[cfg(feature = "diagnostics")]
+                crate::crumbs::waited(&fence, sent);
                 Ok(after)
             })()
         };
@@ -5584,7 +5644,7 @@ impl Host {
         COPY_BACK[1].fetch_add(written, Ordering::Relaxed);
         if let Some(f) = fetch.as_mut() {
             if let Some(check) = &check {
-                check.done(&mut f.suspects);
+                check.done(&mut f.suspects, after);
             }
             f.had.fetched(
                 ahead,
@@ -5804,13 +5864,20 @@ impl Host {
                         list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
                     }
                     list.Close()?;
-                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                    let lists = [Some(list.cast::<ID3D12CommandList>()?)];
+                    #[cfg(feature = "diagnostics")]
+                    crate::crumbs::exec(&self.queue, crate::crumbs::sent::FETCH, 0, &lists);
+                    self.queue.ExecuteCommandLists(&lists);
                     self.card_sent();
                     *submitted += 1;
                     self.queue.Signal(&self.fence, *submitted)?;
+                    #[cfg(feature = "diagnostics")]
+                    crate::crumbs::signal(&self.queue, &self.fence, *submitted);
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
                     WaitForSingleObject(self.event, INFINITE);
+                    #[cfg(feature = "diagnostics")]
+                    crate::crumbs::waited(&self.fence, *submitted);
                     stood(waiting);
                     working(was_working);
                     Ok(())
@@ -6517,9 +6584,13 @@ impl Host {
             let signalled = unsafe {
                 let mut from = 0;
                 for to in cuts.into_iter().chain([lists.len()]) {
+                    #[cfg(feature = "diagnostics")]
+                    crate::crumbs::exec(&self.queue, crate::crumbs::sent::LATE, this_submission, &lists[from..to]);
                     self.queue.ExecuteCommandLists(&lists[from..to]);
                     from = to;
                 }
+                #[cfg(feature = "diagnostics")]
+                crate::crumbs::signal(&self.queue, &self.fence, *submitted);
                 self.queue.Signal(&self.fence, *submitted)
             };
             awake::sent(&self.device);
@@ -6575,8 +6646,12 @@ impl Host {
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
+                #[cfg(feature = "diagnostics")]
+                crate::crumbs::exec(&self.queue, crate::crumbs::sent::SYNC, this_submission, group);
                 self.queue.ExecuteCommandLists(group);
                 self.card_sent();
+                #[cfg(feature = "diagnostics")]
+                crate::crumbs::signal(&self.queue, &self.fence, *submitted);
                 let signalled = self.queue.Signal(&self.fence, *submitted);
                 #[cfg(feature = "diagnostics")]
                 crate::timeline::sent(sending, *submitted, stamp);
@@ -7710,12 +7785,13 @@ impl HostList {
     }
 
     /// As [`HostList::defer_fill`], for upload memory that only `slot` (a
-    /// title heap's address, and the slot) shows.
-    pub(crate) fn defer_constants(&self, dst: *mut u8, src: *const u8, len: usize, slot: (usize, u32)) {
+    /// title heap's address, the identity of its host heap, and the slot)
+    /// shows.
+    pub(crate) fn defer_constants(&self, dst: *mut u8, src: *const u8, len: usize, slot: (usize, u64, u32)) {
         let src = self.forward_fill(src as usize, len);
         self.deferred()
             .copies
-            .push(Step::Fill(dst as usize, src, len, Some(card_steps::FillTo::Slot(slot.0, slot.1))));
+            .push(Step::Fill(dst as usize, src, len, Some(card_steps::FillTo::Slot(slot.0, slot.1, slot.2))));
     }
 
     /// As [`HostList::defer_fill`], for the beginning of a buffer
@@ -7783,6 +7859,8 @@ impl HostList {
         // With [`card_steps`] the card may be the one that fills it.
         let (buffer, data) = if card_steps::stage() > 1 { host.shared_buffer(size)? } else { host.upload_buffer(size)? };
         name(&buffer, || format!("list upload {size:#x}"));
+        #[cfg(feature = "diagnostics")]
+        crate::crumbs::upload_made(&self.list, &buffer, size, u64::from(card_steps::stage()));
         self.deferred().hold_upload(buffer.clone(), size);
         Some((buffer, data))
     }
@@ -7875,7 +7953,9 @@ impl HostList {
                 BUDGET_NOTES[0].fetch_add(u64::from(refused), Ordering::Relaxed);
                 crate::framewatch::add(crate::framewatch::Count::Refused, u64::from(refused));
                 BUDGET_NOTES[1].fetch_max(u64::from(biggest), Ordering::Relaxed);
-                for k in 0..5 {
+                // (And the records whose place was outside their buffer.)
+                STORES_OUTSIDE.fetch_add(u64::from(words.add(5).read_volatile()), Ordering::Relaxed);
+                for k in 0..6 {
                     words.add(k).write_volatile(0);
                 }
             });
@@ -7910,7 +7990,7 @@ impl HostList {
         };
         // SAFETY: a live buffer.
         let at = unsafe { card.GetGPUVirtualAddress() };
-        let zeros = [0u64, 4, 8, 12, 16].map(|offset| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
+        let zeros = [0u64, 4, 8, 12, 16, 20].map(|offset| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
             Dest: at + offset,
             Value: 0,
         });
@@ -7951,7 +8031,7 @@ impl HostList {
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
-            self.list.CopyBufferRegion(mapped, 4, card, 4, 16);
+            self.list.CopyBufferRegion(mapped, 4, card, 4, 20);
             self.list.ResourceBarrier(&[transition(
                 card,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -9945,6 +10025,7 @@ impl Meter {
             tracing::info!(
                 "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame; {refused:.2} indirect records a frame ran empty for want of their list's budget (2^27), the largest cost of one {biggest} (0: under 2^22)"
             );
+            outside_line();
             crate::shadow::exact_line(frames);
             crate::descriptor::sync_line(frames);
             late_line(frames);

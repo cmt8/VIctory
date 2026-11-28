@@ -18,12 +18,36 @@
 //! bytes went up to it meanwhile), and the next flight that may write it
 //! fetches it whatever its compare says, until a fetch is found whole.
 //!
+//! Every suspect a flight was at has a flight to fetch it: only a flight
+//! that declared a piece writes it, a flight that declared it has a range
+//! over it when it lands, and that landing fetches a suspect whatever its
+//! compare says. So the last flight at a piece fetches it with none behind
+//! it, whole. A suspect no flight comes for is one the title's bytes went
+//! up to behind the fetch: those bytes the merge left out
+//! (`Shadow::land_card`), and the CPU's side holds them as the card does.
+//! Nothing is fetched outside a landing's declared ranges, then, and
+//! nothing could be merged there: the refresh writes the CPU's side
+//! wherever no range is declared.
+//!
+//! A piece that came down under a range the card did not compare (no room
+//! for its results) has no hash to be checked against: it is suspect too,
+//! or a later flight at it whose compare flags nothing left it as it was.
+//!
 //! What it costs: pieces are fetched whole where a flight declared a part
 //! of one, and 64 KiB of what came down are hashed (some 4 us) just before
 //! they are merged, on the thread that merges them (`crate::land`).
+//!
+//! The frame-rate line tells what was found: how many pieces a frame were
+//! not what their flight ended with, in how many of those title bytes had
+//! been sent up behind the flight, how many were what a later flight ended
+//! with (whole, as a fetch on the drawing queue brings them too:
+//! `crate::land::Had`), how many suspects there are and how many of them no
+//! flight has fetched for [`OLD`] landings, and which pieces of title memory
+//! it was most often. What is left of the first number when the next two
+//! are taken off is the most that came down from the middle of a flight.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::AtomicU8;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64};
 
 use super::*;
 
@@ -38,34 +62,175 @@ pub(super) fn on() -> bool {
 /// A piece: its copy's number, and the piece.
 pub(super) type Piece = (u64, u32);
 
-/// Since the last frame-rate line: pieces fetched and hashed, those found
-/// suspect, and those fetched because an earlier fetch was.
-pub(super) static STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+/// Since the last frame-rate line: see [`stat`].
+pub(super) static STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
-/// The pieces whose last fetch was not what a flight ended with.
+/// What [`STATS`] count.
+mod stat {
+    /// Pieces fetched and hashed.
+    pub(super) const CHECKED: usize = 0;
+    /// Of them, those that were not what their flight ended with.
+    pub(super) const SUSPECT: usize = 1;
+    /// Suspects found whole when fetched again.
+    pub(super) const WHOLE: usize = 2;
+    /// Suspects that had come down as a later flight ended with: early,
+    /// but whole. (At least: of the last [`super::HELD`] fetches of one,
+    /// and only as long as it is suspect.)
+    pub(super) const LATER: usize = 3;
+    /// Pieces fetched with no hash to check them against.
+    pub(super) const BLIND: usize = 4;
+    /// Of the suspects, those in whose piece title bytes were sent up behind
+    /// the flight (a send may be behind the fetch as well: a flight may have
+    /// been at such a piece too).
+    pub(super) const TITLE: usize = 5;
+}
+
+/// As the last landing left them: the suspects, and those of them that no
+/// flight has fetched for [`OLD`] landings.
+static NOW: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// A piece for the log: its title address, and its copy's address and
+/// bytes.
+type Place = (u64, (u64, u64));
+
+/// Since the last frame-rate line, by piece: the times it was not what its
+/// flight ended with.
+static OFTEN: std::sync::Mutex<Option<HashMap<Place, u32>>> = std::sync::Mutex::new(None);
+
+/// The landings (those with a fetch) after which a suspect that no flight
+/// fetched again is counted as left.
+const OLD: u64 = 64;
+
+/// The hashes kept of what came down of a suspect.
+const HELD: usize = 4;
+
+/// What is known of a suspect.
 #[derive(Default)]
-pub(super) struct Suspects(HashSet<Piece>);
+struct Suspect {
+    /// What came down of it and was not what its flight ended with, by
+    /// hash: the last few fetches, less those a later flight is known to
+    /// have ended with.
+    held: Vec<u32>,
+    /// The landing that fetched it last.
+    at: u64,
+}
+
+/// The pieces whose last fetch was not what a flight ended with, or could
+/// not be checked.
+#[derive(Default)]
+pub(super) struct Suspects {
+    all: HashMap<Piece, Suspect>,
+    /// The landings with a fetch so far.
+    landings: u64,
+    /// For [`STATS`], since the last landing.
+    counted: [u64; 6],
+}
 
 impl Suspects {
     /// Whether a flight that may write `piece` fetches it, its compare
     /// having flagged it or not.
     pub(super) fn wanted(&self, piece: Piece, flagged: bool) -> bool {
-        flagged || (!self.0.is_empty() && self.0.contains(&piece))
+        flagged || (!self.all.is_empty() && self.all.contains_key(&piece))
     }
 
-    /// `piece` was fetched; `same`: it was what the last of the flights
-    /// landed ended with.
-    pub(super) fn fetched(&mut self, piece: Piece, same: bool) {
-        STATS[0].fetch_add(1, Ordering::Relaxed);
-        if same {
-            if self.0.remove(&piece) {
-                STATS[2].fetch_add(1, Ordering::Relaxed);
-            }
-        } else {
-            self.0.insert(piece);
-            STATS[1].fetch_add(1, Ordering::Relaxed);
+    /// A flight that is landed ended with `hash` at `piece`: what came down
+    /// of the piece before with that hash was this flight's, whole.
+    pub(super) fn ended(&mut self, piece: Piece, hash: u32) {
+        if self.all.is_empty() {
+            return;
+        }
+        if let Some(suspect) = self.all.get_mut(&piece) {
+            let before = suspect.held.len();
+            suspect.held.retain(|&held| held != hash);
+            self.counted[stat::LATER] += (before - suspect.held.len()) as u64;
         }
     }
+
+    /// `piece` was fetched and came down with hash `held`; `same`: that is
+    /// what the last of the flights landed ended with.
+    pub(super) fn fetched(&mut self, piece: Piece, same: bool, held: u32) {
+        self.counted[stat::CHECKED] += 1;
+        if same {
+            if self.all.remove(&piece).is_some() {
+                self.counted[stat::WHOLE] += 1;
+            }
+            return;
+        }
+        self.counted[stat::SUSPECT] += 1;
+        let suspect = self.all.entry(piece).or_default();
+        suspect.at = self.landings;
+        if suspect.held.len() == HELD {
+            suspect.held.remove(0);
+        }
+        suspect.held.push(held);
+    }
+
+    /// Title bytes were sent up to the piece just found suspect, behind its
+    /// flight.
+    pub(super) fn title_sent(&mut self) {
+        self.counted[stat::TITLE] += 1;
+    }
+
+    /// `piece` was fetched and there is no hash to check it against (the
+    /// card did not compare the range it came down under): a later flight
+    /// may have been at it, so the next one that may write it fetches it.
+    pub(super) fn blind(&mut self, piece: Piece) {
+        self.counted[stat::BLIND] += 1;
+        self.all.entry(piece).or_default().at = self.landings;
+    }
+
+    /// The suspects that no flight has fetched for [`OLD`] landings.
+    fn left(&self) -> usize {
+        self.all.values().filter(|s| self.landings - s.at >= OLD).count()
+    }
+
+    /// A landing's fetch is done with: what was counted goes to the line.
+    pub(super) fn landed(&mut self) {
+        for (stat, counted) in STATS.iter().zip(&mut self.counted) {
+            stat.fetch_add(std::mem::take(counted), Ordering::Relaxed);
+        }
+        self.landings += 1;
+        NOW[0].store(self.all.len() as u64, Ordering::Relaxed);
+        NOW[1].store(self.left() as u64, Ordering::Relaxed);
+    }
+}
+
+/// The `most` pieces of `often` with the highest counts, those first (and
+/// by address where the counts are the same).
+fn most_often(often: HashMap<Place, u32>, most: usize) -> Vec<(Place, u32)> {
+    let mut all: Vec<_> = often.into_iter().collect();
+    all.sort_unstable_by_key(|&(piece, times)| (std::cmp::Reverse(times), piece));
+    all.truncate(most);
+    all
+}
+
+/// For the log, over `frames` frames.
+pub(super) fn line(frames: f64) {
+    let t: Vec<f64> = STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    let often = OFTEN.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+    if t[stat::CHECKED] <= 0.0 {
+        return;
+    }
+    let often: Vec<String> = most_often(often, 6)
+        .into_iter()
+        .map(|((at, (start, len)), times)| format!("{at:#x} (of {start:#x}+{len:#x}) {:.2}", f64::from(times) / frames))
+        .collect();
+    tracing::info!(
+        "fetched pieces checked per frame (VICTORY_FETCH_CHECK): {:.1}, of which {:.2} were not what their flight ended with \
+         ({:.2} of them with title bytes sent up to the piece behind the flight, which the merge leaves out; at least {:.2} what \
+         a later flight ended with, whole; the others caught while a flight was at them); {:.2} were found whole when fetched \
+         again; {:.2} had no hash to be checked against; suspect now: {} pieces, {} of them fetched by no flight for {OLD} \
+         landings; most often not what their flight ended with, per frame: {}",
+        t[stat::CHECKED],
+        t[stat::SUSPECT],
+        t[stat::TITLE],
+        t[stat::LATER],
+        t[stat::WHOLE],
+        t[stat::BLIND],
+        NOW[0].load(Ordering::Relaxed),
+        NOW[1].load(Ordering::Relaxed),
+        if often.is_empty() { "none".to_string() } else { often.join(", ") },
+    );
 }
 
 /// What is landed: its copy, its offsets from and to, and where it comes
@@ -86,13 +251,21 @@ pub(super) struct Check {
     /// Of each piece: 0 not looked at yet, 1 as that flight ended with, 2
     /// not so.
     found: Vec<AtomicU8>,
+    /// Of each piece that was looked at: the hash of what came down.
+    held: Vec<AtomicU32>,
 }
 
 impl Check {
     /// For `landed`, parts of pieces that `plans` may have written, whose
     /// compares' results are in `differs`: the parts are given their places
-    /// in the pieces that come down.
-    pub(super) fn new<'a>(plans: impl Iterator<Item = &'a CardPlan>, differs: &[u32], landed: &mut [Landed]) -> Check {
+    /// in the pieces that come down. `suspects` are told what the flights
+    /// ended with.
+    pub(super) fn new<'a>(
+        plans: impl Iterator<Item = &'a CardPlan>,
+        differs: &[u32],
+        landed: &mut [Landed],
+        suspects: &mut Suspects,
+    ) -> Check {
         let mut index: HashMap<Piece, usize> = HashMap::new();
         let (mut copies, mut of, mut within, mut total) = (Vec::new(), Vec::new(), Vec::new(), 0u64);
         for (shadow, lo, _, at) in landed {
@@ -111,15 +284,19 @@ impl Check {
         // (The last flight's stands.)
         for r in plans.flat_map(|plan| &plan.ranges).filter(|r| r.compared && !r.picked) {
             for p in 0..r.span.pieces {
-                if let Some(&i) = index.get(&(r.shadow.id(), r.span.first + p))
-                    && let Some(&d) = differs.get((r.at + p) as usize)
-                {
+                let piece = (r.shadow.id(), r.span.first + p);
+                let Some(&d) = differs.get((r.at + p) as usize) else {
+                    continue;
+                };
+                suspects.ended(piece, folded(d));
+                if let Some(&i) = index.get(&piece) {
                     of[i].1 = Some(folded(d));
                 }
             }
         }
         let found = of.iter().map(|_| AtomicU8::new(0)).collect();
-        Check { copies, total, of, within, found }
+        let held = of.iter().map(|_| AtomicU32::new(0)).collect();
+        Check { copies, total, of, within, found, held }
     }
 
     /// Looks at the piece that part `i` of what is landed is of, if none of
@@ -139,18 +316,40 @@ impl Check {
         let (_, from, to, at) = &self.copies[i];
         // SAFETY: the caller's.
         let bytes = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, to - from) };
-        self.found[i].store(if self::hash(bytes) == hash { 1 } else { 2 }, Ordering::Relaxed);
+        let held = self::hash(bytes);
+        self.held[i].store(held, Ordering::Relaxed);
+        self.found[i].store(if held == hash { 1 } else { 2 }, Ordering::Relaxed);
     }
 
-    /// All is landed: what was found is kept for later flights.
-    pub(super) fn done(&self, suspects: &mut Suspects) {
-        for ((piece, _), found) in self.of.iter().zip(&self.found) {
+    /// All is landed: what was found is kept for later flights. `after`:
+    /// the send the fetch is known to have run behind.
+    pub(super) fn done(&self, suspects: &mut Suspects, after: u64) {
+        let mut caught: Vec<Place> = Vec::new();
+        for (i, ((piece, _), found)) in self.of.iter().zip(&self.found).enumerate() {
             match found.load(Ordering::Relaxed) {
-                // Not compared on the card: fetched by every flight.
-                0 => {}
-                found => suspects.fetched(*piece, found == 1),
+                // Not compared on the card: nothing says what it should be.
+                0 => suspects.blind(*piece),
+                found => {
+                    suspects.fetched(*piece, found == 1, self.held[i].load(Ordering::Relaxed));
+                    if found == 2 {
+                        let (shadow, from, to, _) = &self.copies[i];
+                        if shadow.card_sent_behind(after, *from, *to) {
+                            suspects.title_sent();
+                        }
+                        let span = shadow.span();
+                        caught.push((span.0 + *from as u64, span));
+                    }
+                }
             }
         }
+        if !caught.is_empty() {
+            let mut often = OFTEN.lock().unwrap_or_else(|e| e.into_inner());
+            let often = often.get_or_insert_with(Default::default);
+            for place in caught {
+                *often.entry(place).or_default() += 1;
+            }
+        }
+        suspects.landed();
     }
 }
 
@@ -263,6 +462,12 @@ mod tests {
     /// a later flight is at some step. Returns what the CPU's side holds in
     /// the end, and the fetches.
     fn landed(flights: &[&[u32]], seen: &[(usize, usize)], check: bool) -> (u32, u32) {
+        let (held, fetches, _) = landed_counted(flights, seen, check);
+        (held, fetches)
+    }
+
+    /// [`landed`], and what the suspects counted.
+    fn landed_counted(flights: &[&[u32]], seen: &[(usize, usize)], check: bool) -> (u32, u32, [u64; 6]) {
         let piece: Piece = (1, 0);
         let mut suspects = Suspects::default();
         let (mut held, mut ended, mut fetches) = (0, 0, 0);
@@ -270,6 +475,7 @@ mod tests {
             let before = ended;
             ended = *steps.last().expect("a step");
             let flagged = ended != before;
+            suspects.ended(piece, ended);
             if if check { !suspects.wanted(piece, flagged) } else { !flagged } {
                 continue;
             }
@@ -278,9 +484,9 @@ mod tests {
             let (at, step) = seen[f];
             assert!(at >= f);
             held = flights[at][step];
-            suspects.fetched(piece, held == ended);
+            suspects.fetched(piece, held == ended, held);
         }
-        (held, fetches)
+        (held, fetches, suspects.counted)
     }
 
     /// A counter that each flight clears and counts up to the same: the
@@ -298,6 +504,79 @@ mod tests {
         // Fetched whole: no more fetches than without the check.
         assert_eq!(landed(&four, &[(0, 2), (1, 2), (2, 2), (3, 2)], true), (5, 1));
         assert_eq!(landed(&four, &[(0, 2), (1, 2), (2, 2), (3, 2)], false), (5, 1));
+    }
+
+    /// Two flights that end otherwise: the first's fetch runs behind the
+    /// second, or while the second has cleared the piece.
+    #[test]
+    fn what_a_later_flight_ended_with_is_told_from_what_was_in_between() {
+        let (first, second): (&[u32], &[u32]) = (&[0, 3, 5], &[0, 4, 7]);
+        let (held, fetches, counted) = landed_counted(&[first, second], &[(1, 2), (1, 2)], true);
+        assert_eq!((held, fetches), (7, 2));
+        assert_eq!((counted[stat::SUSPECT], counted[stat::LATER], counted[stat::WHOLE]), (1, 1, 1));
+        let (held, fetches, counted) = landed_counted(&[first, second], &[(1, 0), (1, 2)], true);
+        assert_eq!((held, fetches), (7, 2));
+        assert_eq!((counted[stat::SUSPECT], counted[stat::LATER], counted[stat::WHOLE]), (1, 0, 1));
+        // Behind the third, of four: the second's landing does not know
+        // the hash, the third's does.
+        let third: &[u32] = &[0, 6, 9];
+        let (held, fetches, counted) = landed_counted(&[first, second, third, third], &[(2, 2), (2, 2), (2, 2), (3, 2)], true);
+        assert_eq!((held, fetches), (9, 3));
+        assert_eq!((counted[stat::SUSPECT], counted[stat::LATER], counted[stat::WHOLE]), (2, 2, 1));
+    }
+
+    /// A piece that came down under a range the card did not compare: the
+    /// next flight that may write it fetches it, flagged or not, and what
+    /// it finds whole is suspect no more.
+    #[test]
+    fn a_piece_with_no_hash_is_fetched_by_the_next_flight() {
+        let (piece, other): (Piece, Piece) = ((7, 3), (7, 4));
+        let mut suspects = Suspects::default();
+        assert!(!suspects.wanted(piece, false));
+        suspects.blind(piece);
+        assert!(suspects.wanted(piece, false) && !suspects.wanted(other, false) && suspects.wanted(other, true));
+        // Not compared again: it stays.
+        suspects.blind(piece);
+        assert!(suspects.wanted(piece, false));
+        suspects.ended(piece, 5);
+        suspects.fetched(piece, true, 5);
+        assert!(!suspects.wanted(piece, false));
+        assert_eq!(suspects.counted, [1, 0, 1, 0, 2, 0]);
+    }
+
+    /// A suspect that no flight comes for (title bytes went up to it, and
+    /// no shader writes it again) is counted, and stays for the flight that
+    /// does come.
+    #[test]
+    fn a_suspect_no_flight_fetches_is_counted_as_left() {
+        let (left, kept): (Piece, Piece) = ((1, 0), (1, 1));
+        let mut suspects = Suspects::default();
+        suspects.fetched(left, false, 9);
+        suspects.fetched(kept, false, 9);
+        for _ in 0..OLD - 1 {
+            suspects.landed();
+        }
+        assert_eq!((suspects.all.len(), suspects.left()), (2, 0));
+        suspects.fetched(kept, false, 8);
+        suspects.landed();
+        assert_eq!((suspects.all.len(), suspects.left()), (2, 1));
+        assert!(suspects.wanted(left, false));
+        suspects.fetched(left, true, 5);
+        assert_eq!((suspects.all.len(), suspects.left()), (1, 0));
+        // No more hashes are kept of one than the last few.
+        for held in 0..10 {
+            suspects.fetched(kept, false, held);
+        }
+        assert_eq!(suspects.all[&kept].held, [6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn the_pieces_caught_most_often_come_first() {
+        let copy = (0x1000_0000, 0x40_0000);
+        let often: HashMap<Place, u32> =
+            [(0x1001_0000, 2), (0x1002_0000, 9), (0x1003_0000, 2), (0x1004_0000, 1)].into_iter().map(|(at, n)| ((at, copy), n)).collect();
+        let most: Vec<(u64, u32)> = most_often(often, 3).into_iter().map(|((at, _), n)| (at, n)).collect();
+        assert_eq!(most, [(0x1002_0000, 9), (0x1001_0000, 2), (0x1003_0000, 2)]);
     }
 
     /// What the hash costs (ignored: a measurement): pieces that just came

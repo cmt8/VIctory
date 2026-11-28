@@ -136,6 +136,11 @@ impl Made {
 
 static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// Constant views of card steps that were not written because their slot's
+/// host heap was gone and another stood at its address
+/// ([`HostHeap::constant_for`]), since the start.
+pub(crate) static STRAY_CONSTANTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub(crate) struct HostHeap {
     /// Identity of this host heap instance, checked by [`release`] so a stale
     /// list resetting after a title heap was replaced at the same address does
@@ -734,10 +739,18 @@ fn neutral() -> Option<&'static ID3D12Resource> {
                 list.CopyTextureRegion(&to, 0, 0, 0, &source, None);
                 list.Close().ok()?;
                 let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
-                queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).ok()?)]);
+                let lists = [Some(windows::core::Interface::cast::<ID3D12CommandList>(&list).ok()?)];
+                #[cfg(feature = "diagnostics")]
+                {
+                    crate::crumbs::exec(&queue, crate::crumbs::sent::OTHER, 0, &lists);
+                    crate::crumbs::signal(&queue, &fence, 1);
+                }
+                queue.ExecuteCommandLists(&lists);
                 queue.Signal(&fence, 1).ok()?;
                 // (Without an event: this waits.)
                 fence.SetEventOnCompletion(1, windows::Win32::Foundation::HANDLE::default()).ok()?;
+                #[cfg(feature = "diagnostics")]
+                crate::crumbs::waited(&fence, 1);
                 Some(made)
             }
         })
@@ -3908,6 +3921,26 @@ impl HostHeap {
         D3D12_GPU_DESCRIPTOR_HANDLE {
             ptr: start + u64::from(index) * u64::from(self.step),
         }
+    }
+
+    /// [`HostHeap::constant_at`], only if `id` is this host heap's identity
+    /// ([`HostHeap::id`]): for a slot whose number was taken some time ago
+    /// (a card step's, written when its submission is sent). Whether it was
+    /// written.
+    pub(crate) fn constant_for(&self, id: u64, index: u32, buffer: &ID3D12Resource, gpu: u64, size: u32) -> bool {
+        if id != self.id {
+            STRAY_CONSTANTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(
+                    index,
+                    "a card step's constant slot belongs to a view heap that is gone, another stands at its address: not written (first time)"
+                )
+            });
+            return false;
+        }
+        self.constant_at(index, buffer, gpu, size);
+        true
     }
 
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
@@ -8573,6 +8606,27 @@ void main(uint3 t : SV_DispatchThreadID) {
         );
         a.release(a.id(), first, 2);
         assert_eq!(a.free.load(std::sync::atomic::Ordering::Relaxed), after_alloc + 2);
+    }
+
+    /// A card step's constant view is written when its submission is sent,
+    /// into the slot its list took when it was recorded: not into a heap
+    /// that is another one by then.
+    #[test]
+    fn a_constant_slot_is_written_only_in_the_heap_it_was_taken_from() {
+        let (Some(a), Some(b)) = (HostHeap::new(false, 4), HostHeap::new(false, 4)) else {
+            return; // no host GPU
+        };
+        let Some((buffer, _)) = crate::host::host().and_then(|host| host.upload_buffer(256)) else {
+            return;
+        };
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let slot = a.dynamic(1).unwrap();
+        let before = STRAY_CONSTANTS.load(std::sync::atomic::Ordering::Relaxed);
+        // `b` stands for a heap made where `a` was: the same slot number.
+        assert!(!b.constant_for(a.id(), slot, &buffer, gpu, 256), "written into another heap's slot");
+        assert!(STRAY_CONSTANTS.load(std::sync::atomic::Ordering::Relaxed) > before);
+        assert!(a.constant_for(a.id(), slot, &buffer, gpu, 256));
     }
 
     #[test]
