@@ -13755,10 +13755,8 @@ impl<'a> Lower<'a> {
             .push((next, c));
         let over = self.s.m.cmp(c, p, next, limit);
         self.s.m.tag(over, Tag::Counter);
-        // A walk whose lane went on round one node after its walk was cut
-        // is left too (`VICTORY_BVH_SPIN`, `intersect::bvh_cut`).
-        if self.walks.contains_key(&to) && self.s.threads.is_some() && super::bvh_spin().is_some() {
-            let leave = self.bvh_leaving();
+        // A lane whose walk was cut leaves its loops (`intersect::bvh_leaving`).
+        if let Some(leave) = self.bvh_leaving(to) {
             let c = self.cur;
             // (No `xor` of a compare: see `exit`.)
             return if p == pred::IULT {

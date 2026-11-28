@@ -368,7 +368,7 @@ fn bvh_loop_mark() -> Option<&'static str> {
 /// whose walks are cut when a lane goes round one node ([`super::bvh_spin`]),
 /// with the count.
 fn bvh_spin_mark() -> Option<&'static str> {
-    let text = |n: u32| format!("VICTORY_BVH_SPIN={n}: walks of programs with a node test cut by a lane going round one node, the test then finding nothing");
+    let text = |n: u32| format!("VICTORY_BVH_SPIN={n}: walks of programs with a node test cut by a lane going round one node, the test then finding nothing, its loops left 64 turns later");
     #[cfg(test)]
     if super::BVH_SPIN_TEST.get().is_some() {
         return super::bvh_spin().map(|n| &*Box::leak(text(n).into_boxed_str()));

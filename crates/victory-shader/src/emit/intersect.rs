@@ -654,9 +654,9 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// Tests of one node with one ray past [`super::super::bvh_spin`]'s count
-/// after which a lane whose walk was cut leaves its loop (`Lower::bvh_cut`):
-/// the title's walk did not end of itself by then.
+/// Turns of its walk's loops after which a lane whose walk was cut
+/// (`Lower::bvh_cut`) leaves them (`Lower::bvh_leaving`): the title's walk
+/// did not end of itself by then.
 pub(in crate::emit) const SPIN_GRACE: u32 = 64;
 
 /// Which of a lane's counts ([`super::super::shader::COUNT_NAMES`]).
@@ -706,8 +706,8 @@ pub(in crate::emit) mod count {
 
 impl Lower<'_> {
     /// [`super::super::bvh_spin`]: the lane's private last pointer (low,
-    /// high), ray digest, run, whether its walk is cut and whether its loop
-    /// is left, made the first time. The high dword starts at a value no
+    /// high), ray digest, run, whether its walk is cut and the turns of its
+    /// walk's loops since, made the first time. The high dword starts at a value no
     /// pointer has, so the first test is no repeat.
     fn bvh_spin_vars(&mut self) -> [V; 6] {
         if let Some(v) = self.bvh_spin {
@@ -720,17 +720,26 @@ impl Lower<'_> {
         v
     }
 
-    /// Whether this lane's walk is to be left at its loop's next turn: it
-    /// went on round one node [`SPIN_GRACE`] tests after its walk was cut
-    /// ([`Self::bvh_cut`]), so the title's walk does not end of itself. The
-    /// value the walk loop's back edges leave by (`lower.rs`
-    /// `count_iteration`), in the current block.
-    pub(super) fn bvh_leaving(&mut self) -> V {
-        let [.., leave] = self.bvh_spin_vars();
+    /// At a back edge to loop header `to` of a compute program, where the
+    /// spin stop is on and the loop is a walk's or inside one (`walks`):
+    /// whether the lane leaves the loop. A lane whose walk was cut
+    /// ([`Self::bvh_cut`]) and that still turns its walk's loops
+    /// [`SPIN_GRACE`] turns later (the title's walk does not end of itself,
+    /// tests or none) leaves them. The turn is counted here, in the current
+    /// block.
+    pub(super) fn bvh_leaving(&mut self, to: usize) -> Option<V> {
+        let at = *self.rpo.get(to)?;
+        let inside = self.walks.values().any(|&(lo, hi)| lo <= at && at <= hi);
+        if !inside || self.s.threads.is_none() || super::super::bvh_spin().is_none() {
+            return None;
+        }
+        let [.., cut_at, since_at] = self.bvh_spin_vars();
         let c = self.cur;
-        let f = self.s.m.load(c, leave);
-        let zero = self.s.m.i32(0);
-        self.s.m.cmp(c, pred::NE, f, zero)
+        let (cut, since) = (self.s.m.load(c, cut_at), self.s.m.load(c, since_at));
+        let since = self.s.m.bin(c, Bin::Add, since, cut);
+        self.s.m.store(c, since_at, since);
+        let grace = self.s.m.i32(SPIN_GRACE);
+        Some(self.s.m.cmp(c, pred::IUGT, since, grace))
     }
 
     /// [`super::super::bvh_spin`], for one node test of a lane that runs it
@@ -741,26 +750,28 @@ impl Lower<'_> {
     /// `bvh_spin` tests cuts the walk, and it stays cut while the ray stays
     /// (the title's walk empties its stack and ends with what it found); a
     /// test with another ray is the next walk's. A run [`SPIN_GRACE`] tests
-    /// longer leaves the loop ([`Self::bvh_leaving`]). A walk of a tree
+    /// turns of its loops later leaves them ([`Self::bvh_leaving`]). A walk of a tree
     /// tests no node twice in a row for one ray, and a lane whose rays all
     /// miss the root tests it with another ray each time.
     fn bvh_cut(&mut self, pointer: V, pointer_high: Option<V>, ray: &[V]) -> V {
         let n = super::super::bvh_spin().expect("on");
-        let [low_at, high_at, ray_at, run_at, cut_at, leave_at] = self.bvh_spin_vars();
+        let [low_at, high_at, ray_at, run_at, cut_at, since_at] = self.bvh_spin_vars();
         let (run, same_ray) = self.bvh_run_step([low_at, high_at, ray_at, run_at], pointer, pointer_high, ray);
         let c = self.cur;
-        let (limit, past) = (self.s.m.i32(n), self.s.m.i32(n + SPIN_GRACE));
+        let limit = self.s.m.i32(n);
         let spinning = self.s.m.cmp(c, pred::IUGE, run, limit);
         let was = self.s.m.load(c, cut_at);
         let zero = self.s.m.i32(0);
         let was = self.s.m.cmp(c, pred::NE, was, zero);
         let kept = self.s.m.bin(c, Bin::And, was, same_ray);
         let cut = self.s.m.bin(c, Bin::Or, kept, spinning);
-        let leave = self.s.m.cmp(c, pred::IUGE, run, past);
+        // The turns since the cut: kept while it stays, from 0 at a new one.
+        let since = self.s.m.load(c, since_at);
+        let since = self.s.m.select(c, kept, since, zero);
         let i32t = self.s.t.i32;
-        let (cut_word, leave_word) = (self.s.m.cast(c, Cast::ZExt, cut, i32t), self.s.m.cast(c, Cast::ZExt, leave, i32t));
+        let cut_word = self.s.m.cast(c, Cast::ZExt, cut, i32t);
         self.s.m.store(c, cut_at, cut_word);
-        self.s.m.store(c, leave_at, leave_word);
+        self.s.m.store(c, since_at, since);
         if super::super::bvh_count() {
             self.bvh_count_or(count::SPIN_LANES, spinning);
         }

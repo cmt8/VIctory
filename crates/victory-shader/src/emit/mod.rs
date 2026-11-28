@@ -459,10 +459,10 @@ thread_local! {
 /// node test may test the same node with the same ray before its walk is
 /// cut (`intersect.rs` `bvh_cut`): its node tests then find nothing while
 /// the ray stays, so the title's walk empties its stack and ends with what
-/// it found; one still going round that node 64 tests later leaves its
-/// walk's loop (`lower.rs` `count_iteration`). `VICTORY_BVH_SPIN`, on
-/// unless `=0` (24), `=<n>` sets the count (4 to 4096). A walk of a tree
-/// tests no node twice in a row for one ray; a lane that does is going
+/// it found; one still in its walk's loops 64 turns later leaves them
+/// (`intersect.rs` `bvh_leaving`; run rx1: most cut walks do not end of
+/// themselves). `VICTORY_BVH_SPIN`, on unless `=0` (24), `=<n>` sets the
+/// count (4 to 4096). A walk of a tree tests no node twice in a row for one ray; a lane that does is going
 /// round one node until the loop limit (runs rw7, rw9: every lane that
 /// reached it had tested one node some 3,580 times of its 4,096), and holds
 /// its whole wave meanwhile. Part of the translation of those programs

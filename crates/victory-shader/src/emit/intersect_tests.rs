@@ -862,7 +862,7 @@ fn real(scene: &Scene, case: &Case, by: f32) -> u32 {
 /// `VICTORY_BVH_SPIN`: a lane that tests the same node with the same ray n
 /// times in a row has its walk cut there: from that test on its tests are
 /// not made and find nothing, and its loop goes on (the title's walk would
-/// end of itself), until 64 such tests later it leaves the loop; a lane
+/// end of itself), until 64 turns later it leaves the loop; a lane
 /// that does so n - 1 times is not cut; a lane whose rays all differ (as
 /// when every ray misses the root) is never cut; with the switch at 0
 /// nothing is.
@@ -891,7 +891,7 @@ fn a_lane_going_round_one_node_has_its_walk_cut() {
     // The n-th test in a row is cut; n - 1 are not.
     check(8, false, Some(8), 8, true);
     check(7, false, Some(8), 7, false);
-    // 64 tests past the cut the loop is left.
+    // 64 turns past the cut the loop is left.
     check(100, false, Some(8), 8 + 64, true);
     // Another ray each turn: never cut.
     check(40, true, Some(4), 40, false);
