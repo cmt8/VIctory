@@ -127,7 +127,14 @@ pub fn intersect(words: &[u32; 28], kind: u32, ray: &Ray, sort: bool) -> [u32; 4
         4 => boxes(&children(words), &boxes16(words), ray, sort),
         5 => boxes(&children(words), &boxes32(words), ray, sort),
         k @ 0..=3 => triangle(&triangle_vertices(words, k), ray).map(f32::to_bits),
-        _ => MISS.map(f32::to_bits),
+        // An instance or procedural node: all ones, which a walk reads as
+        // no child (AMD's GPURT, `image_bvh64_intersect_ray_base` in
+        // src/shaders/IntersectCommon.hlsl, its software form of the
+        // instruction: "User defined node. HW returns -1"). A triangle miss
+        // here is read as the children 0 and 0x3f800000 by a walk that takes
+        // every result as a box node's (runs rw7, rw9: lanes going round one
+        // node until the loop limit).
+        _ => [NONE; 4],
     }
 }
 
@@ -664,11 +671,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn instances_and_procedural_nodes_return_a_triangle_miss() {
+    fn instances_and_procedural_nodes_return_no_child() {
         let node = triangles(&TRIANGLE, 9);
         let ray = Ray::new([0.0; 3], [0.0, 0.0, 1.0], 100.0);
         for k in [6, 7] {
-            assert_eq!(intersect(&node, k, &ray, true), MISS.map(f32::to_bits));
+            assert_eq!(intersect(&node, k, &ray, true), [NONE; 4]);
         }
     }
 

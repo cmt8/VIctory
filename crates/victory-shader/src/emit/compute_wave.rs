@@ -318,6 +318,10 @@ pub const GROUP_CU: &str = "VICTORY_GROUP_CU: a group with a barrier and no LDS 
 /// [`keyed_apart`]'s mark of a program with a ray-tracing node test whose
 /// tests all miss ([`super::bvh_miss`]).
 const BVH_MISS: &str = "VICTORY_BVH_MISS=1: every ray-tracing node test a miss";
+/// [`keyed_apart`]'s mark of every program with a ray-tracing node test:
+/// its instance and procedural nodes give all ones (no child), as the
+/// console's instruction does, where they gave a triangle miss before.
+pub(super) const BVH_OTHER_NONE: &str = "node test: instance and procedural nodes return no child";
 /// [`keyed_apart`]'s mark of a program with a ray-tracing node test that
 /// counts what its walks do ([`super::bvh_count`]). (The translator's version
 /// does not key translations: a change of what is counted changes the mark,
@@ -406,6 +410,9 @@ pub fn keyed_apart(container: &[u8], kept: bool) -> Vec<&'static str> {
     if console_program(container).is_some_and(|p| bvh_marked(&p)) {
         marks.push(BVH_MISS);
     }
+    if console_program(container).is_some_and(|p| has_bvh(&p.code)) {
+        marks.push(BVH_OTHER_NONE);
+    }
     if super::bvh_count() && bvh_count_slot(container).is_some() {
         marks.push(BVH_COUNT);
     }
@@ -459,6 +466,7 @@ pub fn keyed_apart_any() -> Vec<&'static str> {
     if super::bvh_miss() {
         marks.push(BVH_MISS);
     }
+    marks.push(BVH_OTHER_NONE);
     if super::bvh_count() {
         marks.push(BVH_COUNT);
     }
@@ -666,6 +674,14 @@ mod tests {
         assert!(!off_any.contains(&BVH_MISS));
         assert!(on_any.contains(&BVH_MISS));
         assert_eq!(on_any.iter().filter(|m| **m != BVH_MISS).collect::<Vec<_>>(), off_any.iter().collect::<Vec<_>>());
+    }
+
+    /// The node kinds' change keys apart every set of translations, and no
+    /// container that holds no program.
+    #[test]
+    fn the_node_kinds_change_is_keyed_apart() {
+        assert!(keyed_apart_any().contains(&BVH_OTHER_NONE));
+        assert!(!keyed_apart(&[], false).contains(&BVH_OTHER_NONE));
     }
 
     #[test]

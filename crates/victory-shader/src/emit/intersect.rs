@@ -19,7 +19,7 @@
 //! box (4, 5):  4 child pointers; 24 box floats (kind 5) or 24 halves widened (kind 4);
 //!              four slab tests; the sorting network
 //! triangle (0-3): the id dword, three vertices at the bytes it names; the watertight test
-//! other (6, 7): a triangle miss
+//! other (6, 7): all ones (no child)
 //! ```
 //!
 //! Each lane reads only the dwords its node's kind needs: 28 for a 32-bit
@@ -221,9 +221,9 @@ impl<'a> Lower<'a> {
         let triangle_end = self.cur;
         self.s.m.terminate(triangle_end, Term::Br(join));
         self.cur = join;
-        // Kinds 6 and 7 (an instance, a procedural primitive): not known
-        // what the console returns; the title's programs do not read it.
-        let other = bvh::MISS.map(|f| self.s.m.i32(f.to_bits()));
+        // Kinds 6 and 7 (an instance, a procedural primitive): all ones, no
+        // child ([`bvh::intersect`]).
+        let other = [self.s.m.i32(bvh::NONE); 4];
         let i32t = self.s.t.i32;
         let mut results = Vec::with_capacity(4);
         for k in 0..4 {
