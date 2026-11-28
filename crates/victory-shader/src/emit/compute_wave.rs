@@ -251,6 +251,37 @@ fn has_bpermute(code: &[u8]) -> bool {
     })
 }
 
+/// `container`'s program, of whichever stage (the program
+/// [`super::translate`] takes).
+fn console_program(container: &[u8]) -> Option<crate::native::NativeProgram> {
+    use crate::native::HwStage;
+    let c = crate::dxbc::Container::parse(container).ok()?;
+    let part = c.part(crate::dxbc::FourCC::DXIL).or(c.part(crate::dxbc::FourCC::ACCC))?;
+    crate::native_programs(part.data)
+        .ok()?
+        .into_iter()
+        .find(|p| matches!(p.stage, HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms))
+}
+
+/// Whether some dword of `code` is an `image_bvh_intersect_ray` or an
+/// `image_bvh64_intersect_ray` (the MIMG encoding, opcodes 0xe6 and 0xe7:
+/// seven bits at 24:18 and the eighth at bit 0) if it is an instruction's
+/// first: every program with a node test, and perhaps one whose literal
+/// looks like it.
+fn has_bvh(code: &[u8]) -> bool {
+    code.chunks_exact(4).any(|w| {
+        let w = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+        w >> 26 == 0x3C && matches!((w >> 18) & 0x7F | (w & 1) << 7, 0xE6 | 0xE7)
+    })
+}
+
+/// Whether `p` is a program [`super::bvh_miss`] changes: the switch is on and
+/// the code has a node test. Any other program keeps its key, and its cached
+/// translation, with the switch on as off.
+fn bvh_marked(p: &crate::native::NativeProgram) -> bool {
+    super::bvh_miss() && has_bvh(&p.code)
+}
+
 /// Whether some dword of `code` is an `s_barrier` if it is an instruction's
 /// first: every program with the instruction, and perhaps one whose literal
 /// looks like it.
@@ -284,6 +315,9 @@ const TYPED_RW: &str = "VICTORY_TYPED_RW: typed unordered buffer views read behi
 /// declared, which gets a dword of group-shared memory it does not need
 /// ([`super::group_cu`]).
 pub const GROUP_CU: &str = "VICTORY_GROUP_CU: a group with a barrier and no LDS adds to a dword of it";
+/// [`keyed_apart`]'s mark of a program with a ray-tracing node test whose
+/// tests all miss ([`super::bvh_miss`]).
+const BVH_MISS: &str = "VICTORY_BVH_MISS=1: every ray-tracing node test a miss";
 
 /// Whether `p` is a compute program with an `s_barrier` that declares no LDS:
 /// the programs [`super::group_cu`] reaches, as far as the program's header
@@ -335,6 +369,11 @@ pub fn keyed_apart(container: &[u8], kept: bool) -> Vec<&'static str> {
     if super::group_cu() && console_compute(container).is_some_and(|p| barrier_without_lds(&p)) {
         marks.push(GROUP_CU);
     }
+    // (A program of any stage, `VICTORY_WAVE_KEEP` listed or not: the node test is
+    // lowered the same in all.)
+    if console_program(container).is_some_and(|p| bvh_marked(&p)) {
+        marks.push(BVH_MISS);
+    }
     if !console && !halves && !even {
         return marks;
     }
@@ -376,6 +415,9 @@ pub fn keyed_apart_any() -> Vec<&'static str> {
     }
     if super::group_cu() {
         marks.push(GROUP_CU);
+    }
+    if super::bvh_miss() {
+        marks.push(BVH_MISS);
     }
     marks
 }
@@ -532,6 +574,52 @@ mod tests {
         let mut vertex = program(HwStage::Vs, 0, true);
         vertex.io = StageIo::None;
         assert!(!barrier_without_lds(&vertex), "no compute program");
+    }
+
+    /// `VICTORY_BVH_MISS=1` keys apart only a program with a ray-tracing
+    /// node test, of any stage: one without keeps its key with the switch
+    /// on. Off, no program is keyed apart and no key changes.
+    #[test]
+    fn a_node_test_that_misses_keys_only_its_programs_apart() {
+        use crate::native::{ComputeIo, HwStage, NativeProgram, StageIo};
+        let bytes = |words: &[u32]| words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
+        let program = |stage: HwStage, code: &[u32]| NativeProgram {
+            stage,
+            wave64: false,
+            vgprs: 22,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo { rsrc2: 0, threads: [32, 1, 1] }),
+            code: bytes(code),
+        };
+        // image_bvh64_intersect_ray v[13:16], [v1 .. v12], s[8:11]; s_endpgm
+        let wide = [0xF19C_9F07, 0x0002_0D01, 0x0504_0302, 0x0908_0706, 0x000C_0B0A, 0xBF81_0000];
+        // image_bvh_intersect_ray v[13:16], [v1, v3 .. v12], s[8:11]; s_endpgm
+        let narrow = [0xF198_9F07, 0x0002_0D01, 0x0605_0403, 0x0A09_0807, 0x0000_0C0B, 0xBF81_0000];
+        // image_sample v[0:3], v[4:5], s[8:15], s[16:19] dmask:0xf dim:2D; s_endpgm
+        let sample = [0xF080_0F08, 0x0082_0004, 0xBF81_0000];
+        // s_waitcnt, s_barrier, s_endpgm
+        let plain = [0xBF8C_C07F, 0xBF8A_0000, 0xBF81_0000];
+        assert!(has_bvh(&bytes(&wide)) && has_bvh(&bytes(&narrow)));
+        assert!(!has_bvh(&bytes(&sample)) && !has_bvh(&bytes(&plain)) && !has_bvh(&[]));
+
+        let was = crate::emit::BVH_MISS_TEST.replace(Some(false));
+        let off_any = keyed_apart_any();
+        let off = [&wide[..], &narrow, &sample, &plain].map(|c| bvh_marked(&program(HwStage::Cs, c)));
+        crate::emit::BVH_MISS_TEST.set(Some(true));
+        let on_any = keyed_apart_any();
+        let on = [&wide[..], &narrow, &sample, &plain].map(|c| bvh_marked(&program(HwStage::Cs, c)));
+        let pixel = bvh_marked(&program(HwStage::Ps, &wide));
+        let no_program = keyed_apart(&[], false);
+        crate::emit::BVH_MISS_TEST.set(was);
+
+        assert_eq!(off, [false; 4], "off: no program is keyed apart");
+        assert_eq!(on, [true, true, false, false], "on: only the programs with a node test");
+        assert!(pixel, "of any stage");
+        assert!(!no_program.contains(&BVH_MISS));
+        assert!(!off_any.contains(&BVH_MISS));
+        assert!(on_any.contains(&BVH_MISS));
+        assert_eq!(on_any.iter().filter(|m| **m != BVH_MISS).collect::<Vec<_>>(), off_any.iter().collect::<Vec<_>>());
     }
 
     #[test]

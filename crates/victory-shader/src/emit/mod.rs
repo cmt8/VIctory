@@ -353,6 +353,27 @@ pub fn typed_rw() -> bool {
     *ON.get_or_init(|| typed_rw_said(std::env::var("VICTORY_TYPED_RW").ok().as_deref()))
 }
 
+/// Whether every ray-tracing node test (`image_bvh_intersect_ray`,
+/// `image_bvh64_intersect_ray`) is a miss without reading its node
+/// (`lower::intersect`): while the structure builder is off the structures
+/// are never built. `VICTORY_BVH_MISS`: off, `=1` on. Part of the
+/// translation of the programs with a node test only: the shader cache keys
+/// them apart ([`keyed_apart`]); every other program keeps its key.
+pub fn bvh_miss() -> bool {
+    #[cfg(test)]
+    if let Some(on) = BVH_MISS_TEST.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_MISS").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`bvh_miss`] on its thread (`None`: the switch's).
+    pub(crate) static BVH_MISS_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// What `VICTORY_TYPED_RW` says: on only when it is `1`.
 fn typed_rw_said(value: Option<&str>) -> bool {
     value.is_some_and(|v| v.trim() == "1")

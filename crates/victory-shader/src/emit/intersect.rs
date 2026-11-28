@@ -62,9 +62,10 @@ struct Ray {
 /// LOCAL (from our wt5): `VICTORY_BVH_MISS=1` (off by default): the node test
 /// misses every node. While the structure builder is off the structures are
 /// never built, and a walk of what lies in their memory is not the console's.
+/// (The switch itself is `crate::emit::bvh_miss`, which the shader cache's
+/// keys read too.)
 fn bvh_miss() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_MISS").is_some_and(|v| v == "1"))
+    crate::emit::bvh_miss()
 }
 
 impl<'a> Lower<'a> {
